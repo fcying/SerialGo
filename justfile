@@ -13,7 +13,10 @@ powershell := "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 
 _default: build
 
-_icon:
+_config:
+    cp -- config.toml assets/default-config.toml
+
+_icon: _config
     go run ./cmd/appicon -arch "{{GOARCH}}"
 
 build:

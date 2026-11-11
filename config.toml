@@ -1,0 +1,63 @@
+BaudRates = ["9600", "19200", "57600", "115200", "921600", "1000000"]
+SendText = ""
+SendHexText = ""
+Language = "en"
+Encoding = "UTF-8"
+Interval = "1000"
+PacketGap = "20"
+FileDelay = "1"
+SendHex = false
+CRLF = true
+ReceiveHex = false
+ShowSent = false
+Timestamp = false
+ShowPresets = false
+
+[Port]
+Name = ""
+Baud = "115200"
+DataBits = "8"
+Parity = "None"
+StopBits = "1"
+DTR = true
+RTS = false
+
+[[Presets]]
+Label = "Preset 1"
+Data = ""
+Interval = "1000"
+Hex = false
+CRLF = false
+Enabled = false
+
+[[Presets]]
+Label = "Preset 2"
+Data = ""
+Interval = "1000"
+Hex = false
+CRLF = false
+Enabled = false
+
+[[Presets]]
+Label = "Preset 3"
+Data = ""
+Interval = "1000"
+Hex = false
+CRLF = false
+Enabled = false
+
+[[Presets]]
+Label = "Preset 4"
+Data = ""
+Interval = "1000"
+Hex = false
+CRLF = false
+Enabled = false
+
+[[Presets]]
+Label = "Preset 5"
+Data = ""
+Interval = "1000"
+Hex = false
+CRLF = false
+Enabled = false

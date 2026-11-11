@@ -1,12 +1,12 @@
 module github.com/fcying/SerialGo
 
-go 1.27.3
+go 1.27.4
 
 require (
 	github.com/BurntSushi/toml v1.5.0
 	github.com/akavel/rsrc v0.10.2
 	github.com/albenik/go-serial/v2 v2.6.1
-	github.com/egoist/mygo v0.8.3
+	github.com/egoist/mygo v0.9.0
 	golang.org/x/sys v0.48.0
 	golang.org/x/text v0.43.0
 )

@@ -1,22 +1,34 @@
 # AGENTS.md
 
-## 架构
-- `main.go` 是程序入口. `appName` 和 `appVersion` 定义应用名称和版本, 窗口标题仅使用 `appName + " v" + appVersion`.
-- `ui/` 使用 MyGo `ui.View` 构建原生界面, 不依赖 WebView、Node.js 或 TypeScript 绑定. `ui/controller.go` 管理界面状态、后台任务和取消; `ui/view.go` 定义布局和控件. 后台 I/O 不阻塞 UI 主线程, 结果通过 `Window.Update` 更新.
-- `communication/serialport/` 封装设备枚举与 I/O; `internal/` 管理串口会话和数据编解码; `config/` 负责参数持久化. 依赖版本固定在 `go.mod`.
-- 图标只维护 `assets/icon.svg`. `cmd/appicon/` 使用现有 SVG 渲染器生成 PNG、多尺寸 ICO 和 Windows `.syso` 资源, 均不提交或手工修改. PNG 在构建时嵌入程序供窗口使用.
+## Architecture
+- `main.go` is the application entry point. `appName` and `appVersion` define the application name and version; the window title uses only `appName + " v" + appVersion`.
+- `ui/` builds the native interface with MyGo `ui.View`, without WebView, Node.js, or TypeScript bindings. `ui/controller.go` manages UI state, background tasks, and cancellation; `ui/view.go` defines layout and controls. Background I/O must not block the UI thread; publish results through `Window.Update`.
+- `communication/serialport/` encapsulates device enumeration and I/O; `internal/` manages serial sessions and data encoding/decoding; `config/` handles settings persistence. Dependency versions are pinned in `go.mod`.
+- Maintain only `assets/icon.svg` as the icon source. `cmd/appicon/` uses the existing SVG renderer to generate PNG, multi-size ICO, and Windows `.syso` resources; do not commit or manually edit generated files. The PNG is embedded in the application at build time for window use.
 
-## 编译与测试
-- 应用编译统一用 `just`, 不新增独立编译脚本. `justfile` 采用 Bash 默认脚本模式. 构建要求 Go 1.27.3 或更新版本.
-- 构建脚本的日志使用英文.
-- `just` 默认执行 `build`, 由 `build` 调用 `just windows`. `windows` 是独立编译入口, 生成 `build/windows-amd64/SerialGo.exe`; `just linux` 生成 `build/linux-amd64/SerialGo`. 不使用 alias, 默认构建不自动运行程序.
-- Windows 和 Linux 构建都会先执行 `_icon` 生成图标资源. 从干净工作区直接运行聚焦 Go 测试前, 先执行 `just _icon`.
-- `just test` 直接依赖 `windows`, 不依赖可能改变目标的 `build`. 若 `/mnt/d/project/SerialGo` 已存在, 只更新其中的 `SerialGo.exe`; 否则跳过复制, 不创建目录. 复制失败时使用 `wslpath` 转换目标路径, 通过 `/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe` 结束该路径的 Windows 进程, 再重试复制一次. 最终复制成功后进入发布目录, 用 `setsid` 后台启动 EXE. 不重复编译, 不改配置.
-- 根据修改范围选择聚焦测试. 编码和校验用例位于 `internal/`, 接收显示用例位于 `ui/`. Linux 默认只构建, 不运行测试.
+## Build and Tests
+- Use `just` for application builds; do not add standalone build scripts. `justfile` uses Bash default-script mode. Builds require Go 1.27.4 or later.
+- Build-script logs must be in English.
+- `just` defaults to `build`, which calls `just windows`. `windows` is an independent build entry point producing `build/windows-amd64/SerialGo.exe`; `just linux` produces `build/linux-amd64/SerialGo`. Do not use aliases. The default build does not launch the application.
+- Windows and Linux builds both run `_icon` first to generate icon resources. Before running focused Go tests directly from a clean working tree, run `just _icon`.
+- `just test` depends directly on `windows`, not on `build`, whose target may change. If `/mnt/d/project/SerialGo` already exists, replace only its `SerialGo.exe`; otherwise skip copying and do not create the directory. If copying fails, convert the destination path with `wslpath`, terminate the Windows process at that path through `/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe`, and retry copying once. After the final copy succeeds, enter the deployment directory and launch the EXE in the background with `setsid`. Do not rebuild or modify configuration.
+- Select focused tests according to the changes. Encoding tests are in `internal/`; receive-display tests are in `ui/`. On Linux, build only by default; do not run tests by default.
 
-## Windows 测试机
-- `cth-win10` 是测试机. 用 `ssh -o BatchMode=yes cth-win10 hostname` 检查直连, 不经宿主机跳转. 不在仓库中保存连接凭据.
-- 用 `just windows` 生成 Windows 产物, 用 `scp` 更新测试机桌面的 `SerialGo/SerialGo.exe`. 固定使用这一个目录, 不按版本另建目录. 更新时只替换 EXE, 保留已有 `config.toml`. 聚焦 Go 测试可用 `CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go test -c -o <测试程序.exe> <包>` 交叉编译, 上传后在测试机执行.
-- GUI 验证在已登录的桌面会话中启动. 如使用交互式计划任务, 使用本次测试专用名称. 不覆盖用户已有的配置.
-- 没有物理或虚拟 COM 口时, 只报告实际验证的界面、参数及错误路径, 不声称真实串口收发通过. 不为测试安装驱动或修改共用环境.
-- 验证结束后, 保留 `桌面/SerialGo/SerialGo.exe` 和已有配置. 只清理本次创建的进程、计划任务、测试脚本和其他临时文件.
+## Windows Test Machine
+- `cth-win10` is the test machine. Check direct connectivity with `ssh -o BatchMode=yes cth-win10 hostname`; do not jump through the host machine. Do not store connection credentials in the repository.
+- Build the Windows artifact with `just windows`, then use `scp` to update `SerialGo/SerialGo.exe` on the test machine's desktop. Always use this one directory; do not create version-specific directories. Replace only the EXE and preserve the existing `config.toml`. Focused Go tests can be cross-compiled with `CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go test -c -o <test-program.exe> <package>`, uploaded, and executed on the test machine.
+- Launch GUI verification in the logged-in desktop session. If using an interactive scheduled task, give it a name specific to this test run. Do not overwrite the user's existing configuration.
+- Without a physical or virtual COM port, report only the UI, settings, and error paths actually verified; do not claim successful real serial transmission or reception. Do not install drivers or change the shared environment for testing.
+- After verification, retain `Desktop/SerialGo/SerialGo.exe` and the existing configuration. Clean up only processes, scheduled tasks, test scripts, and other temporary files created for this run.
+
+## Configuration Safety
+- Read and save `config.toml` only beside the actual running executable, resolving executable symlinks. Do not read configuration from the working directory, user configuration directories, or other locations, and do not fall back to another directory if saving fails.
+- Create the default configuration immediately when it is missing. Loading must not overwrite an existing configuration, including one that cannot be read or decoded. Report creation and save failures without replacing user data.
+- Preserve serial settings, user-entered content, and preset labels, data, flags, and order. New configurations start with five distinctly named presets. The UI shows only configured entries, up to 99, without a separate panel title. Support adding blank entries and confirmed deletion, renumbering remaining entries in order. Save every configured entry, including blank ones; never pad short lists or trim configured trailing entries. Missing or explicitly empty preset lists stay empty on load and restart.
+- Track persisted edits with `settingsDirty`; edit callbacks only mark changes, without timers or disk I/O. Save dirty settings on actual use, including preset addition and confirmed deletion, and flush remaining drafts on normal exit. Skip unchanged uses and exits. Serialize background snapshots with independently copied preset and baud-rate slices; clear dirty only for the successfully saved current revision, and preserve dirty state and save errors after failure.
+
+## Bilingual Maintenance
+- Keep this root `AGENTS.md` in English. Keep `README.md` in English and `README.zh-CN.md` in Simplified Chinese, with reciprocal language links and synchronized behavior, build instructions, and limitations.
+- Maintain Chinese and English UI text together. Keep language switching inside the Options dialog, without a duplicate toolbar language button or menu bar. Its button shows `简体中文` in English and `English` in Chinese, with the accessible name `语言 / Language`. Language switching must take effect immediately and persist to the executable-adjacent configuration; the default is `en`, with `zh-CN` for Simplified Chinese. Older configurations without a language and invalid language values normalize to `en`.
+- Localize application-owned menus, controls, dialogs, statuses, tooltips, and error descriptions consistently, including already-visible status messages. Do not translate serial data, user input, preset labels or contents, protocol values, or original operating-system/library error details. Switching languages must not reset or rewrite those values.
+- Configure MyGo's locale as session-only so `config.toml` remains the sole preferences store. Do not create separate language settings in user directories.

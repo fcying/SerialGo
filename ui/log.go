@@ -2,7 +2,6 @@ package ui
 
 import (
 	"fmt"
-	"math"
 	"strings"
 	"time"
 
@@ -33,6 +32,7 @@ type receiveLog struct {
 	pending              []byte
 	last                 internal.Event
 	started, newline, cr bool
+	scrollToEnd          bool
 }
 
 func (l *receiveLog) clear() {
@@ -58,7 +58,7 @@ func (l *receiveLog) rebuild() {
 		l.render(&out, event)
 	}
 	l.text.Set(out.String())
-	l.scroll.Y = math.MaxFloat32
+	l.scrollToEnd = true
 }
 
 func (l *receiveLog) append(events []internal.Event) {
@@ -90,9 +90,7 @@ func (l *receiveLog) append(events []internal.Event) {
 	}
 	end := l.text.Len()
 	l.text.Replace(end, end, out.String())
-	if l.scroll.Y >= l.scroll.MaxY-2 {
-		l.scroll.Y = math.MaxFloat32
-	}
+	l.scrollToEnd = true
 }
 
 func (l *receiveLog) render(out *strings.Builder, event internal.Event) {

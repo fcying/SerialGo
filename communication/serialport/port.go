@@ -17,6 +17,12 @@ import (
 	serial "github.com/albenik/go-serial/v2"
 )
 
+// Info describes an available UART. Description is optional display metadata;
+// Name alone identifies the device to open.
+type Info struct {
+	Name, Description string
+}
+
 // Settings describes a UART and the initial state of its modem output lines.
 type Settings struct {
 	Name, Baud, DataBits, Parity, StopBits string

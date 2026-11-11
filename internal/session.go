@@ -3,13 +3,13 @@ package internal
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"sync"
 	"time"
 
 	"github.com/fcying/SerialGo/communication/serialport"
+	"github.com/fcying/SerialGo/internal/i18n"
 )
 
 type Event struct {
@@ -69,11 +69,11 @@ func (s *Session) receive() {
 			s.captureMu.Unlock()
 			s.emit(Event{At: at, Data: append([]byte(nil), buf[:n]...)})
 			if captureErr != nil {
-				s.emit(Event{Err: fmt.Errorf("接收文件写入失败: %w", captureErr)})
+				s.emit(Event{Err: i18n.WrapError("接收文件写入失败", "Receive file write failed", captureErr)})
 			}
 		}
 		if err != nil {
-			s.emit(Event{Err: fmt.Errorf("接收失败: %w", err), ReadFailed: true})
+			s.emit(Event{Err: i18n.WrapError("接收失败", "Receive failed", err), ReadFailed: true})
 			return
 		}
 	}

@@ -3,3 +3,4 @@ tmp/
 /assets/icon.png
 /assets/icon.ico
 /assets/icon_windows_*.syso
+/assets/default-config.toml
