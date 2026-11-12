@@ -58,17 +58,38 @@ type App struct {
 	settingsSaveError bool
 	cancelSend        context.CancelFunc
 	loadErrorReported bool
+	settingsWarning   Text
 }
 
 func NewApp() *App {
 	settings, path, err := config.Load()
-	s := &App{Settings: settings, SettingsPath: path, LoadError: err}
+	warning := normalizeStartupSettings(&settings)
+	s := &App{Settings: settings, SettingsPath: path, LoadError: err, settingsWarning: warning}
 	initialPort, initialRates := settings.Port, settings.BaudRates
 	s.InitializeBaudRates()
 	if s.Settings.Port != initialPort || !slices.Equal(s.Settings.BaudRates, initialRates) {
 		s.SettingsChanged()
 	}
 	return s
+}
+
+func normalizeStartupSettings(settings *config.Settings) Text {
+	var warning Text
+	if settings.Encoding != "UTF-8" && settings.Encoding != "GB18030" {
+		settings.Encoding = "UTF-8"
+		warning.ZH = "编码回退 UTF-8"
+		warning.EN = "Encoding reset to UTF-8"
+	}
+	if _, err := Milliseconds(settings.PacketGap, "分包超时", 1); err != nil {
+		settings.PacketGap = "20"
+		if warning.ZH != "" {
+			warning.ZH += "; "
+			warning.EN += "; "
+		}
+		warning.ZH += "分包超时回退 20 ms"
+		warning.EN += "packet gap reset to 20 ms"
+	}
+	return warning
 }
 
 func (s *App) Startup(view View) {
@@ -131,6 +152,15 @@ func (s *App) Note(zh, en string) {
 		return
 	}
 	s.Status, s.StatusError = Text{ZH: zh, EN: en}, false
+}
+
+func (s *App) showSettingsWarning() {
+	if s.settingsWarning.ZH == "" && s.settingsWarning.EN == "" || s.StatusError {
+		return
+	}
+	s.Status = s.settingsWarning
+	s.StatusError = false
+	s.settingsWarning = Text{}
 }
 
 func (s *App) ClearCounts() { s.Tx, s.Rx = 0, 0 }
@@ -401,31 +431,34 @@ func (s *App) RefreshPorts() {
 	go func() {
 		defer s.jobs.Done()
 		ports, err := serialport.List()
-		s.dispatch(func() {
-			s.PortBusy = false
-			s.RefreshingPorts = false
-			reportLoadError := !s.loadErrorReported && s.LoadError != nil
-			s.loadErrorReported = true
-			if err != nil {
-				s.SetPorts(nil)
-				if reportLoadError {
-					s.Fail("读取参数失败", "Failed to load settings", s.LoadError)
-				} else {
-					s.Fail("刷新串口失败", "Failed to refresh serial ports", err)
-				}
-				return
-			}
-			s.SetPorts(ports)
-			if len(ports) == 0 {
-				s.Note("未找到串口", "No serial ports found")
-			} else {
-				s.Note(fmt.Sprintf("找到 %d 个串口", len(ports)), fmt.Sprintf("Found %d serial ports", len(ports)))
-			}
-			if reportLoadError {
-				s.Fail("读取参数失败", "Failed to load settings", s.LoadError)
-			}
-		})
+		s.dispatch(func() { s.applyPortRefresh(ports, err) })
 	}()
+}
+
+func (s *App) applyPortRefresh(ports []serialport.Info, err error) {
+	s.PortBusy = false
+	s.RefreshingPorts = false
+	reportLoadError := !s.loadErrorReported && s.LoadError != nil
+	s.loadErrorReported = true
+	if err != nil {
+		if reportLoadError {
+			s.Fail("读取参数失败", "Failed to load settings", s.LoadError)
+		} else {
+			s.Fail("刷新串口失败", "Failed to refresh serial ports", err)
+		}
+		s.showSettingsWarning()
+		return
+	}
+	s.SetPorts(ports)
+	if len(ports) == 0 {
+		s.Note("未找到串口", "No serial ports found")
+	} else {
+		s.Note(fmt.Sprintf("找到 %d 个串口", len(ports)), fmt.Sprintf("Found %d serial ports", len(ports)))
+	}
+	if reportLoadError {
+		s.Fail("读取参数失败", "Failed to load settings", s.LoadError)
+	}
+	s.showSettingsWarning()
 }
 
 func (s *App) TogglePort() {
@@ -513,22 +546,28 @@ func (s *App) SaveLog(path, text string) {
 	if s.FileBusy || s.closing {
 		return
 	}
-	if path == s.CapturePath {
-		s.Note("请勿覆盖正在接收的文件", "Do not overwrite the active receive file")
-		return
-	}
+	capturePath := s.CapturePath
 	snapshot := s.usedSettingsSnapshot()
 	s.FileBusy = true
 	s.jobs.Add(1)
 	go func() {
 		defer s.jobs.Done()
-		file, err := os.Create(path)
-		if err == nil {
-			_, err = io.WriteString(file, text)
-			err = errors.Join(err, file.Close())
+		sameCapture := capturePath != "" && sameFilePath(path, capturePath)
+		var err error
+		if !sameCapture {
+			var file *os.File
+			file, err = os.Create(path)
+			if err == nil {
+				_, err = io.WriteString(file, text)
+				err = errors.Join(err, file.Close())
+			}
 		}
 		s.dispatch(func() {
 			s.FileBusy = false
+			if sameCapture {
+				s.Note("请勿覆盖正在接收的文件", "Do not overwrite the active receive file")
+				return
+			}
 			if err != nil {
 				s.Fail("保存显示数据失败", "Failed to save displayed data", err)
 			} else {
@@ -537,6 +576,21 @@ func (s *App) SaveLog(path, text string) {
 			}
 		})
 	}()
+}
+
+func sameFilePath(path, other string) bool {
+	if path == other && path != "" {
+		return true
+	}
+	pathInfo, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	otherInfo, err := os.Stat(other)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(pathInfo, otherInfo)
 }
 
 // startCapture ignores stale native-dialog results from an earlier connection.

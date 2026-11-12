@@ -6,11 +6,36 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
+const (
+	baudPickerArrowSize   float32 = 6
+	baudPickerGap         float32 = 1
+	baudPickerPaddingX    float32 = 2
+	baudPickerBorderWidth float32 = 1
+	baudPickerChromeWidth         = 2 * (baudPickerArrowSize + baudPickerGap + baudPickerPaddingX + baudPickerBorderWidth)
+)
+
 type baudPickerState struct {
 	value, choice, language string
 	rates                   []string
 	options                 []string
 	open                    bool
+	triggerWidth            float32
+	triggerWidthChoice      string
+}
+
+func (s *controller) mainBaudPickerWidth(c *ui.Context) float32 {
+	state := &s.baudPickers[0]
+	value := s.settings.Port.Baud
+	if state.value != value {
+		state.value, state.choice = value, value
+	}
+	if state.triggerWidth == 0 || state.triggerWidthChoice != state.choice {
+		standardWidth, _ := c.MeasureText(0, ui.Span{Text: "1000000"})
+		selectedWidth, _ := c.MeasureText(0, ui.Span{Text: state.choice})
+		state.triggerWidth = max(standardWidth, selectedWidth) + baudPickerChromeWidth
+		state.triggerWidthChoice = state.choice
+	}
+	return state.triggerWidth
 }
 
 func (s *controller) baudPicker(c *ui.Context, forPort bool, height float32) ui.Element {
@@ -34,13 +59,16 @@ func (s *controller) baudPicker(c *ui.Context, forPort bool, height float32) ui.
 		state.rates = slices.Clone(rates)
 		state.language = s.settings.Language
 	}
+	if !forPort {
+		s.mainBaudPickerWidth(c)
+	}
 	theme := c.Theme()
 	sel := ui.SelectBaseOpen(c, &state.choice, &state.open)
 	if s.app.Connected() || s.app.PortBusy {
 		sel.SetOpen(false)
 	}
 	trigger := sel.Trigger.Width(0).MinWidth(0).Grow(1).Height(height).
-		Padding(controlPadY, 3).Gap(2).Radius(theme.Radius).Border(1, theme.Border).
+		Padding(controlPadY, baudPickerPaddingX).Gap(baudPickerGap).Radius(theme.Radius).Border(baudPickerBorderWidth, theme.Border).
 		Background(theme.Surface).TextColor(theme.Text).AlignItems(ui.Center).
 		Label(s.tr("波特率", "Baud rate")).Disabled(s.app.Connected() || s.app.PortBusy).OnChange(func() {
 		if state.choice == customLabel {
@@ -58,14 +86,17 @@ func (s *controller) baudPicker(c *ui.Context, forPort bool, height float32) ui.
 		}
 		state.value, state.choice = *value, *value
 	})
+	if !forPort {
+		trigger.Width(state.triggerWidth).MinWidth(state.triggerWidth).Grow(0).Shrink(0)
+	}
 	if trigger.Pressed() {
 		trigger.Background(theme.SurfacePressed)
 	} else if trigger.Hovered() {
 		trigger.Background(theme.SurfaceHover)
 	}
 	trigger.Children(func() {
-		ui.Text(c.Key("selected"), state.choice).Width(0).MinWidth(0).Grow(1).SingleLine()
-		ui.Box(c.Key("arrow")).Size(8, 8).Shrink(0).Draw(func(p *ui.Painter, r ui.Rect) {
+		ui.Text(c.Key("selected"), state.choice).Width(0).MinWidth(0).Grow(1).SingleLine().TextAlign(ui.Center)
+		ui.Box(c.Key("arrow")).Size(baudPickerArrowSize, baudPickerArrowSize).Shrink(0).Draw(func(p *ui.Painter, r ui.Rect) {
 			var path ui.Path
 			path.MoveTo(r.X+r.W*0.1, r.Y+r.H*0.3).LineTo(r.X+r.W*0.5, r.Y+r.H*0.7).LineTo(r.X+r.W*0.9, r.Y+r.H*0.3)
 			p.StrokePath(&path, 1.5, theme.TextMuted)

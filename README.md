@@ -2,113 +2,99 @@
 
 English | [简体中文](README.zh-CN.md)
 
-A native Go serial-port debugging assistant. The receive pane occupies the main area, with a compact file toolbar, serial settings, send controls, and status bar below. An optional multi-send panel expands on the right. All settings are available directly in the interface, without a duplicate menu bar. The interface uses MyGo, without WebView, Node.js, or TypeScript bindings.
+A native serial-port debugging assistant for Windows and Linux, with text/HEX transmission, receive logging, file transfer, and editable send presets.
 
-## Architecture
+[Architecture](ARCHITECTURE.md) | [Roadmap](ROADMAP.md)
 
-`main.go` creates `internal.App` and passes it to `ui.Run(app, title)`. `internal/app.go` is the framework-independent business entry point for serial connections, sending, capture/export, counters and operation status. Its settings actions and persistence helpers own baud rates, presets, dirty revisions and shutdown flushing. This layer does not import MyGo.
+## Screenshots
 
-`ui/` owns controls, interaction drafts, confirmations, native file dialogs and the receive-display model. It calls App commands and implements `internal.View`: `Dispatch(func())` posts results through `Window.Update`, and `AppendEvents([]internal.Event)` updates the display. App commands and observable state belong to the frontend thread; serial enumeration/open/close, transmission, file I/O and settings writes run in background workers. A replacement UI supplies this adapter without reimplementing those operations. Control-line confirmation preserves its synchronous driver-error result.
+<img width="900" height="574" alt="SerialGo English interface" src="https://github.com/user-attachments/assets/7fb7364b-8a54-4d27-95a3-0629a2f6bb29" />
 
-## Build and Run
+## Getting started
 
-Requires Go 1.27.4 or later, Just, and Bash. Build commands live directly in `justfile`; no standalone build script or C cross-compiler is needed. The default build does not launch the application.
-The native UI dependency is pinned to [MyGo v0.9.0](https://github.com/egoist/mygo/releases/tag/v0.9.0) in `go.mod`.
+1. Run `SerialGo.exe` on Windows or `SerialGo` in a Linux graphical session. Use a writable executable directory so the application can create and save its adjacent `config.toml`.
+2. Select a port and baud rate, then click **Open**. The initial baud rate is `115200`; use **Config** beside the baud selector if you need to change framing or control lines.
+3. Enter text or HEX bytes in the send area and click **Send**. Choose the text encoding in **Options** when needed.
+4. View incoming data in the upper pane. Click **Save data** to export displayed text, or **Record data** to start saving raw received bytes while connected.
 
-| Command | Result |
-| --- | --- |
-| `just` / `just build` / `just windows` | `build/windows-amd64/SerialGo.exe` |
-| `just linux` | `build/linux-amd64/SerialGo` |
-| `just test` | Builds Windows; replaces `SerialGo.exe` and launches it in the background only if `/mnt/d/project/SerialGo` already exists and copying succeeds |
+The lower cards contain connection controls, receive controls, file operations, and the send editor, from left to right. Drag the horizontal divider to enlarge the lower workspace; double-click to restore the compact default. Its position is not saved.
 
-Both platform builds embed the repository-root `config.toml` default template and generate icon resources first. To run focused Go tests directly from a clean working tree, prepare those resources with `just _icon` first. Despite its name, `just test` is the Windows build/deploy/launch recipe, not a Go unit-test runner. The Linux recipe builds only; it does not run tests.
+## Connecting and baud rates
 
-If the `just test` copy fails, it terminates the Windows process at the destination executable path and retries copying once, without rebuilding. After a successful copy, it enters the deployment directory and launches the EXE in the background with `setsid`. It neither creates a missing destination directory nor modifies configuration, and it does not launch after a failed copy. The retry requires WSL's `wslpath` and invokes PowerShell at `/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe`, without relying on the Windows PATH.
+- Ports are listed at startup and refreshed whenever the Port dropdown opens, by mouse or keyboard. Close and reopen it to retry; there is no separate Refresh button. Enumeration failure preserves the previous list and selection.
+- Windows shows device descriptions when available, such as `COM12 USB-SERIAL CH340`; Linux shows device paths. Hover over a truncated port name to see its full value, including while connected. Opening and saving use the actual device name, not its description.
+- Refresh preserves an available selected port, otherwise selects the first port. An empty list clears the selection and disables Open. Port and baud selectors are locked while connected.
+- The main connection card shows port selection first, then a visible **Baud** label, a selector sized to display `1000000`, and **Config** on the same row. The Port selector and Config share a right edge. The bottom row places the port-status light immediately before **Open / Close**. Config opens data bits, parity, stop bits, RTS, and DTR properties. Settings are global, not per device; the footer still shows the current framing. While connected, only RTS/DTR can change; driver errors stay in the dialog without committing changes.
+- **OK** applies dialog changes; Cancel, Escape, or closing the dialog discards drafts. Unchanged confirmation does not write configuration. Framing is edited only in Config, not on the main panel.
 
-Linux requires a graphical session, GTK 3, and read/write permission for the selected serial port. The executable directory must be writable for configuration creation and saving.
+Both baud selectors center the selected value in the text area, excluding the right-hand arrow, and initially offer `9600`, `19200`, `57600`, `115200`, `921600`, and `1000000`:
 
-## Language
+- **Custom...** adds and selects a rate, deduplicated and sorted numerically. Input accepts integers from `1` to `4294967295`; actual support depends on the device and driver.
+- Right-click a numeric rate, choose Delete, and confirm. Cancel or Escape changes nothing. Deleting the selected rate selects the first remaining rate.
+- Main-panel additions and deletions save immediately. Inside Config, they remain drafts until the outer OK; outer Cancel or Escape discards them.
+- An empty list stays empty after restart and disables Open until a rate is added. You may also edit `BaudRates` in `config.toml` while the application is closed.
 
-Open Options below the serial settings in the lower-left panel, then use its language button to switch between English and Simplified Chinese. There is no separate toolbar language button. The button inside Options shows **简体中文** in English and **English** in Chinese, indicating the target language. Controls, dialogs, status text, and tooltips switch immediately, without a restart, and the selection is saved immediately to `config.toml`. Already-visible status messages and the open Options dialog also switch language. The default is English (`en`); Simplified Chinese is stored as `zh-CN`. Existing configurations without a language, or with an invalid language value, use English.
+## Sending data
 
-The language choice changes application UI text only. It does not translate serial traffic, user-entered text, file contents, preset names or commands, or protocol values. In particular, the five default preset names remain `Preset 1` through `Preset 5` in both languages. Original operating-system and library error details remain unchanged.
+- Text supports UTF-8 and GB18030. **HEX** in the send editor accepts contiguous bytes or spaces/commas between bytes, for example `01030000` or `01 03 00 00`.
+- **CRLF** appends `\r\n` to outgoing data, independently of serial framing. No checksum is calculated or appended automatically; include protocol-required checksum bytes yourself.
+- Enable **Repeat** and set the interval in milliseconds for timed sending. HEX, Repeat, its interval, and Presets share the send editor's top row, with Presets aligned to the right edge. The Repeat interval and file Delay fields share a centered 48-pixel width for five-digit values.
+- **Send** and **Clear send** are stacked to the right of the input. Both text and HEX modes show **Enter data to send...** when empty. Clear send clears the current input. **Stop** beside Delay stops an active send task; hover it to see **Stop file sending**.
 
-## Usage
+## Receive display and files
 
-- The file toolbar provides file actions and the preset panel toggle. The serial panel's first row contains a connection indicator and port selector, with the row's outer edges aligned to the second row. The indicator is red while the port is closed and green while it is open; its tooltip and accessible name describe the current connection state. It does not flash for data traffic. The second row contains the Baud label, a compact fixed-width selector that fully displays `1000000`, Settings, and Open/Close, in that order. The panel width follows its contents rather than a fixed width. Save log, Capture, and Options share the next row, followed by the independent HEX display/HEX send switches together on the last row. Options groups window/language settings and data-display settings. On top and language switching occupy separate rows. Data display starts with the encoding selector and display-buffer limit, followed by the sent-data checkbox and the combined timestamp/packet checkbox with its timeout on the same row. On top is session-only. Show sent data includes local outgoing data in the receive pane, with `TX >` and `RX <` direction labels; it does not send data again. The right panel contains only Repeat with its interval/unit, CRLF, Send, Clear send, and the send input. Send and Clear send follow CRLF in that order above the input. Reset stays beside the footer counters. Numeric delay fields accommodate five digits. File chunk delay stays immediately after Send file; hovering the file path shows its full value.
-- The Options dialog starts directly with Window and language, without repeating an Options heading above the settings.
-- The lower workspace is compact and balanced against the four rows of left-panel controls instead of leaving a large blank area under the serial settings. Drag the horizontal divider above the file toolbar to redistribute receive/send space; minimum pane sizes keep the input and controls usable in the smallest window. Double-click the divider to restore the compact default distribution. The divider position is session-only and does not change configuration.
-- Serial ports are enumerated at startup and once whenever the Port dropdown opens, with either the mouse or keyboard; there is no separate Refresh button. The empty selector remains usable for refreshing, and an already-open popup does not repeatedly enumerate. The selector is locked while connected. On Windows, device names appear after the port number, for example `COM12 USB-SERIAL CH340`; when no description is available, only the port number is shown. Linux retains device-path labels. Opening and configuration persistence always use the raw device name, never the display description. A refresh preserves an available selected port; otherwise the first listed port is selected, or the selection is cleared if no devices remain. The Open button is unavailable when no ports exist. The port selector keeps its width, truncates long text, and shows the full selected value on hover, including while locked after connecting. The default baud selection is 115200. Set data bits, parity, and stop bits before opening. RTS and DTR can be toggled while connected.
-- Click the serial Settings button to open a modal properties dialog for baud rate, data bits, stop bits, parity, RTS, and DTR. These settings are global, not per-device: switching ports preserves them, and the dialog does not display the selected port or device name. OK applies and saves changed properties; Cancel, Escape, or dismissing the dialog discards its draft. Unchanged confirmation does not write configuration. While connected, framing is read-only and only RTS/DTR can be changed; driver failures stay inside the dialog without committing settings. The main panel retains the baud-rate shortcut, but no longer shows RTS/DTR or expandable framing controls.
-- Both baud selectors use the complete `BaudRates` array in `config.toml`, initially `9600`, `19200`, `57600`, `115200`, `921600`, and `1000000`. There is no distinction between initial and added values. `Custom...` adds and selects a value; lists are deduplicated and sorted numerically. Right-click any numeric option, choose Delete, and confirm to remove it. Cancel or Escape leaves the list and selection unchanged. Confirmed additions and deletions in the main panel save immediately; changes inside port properties stay in the draft until the outer OK, and outer Cancel or Escape rolls them back. Deleting the selected value selects the first remaining value. An empty array stays empty and disables Open until a value is added; deleted values are not restored at startup. You can also edit the array manually while the application is closed. Older configurations migrate their baud values when `BaudRates` is absent; an explicit new array, including `[]`, takes precedence over the old keys. Input accepts positive integers up to 4294967295; actual support depends on the device and driver.
-- The bottom serial status and transmit/receive counters stay on one line. Hover over the corresponding cell to see its full text in a tooltip.
-- Send text in UTF-8 or GB18030, or send HEX, with timed repetition available. Checking CRLF appends `\r\n` to the outgoing data. HEX accepts contiguous bytes or bytes separated by spaces or commas, such as `01030000` or `01 03 00 00`. No checksum is calculated or appended automatically; include any protocol-required checksum bytes in the input yourself. Serial parity in Port settings is unchanged. Legacy send-checksum settings are ignored and their obsolete keys are omitted on the next normal save, without rewriting the existing file merely on load.
-- The receive pane supports text or HEX and sent-data records. The single Timestamp and packets checkbox splits display packets at the configured idle timeout and adds a timestamp to each packet; clearing it disables both. The timeout field stays on the same row as the checkbox and is disabled while unchecked. Existing `Timestamp` and `PacketGap` values are retained; the obsolete independent `Packet` key is ignored and omitted on the next normal save, without rewriting a file merely on load. Newly displayable data always returns to the latest line, including after selecting older text or receiving long wrapped batches. Without new data, manual history browsing stays put. Counters track actual byte counts. Saving displayed data exports the current pane text; receiving to a file records raw bytes from the serial port. File sending uses 256-byte chunks with a configurable delay between chunks.
-- Options > Data display > Display buffer limit provides five standard presets: `200K`, `500K`, `1M`, `2M` and `5M`, defaulting to `200K` for testing. Units are decimal (`K = 1000`, `M = 1000000`) and count retained raw event payload bytes, including outgoing history, not HEX expansion or timestamps. The selection applies immediately and persists as `DisplayBufferLimit`; missing or unsupported values use the embedded default without rewriting a file on load. Overflow drops complete oldest events with a 16,384-byte headroom target; the newest event is always retained, even if oversized. Lowering the limit trims history immediately; raising it cannot restore discarded data. There is no separate record-count limit or unlimited option. Receive-to-file records raw bytes independently of display-history eviction.
-- Expand the multi-send panel with the toolbar's Presets button. It has no separate panel title and shows exactly the configured entries, up to 99, rather than padding short lists with unused slots. Add appends a blank entry and scrolls to it; each entry has a Delete button with confirmation. Cancel leaves the list unchanged. Confirmed deletion preserves the remaining entries in order and renumbers them consecutively. Add and confirmed Delete save immediately; blank added entries are retained. All entries may be deleted, and an empty list stays empty after restart. Existing entries, including blank ones, are preserved unless explicitly deleted. Structural edits are unavailable while a send task is active. In narrow panels, notes and grouped HEX/CRLF/interval/Delete controls wrap onto separate lines. New configurations still start with five distinctly named entries: `Preset 1` through `Preset 5`. Individual sending, sending checked entries in order, looping, and Stop retain their existing behavior.
+- **HEX** switches the receive display between text and HEX. **Options > Show sent data** includes local outgoing records marked `TX >` and incoming records marked `RX <`, without sending data again.
+- **Timestamp** splits display packets at the configured idle gap and adds timestamps. Set **Timestamp packet gap** in Options, default `20 ms`. Invalid edits remain uncommitted with an error until corrected.
+- **Auto scroll** follows incoming data. Disable it to keep your viewport while reception continues; re-enable it to return to the latest line. Scrolling back alone does not disable following. Auto scroll is not saved.
+- **Clear** clears the receive log. The footer shows `S | R | Reset | Serial settings | Status`: S and R track actual transmitted and received bytes, followed by the Reset action; vertical bars separate fields with consistent horizontal padding. Counters and serial settings size to their contents, leaving the remaining width to the operation status. Hover over counters, serial settings, or status cells to see their full text.
+- **Open file** selects a file; hover over **Send file** to see its full path. Files send in 256-byte chunks. **Delay**, beside Stop, sets the millisecond delay between chunks, with no delay after the last chunk; the field accommodates five centered digits.
+- The file card has two actions: **Save data**, aligned with **Open file**, exports the displayed log as `.txt`; **Record data**, aligned with **Send file**, starts raw capture to `.dat` and changes to **Stop recording** while active. Recording is disabled without a connection. Capture state is runtime-only and does not resume after restart; completed `.dat` files remain on disk.
 
-## Configuration and Data Safety
+### Display history limit
 
-Only `config.toml` beside the actual running executable (the bin), after resolving executable symlinks, is supported. The working directory, user configuration directory, and other locations are not searched; save failures do not trigger a fallback directory.
+Choose **Options > Data display > Display buffer limit**: `200K`, `500K`, `1M`, `2M`, or `5M`, default `200K`. Units are decimal (`K = 1000`, `M = 1000000`) and count raw event payload bytes, including outgoing history, not HEX expansion or timestamps.
 
-If the file is missing at startup, the application immediately creates a default configuration. Loading does not overwrite an existing file; a configuration that cannot be read or decoded is not replaced. Creation or save failures are reported; the executable directory must be writable.
+Overflow removes whole oldest events; the newest event is always retained, even if oversized. Lowering the limit trims history immediately; raising it cannot restore discarded data. There is no unlimited option or separate record-count limit. Use **Record data** for raw data independent of the display limit.
 
-The repository-root [`config.toml`](config.toml) is the single source of default settings and a reference for comparison. Just copies it into a generated embedded resource before compilation; Go decodes that template instead of maintaining a second set of defaults. The executable remains standalone and does not read the repository template at runtime. Existing executable-local settings are preserved, with omitted scalar fields initialized from the embedded defaults. An omitted or explicitly empty preset list means no entries; it does not restore the five new-configuration defaults.
+## Send presets
 
-Committed edits mark settings dirty, without writing on each keystroke or starting a save timer. Property-dialog drafts remain separate until confirmation. Dirty settings are saved when used: after a successful port open, accepted send, successful log export or capture start, confirmed port-property change, preset addition or confirmed deletion, or an immediately applied display, language, or preset-panel change. Unchanged operations do not write again; timed and looping sends do not save per packet. Normal exit drains pending saves and writes any remaining dirty draft, leaving an unchanged file untouched. Background saves use immutable snapshots, including independent preset and baud-rate lists; an older save cannot clear a newer edit. Failures keep settings dirty for the next use to retry, and later success notifications do not hide the save error. Unsaved edits can be lost if the process is forcibly terminated.
+Click **Presets** on the send editor's top row to expand the panel, or **Hide** to collapse it.
 
-## Appearance
+- New configurations start with `Preset 1` through `Preset 5`. Only configured entries appear, up to 99, without padding unused slots.
+- Edit each entry's note, data, HEX/CRLF flags, and interval. Send one entry, send checked entries in order, or enable Loop for repeated sending. Stop ends the active task.
+- **Add** appends a blank entry and scrolls to it. Delete requires confirmation; Cancel changes nothing. Remaining entries retain their order and are renumbered consecutively.
+- Add and confirmed Delete save immediately, including blank entries. All entries may be deleted, and an empty list stays empty after restart. Adding and deleting are unavailable while sending.
 
-Windows controls use the Microsoft YaHei UI system font. Receive logs, the main send input, and preset data use the system monospace font, with system fallback for Chinese characters. The icon combines a black serial-port motif with a solid light circular background; its SVG outlines and curve control points are strictly mirrored about the vertical centerline. Icons are embedded, so no separate icon files are needed beside the executable. Windows loads the embedded ICO for the current DPI to avoid blurring fine lines by shrinking an oversized PNG; Linux uses the embedded PNG. `assets/icon.svg` is the maintained source; PNG, multi-size ICO, and Windows `.syso` resources are generated during builds.
+## Language and appearance
+
+Open **Options** in the receive controls. The language button shows **简体中文** in English and **English** in Chinese, indicating the target language. Controls, dialogs, tooltips, and already-visible statuses switch immediately, without restarting, and the choice is saved. The default is English (`en`); Simplified Chinese uses `zh-CN`. Missing or invalid language values use English.
+
+Switching language does not translate or reset serial data, user input, files, preset notes or commands, protocol values, or original operating-system/library errors. Default preset names stay `Preset 1` through `Preset 5` in both languages.
+
+Options also provides On top, text encoding, display history, Show sent data, timestamp packet gap, and receive-font settings. The receive font defaults to `宋体`, 9 pt, black, with a standard 16-color palette. Send and preset data use the system monospace font with Chinese fallback. Icons are embedded; no separate icon files are needed.
+
+## Configuration and data safety
+
+- Only `config.toml` beside the actual executable is used, after resolving executable symlinks. Working and user configuration directories are not searched; save failures never trigger a fallback directory.
+- Missing configuration is created immediately. Existing files, including unreadable or invalid files, are not overwritten on load. Creation and save failures are reported; keep the executable directory writable.
+- The repository [`config.toml`](config.toml) is a default reference, not a runtime dependency. Existing executable-local values are preserved; omitted scalar fields use defaults. Missing or explicitly empty preset lists stay empty rather than restoring the initial entries.
+- Settings save on actual use, including successful connection, accepted sending, file export/capture, confirmed properties, preset addition/deletion, and immediately applied display, language, or preset-panel changes. Editing does not write per keystroke. Normal exit saves remaining drafts; forced termination may lose them. Unchanged uses and exits do not rewrite the file.
+- Save errors remain visible and retry on the next use. Invalid stored encoding or packet-gap values use UTF-8 and `20 ms` with a startup warning, without rewriting the file on load. Invalid display limits use the default.
+- Older configurations without `BaudRates` migrate legacy baud values; an explicit array, including `[]`, takes precedence. Obsolete send-checksum and independent `Packet` settings are ignored and omitted on the next normal save, not rewritten merely on load. `Timestamp` and `PacketGap` remain supported.
+
+## Runtime requirements
+
+- Windows amd64, or Linux amd64 with a graphical session and GTK 3.
+- Read/write permission for the selected serial port.
+- A writable executable directory for creating and saving configuration.
+
+For building from source, tests, and deployment, see [Build and verification workflow](ARCHITECTURE.md#build-and-verification-workflow).
 
 ## Limitations
 
-- The provided recipes target Windows amd64 and Linux amd64. Linux needs the graphical and serial-port permissions described above.
-- Linux supplies the embedded PNG to GTK as the window icon. Whether that icon appears in the native title bar or other desktop surfaces is controlled by the window manager/compositor; GTK does not guarantee title-bar display. A missing title-bar icon alone does not establish an image-loading failure. See the [GTK window-icon contract](https://docs.gtk.org/gtk3/method.Window.set_icon.html). The application keeps native window decorations rather than drawing a replacement title bar to force an icon.
-- Serial drivers determine support for configured baud rates; the multi-send panel supports up to 99 editable entries. Configuration is executable-local only, with no user-directory fallback.
-- Receive follow mode scrolls on each append of displayable data; scrolling back does not pause following.
-- Real serial transmission and reception require an available physical or virtual serial port. Building or launching the UI alone does not establish that serial I/O has been verified.
-
-## Deferred Serial Library Migration
-
-**Decision: worth an isolated trial, but only after regression testing of the other application features is complete. No dependency or serial-backend migration has been applied.** The current backend remains `github.com/albenik/go-serial/v2 v2.6.1`; automatic flow control is not currently exposed by this application.
-
-### Candidates and maintenance
-
-- The current library's latest tagged version is still [`v2.6.1`, with source commit dated 2024-01-28](https://proxy.golang.org/github.com/albenik/go-serial/v2/@latest). Its [last default-branch commit](https://github.com/albenik/go-serial/commit/594ef15cc4760409acc4074b486375a6de28bf54) is also from that date. The repository is not archived, but this is a maintenance risk, not evidence of recent active maintenance.
-- The original upstream, [`go.bug.st/serial v1.8.0`](https://github.com/bugst/go-serial/releases/tag/v1.8.0), was released on 2026-07-15. It has more recent maintenance, but its stable API does not include flow control; [RTS/CTS PR #201](https://github.com/bugst/go-serial/pull/201) remains unmerged.
-- The trial candidate is [`github.com/briardhq/go-serial v1.8.0-briard.1`](https://github.com/briardhq/go-serial/tree/v1.8.0-briard.1), commit `7fa2b2eddb3a0968a2eea9467c39e33e098f526b`, dated 2026-09-30. The implementation is on its `briard` branch, not `master`. It is based on upstream v1.8.0 plus the RTS/CTS patch and a Windows RTS-handshake fix. Its [README](https://github.com/briardhq/go-serial/blob/v1.8.0-briard.1/README.md) explicitly calls it a temporary fork until upstream releases the feature; long-term maintenance is not established. If upstream gains equivalent stable support before migration, prefer upstream instead.
-
-### Findings and migration blockers
-
-- The candidate declares Go 1.25.0 and only `golang.org/x/sys` as a module dependency. The current Go 1.27.4 build toolchain already satisfies that toolchain floor; this does not remove the I/O behavior checks below.
-- Source inspection confirms `Mode.RTSCTSFlowControl` enables Linux `CRTSCTS` and Windows CTS output gating plus driver-managed RTS handshake. It does **not** add XON/XOFF software flow control or DTR/DSR flow control. This is source-level evaluation, not hardware verification.
-- `SetMode` does not apply changes to the flow-control field. Flow-control changes must reopen the port unless this is addressed and tested separately.
-- Our current open path calls manual `SetRTS` after opening. The candidate's Windows `SetRTS` replaces the RTS handshake bits, so a migration must avoid that call while hardware flow control owns RTS, including later DTR-only updates. Manual DTR and non-flow-controlled RTS behavior must remain available.
-- The candidate uses a `Port` interface and `Mode` configuration instead of our current concrete port and option functions. It has `SetReadTimeout`, but no public write-timeout API. Preserve the application's 10ms receive-idle polling and 250ms write deadline; do not silently replace a bounded write with an indefinitely pending write.
-- Its Unix implementation still switches the descriptor to blocking mode after opening. The existing nonblocking I/O and borrowed-descriptor compatibility work cannot simply be deleted or reused unchanged. Retain the existing Windows port enumeration and device descriptions; a library change must not replace them with intrusive USB probing.
-
-### Historical receive-compatibility gate
-
-The UART migration history supplied by the user is an additional blocker, not evidence that switching back is now safe. Commit `8873737` (2024-08-29) changed the active UART implementation to albenik and explicitly reported that the first-byte-timeout strategy could "break rx data", while `SetReadTimeout` plus `ReadyToRead` worked better and faster. The later mutex change was separate from that original reason. The old `go.bug.st/serial v1.6.2` dependency was actually replaced by [`github.com/fcying/go-serial` at `312149864b96`](https://github.com/fcying/go-serial/tree/312149864b9635cb5702daf7966eeca833c8755a), so comparisons must use that fork rather than assume unmodified upstream behavior.
-
-Source comparison of that old fork and `v1.8.0-briard.1` does **not** establish a fix for the historical receive problem:
-
-- Both Windows implementations still use the first-byte-return configuration for positive read timeouts (`ReadIntervalTimeout` and `ReadTotalTimeoutMultiplier` both `MAXDWORD`). The newer CH340 workaround changes the infinite/very-large timeout constant to `0x7FFFFFFE`; it does not demonstrate a fix for the old positive 1ms timeout path.
-- The old fork reports an empty timed-out read as a `Timeout` error, while the candidate returns `(0, nil)` for a configured read timeout. The adapter must preserve the intended caller behavior rather than treat this semantic change as proof that lost data was fixed.
-- The current UART wrapper polls `ReadyToRead` with immediate reads and handles waiting in its own deadline loop. The current SerialGo backend instead uses a 10ms first-byte timeout on Windows, and `Session.receive` continuously copies every returned byte slice. These are different consumers; one `Read` completion is not a protocol-frame boundary. Display grouping and raw byte preservation must be evaluated separately.
-- Albenik also provides `SetFirstByteReadTimeout`, but the UART implementation deliberately avoids it. A migration must preserve the polling workaround or demonstrate equivalent reliable receive behavior; a newer library version alone is not the acceptance criterion.
-- The reviewed briard `Port` interface has no public `ReadyToRead` method, so the UART workaround cannot simply be copied into that backend. Do not assume its `SetReadTimeout(0)` is equivalent to albenik's immediate-read mode. An equivalent waiting/reading path needs separate evaluation. The current SerialGo strategy differs from UART's, but the historical record alone does not establish that SerialGo loses data.
-- The UART wrapper's current `ReadLength` also reads into a larger buffer and clamps the copied count to the remaining requested length without retaining excess bytes. If multiple frames are available, this caller-side truncation must be isolated from any library defect. No UART code is changed by this evaluation.
-
-Before considering a switch, first reproduce the historical receive workload on the same adapter/driver where possible. Compare the working UART polling strategy against the pinned candidate with identical data, baud rate, timeout, and receive workload: single-byte arrivals, header followed by a delayed tail, back-to-back frames, bursts, sustained traffic, and timeout followed by new data. Check raw byte order, sequence numbers/checksums, and total bytes for loss, duplication, or truncation; do not compare only `Read` sizes or displayed line breaks. Resolve any exact-length over-read behavior in the test consumer so it cannot bias the comparison. Without this evidence, the historical problem remains unverified and the candidate remains deferred even if RTS/CTS works.
-
-### Deferred trial and acceptance gate
-
-1. Complete the base application features and their regression testing first. Then reassess upstream/fork maintenance, available releases, flow-control fixes, receive APIs, and the historical timeout problem before deciding whether to trial a migration. This section records the current findings, not approval to switch automatically. If a trial is still justified, perform it as a separate backend change and pin the newly reviewed tag/commit rather than a floating branch.
-2. Keep the `communication/serialport` wrapper contract, executable-local configuration, saved framing and control-line values, presets, and UI behavior unchanged. Adapt opening, timeouts, errors, and handle ownership inside the backend; do not treat an import-path replacement as a complete migration.
-3. Before adoption, verify real Windows serial transmission/reception, custom baud rates, file sending, packet-gap display, manual RTS/DTR, blocked CTS and resume, driver-managed RTS, write timeout, stop/close responsiveness, disconnect/reconnect, and repeated open/close. Use hardware or a virtual setup that actually supports handshake signals; UI launch alone is insufficient.
-4. Follow the existing Linux policy: build only by default. Do not claim Linux I/O or hardware-flow-control validation without exercising it. The trial is not considered accepted until the existing timeout/cancellation guarantees and Windows serial behavior have been demonstrated.
+- Provided builds target Windows amd64 and Linux amd64. Drivers determine supported baud rates and control-line behavior. No automatic-flow-control setting is currently exposed.
+- Linux window-icon display depends on the window manager/compositor; a missing title-bar icon alone does not indicate loading failure. See the [GTK window-icon contract](https://docs.gtk.org/gtk3/method.Window.set_icon.html).
+- Real serial transmission and reception require a physical or virtual serial port. Building or launching the UI does not verify serial I/O.
 
 ## License
 

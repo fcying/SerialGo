@@ -61,6 +61,46 @@ func NormalizeDisplayBufferLimit(bytes int) int {
 	return defaultSettings.DisplayBufferLimit
 }
 
+const (
+	DefaultReceiveFont      = "宋体"
+	DefaultReceiveFontSize  = 9
+	DefaultReceiveFontColor = "#000000"
+	MinReceiveFontSize      = 5
+	MaxReceiveFontSize      = 72
+)
+
+func NormalizeReceiveFont(family string) string {
+	family = strings.TrimSpace(family)
+	if family == "" {
+		return DefaultReceiveFont
+	}
+	return family
+}
+
+func NormalizeReceiveFontSize(size int) int {
+	if size < MinReceiveFontSize || size > MaxReceiveFontSize {
+		return DefaultReceiveFontSize
+	}
+	return size
+}
+
+func NormalizeReceiveFontColor(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) != 7 || value[0] != '#' {
+		return DefaultReceiveFontColor
+	}
+	if _, err := strconv.ParseUint(value[1:], 16, 24); err != nil {
+		return DefaultReceiveFontColor
+	}
+	return strings.ToUpper(value)
+}
+
+func validReceiveFontSettings(settings Settings) bool {
+	return strings.TrimSpace(settings.ReceiveFont) != "" &&
+		settings.ReceiveFontSize >= MinReceiveFontSize && settings.ReceiveFontSize <= MaxReceiveFontSize &&
+		NormalizeReceiveFontColor(settings.ReceiveFontColor) == strings.ToUpper(settings.ReceiveFontColor)
+}
+
 type Settings struct {
 	Port                                serialport.Settings
 	BaudRates                           []string
@@ -71,6 +111,9 @@ type Settings struct {
 	SendHex, CRLF, ReceiveHex, ShowSent bool
 	Timestamp, ShowPresets              bool
 	DisplayBufferLimit                  int      // Retained event payload bytes, not rendered text bytes.
+	ReceiveFont                         string   // Font family for the receive display.
+	ReceiveFontSize                     int      // Font size in points.
+	ReceiveFontColor                    string   // Foreground color as #RRGGBB.
 	Presets                             []Preset `toml:"-"`
 }
 
@@ -92,6 +135,9 @@ func parseDefaultSettings(source string) (Settings, error) {
 	}
 	if !validDisplayBufferLimit(settings.DisplayBufferLimit) {
 		return Settings{}, errors.New("invalid embedded default configuration: unsupported display buffer limit")
+	}
+	if !validReceiveFontSettings(settings) {
+		return Settings{}, errors.New("invalid embedded default configuration: unsupported receive font settings")
 	}
 	settings.Presets = stored.Presets
 	return settings, nil
@@ -184,6 +230,9 @@ func decode(path string, s *Settings) error {
 		s.Language = defaultSettings.Language
 	}
 	s.DisplayBufferLimit = NormalizeDisplayBufferLimit(s.DisplayBufferLimit)
+	s.ReceiveFont = NormalizeReceiveFont(s.ReceiveFont)
+	s.ReceiveFontSize = NormalizeReceiveFontSize(s.ReceiveFontSize)
+	s.ReceiveFontColor = NormalizeReceiveFontColor(s.ReceiveFontColor)
 	return nil
 }
 
@@ -220,7 +269,9 @@ func Save(path string, s Settings) error {
 			fmt.Sprintf("Too many presets: got %d, maximum %d", len(s.Presets), PresetCount),
 		)
 	}
-	s.DisplayBufferLimit = NormalizeDisplayBufferLimit(s.DisplayBufferLimit)
+	s.ReceiveFont = NormalizeReceiveFont(s.ReceiveFont)
+	s.ReceiveFontSize = NormalizeReceiveFontSize(s.ReceiveFontSize)
+	s.ReceiveFontColor = NormalizeReceiveFontColor(s.ReceiveFontColor)
 	// An explicit empty list records manual deletion and must survive reload.
 	if s.BaudRates == nil {
 		s.BaudRates = []string{}

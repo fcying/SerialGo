@@ -20,6 +20,7 @@ func (s *controller) applyPortSettings() {
 }
 
 func (s *controller) portSettingsDialog(c *ui.Context) {
+	wasOpen := s.portSettingsOpen
 	ui.Modal(c.Key("port-settings-dialog"), &s.portSettingsOpen, func() {
 		p := &s.portDraft
 		open := s.app.Connected() || s.app.PortBusy
@@ -48,10 +49,16 @@ func (s *controller) portSettingsDialog(c *ui.Context) {
 			})
 			ui.Row(c.Key("actions")).FillWidth().Gap(8).Justify(ui.End).Children(func() {
 				ui.Button(c.Key("ok"), s.tr("确定", "OK")).Width(76).Height(28).OnClick(s.applyPortSettings)
-				ui.Button(c.Key("cancel"), s.tr("取消", "Cancel")).Width(76).Height(28).OnClick(func() { s.portSettingsOpen = false })
+				ui.Button(c.Key("cancel"), s.tr("取消", "Cancel")).Width(76).Height(28).OnClick(func() {
+					s.portSettingsOpen = false
+					s.portDraft = s.settings.Port
+				})
 			})
 		})
 	}).Label(s.tr("串口设置", "Port settings"))
+	if wasOpen && !s.portSettingsOpen {
+		s.portDraft = s.settings.Port
+	}
 }
 
 func portSettingSelect(c *ui.Context, id, label string, value *string, options []string, disabled bool) {

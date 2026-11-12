@@ -18,7 +18,46 @@ func portSettingsFixture(t *testing.T) (*controller, <-chan func()) {
 		Name: `\\.\COM17`, Baud: "115200", DataBits: "8", Parity: "None", StopBits: "1",
 	}
 	s.settings.BaudRates = []string{"9600", "115200"}
+	s.portDraft = s.settings.Port
 	return s, notified
+}
+
+func TestPortFramingSelectionAppliesOnlyOnConfirmation(t *testing.T) {
+	s, notified := portSettingsFixture(t)
+	s.configureLog()
+	original := s.settings.Port
+	tt := gui.NewTester(s.view, 1280, 600)
+	if err := tt.Click("Port configuration"); err != nil {
+		t.Fatal(err)
+	}
+	trigger, found := tt.AccessByRole(gui.RolePopUpButton, "Data bits")
+	if !found || trigger.Disabled {
+		t.Fatal("property data-bits selector is missing or disabled")
+	}
+	tt.ClickAt(trigger.Bounds.X+trigger.Bounds.W/2, trigger.Bounds.Y+trigger.Bounds.H/2)
+	option, found := tt.AccessByRole(gui.RoleOption, "7")
+	if !found || option.Disabled || option.Offscreen {
+		t.Fatal("data-bits option 7 is unavailable")
+	}
+	tt.ClickAt(option.Bounds.X+option.Bounds.W/2, option.Bounds.Y+option.Bounds.H/2)
+	if s.settings.Port != original || s.portDraft.DataBits != "7" || s.app.SettingsDirty {
+		t.Fatalf("framing draft was committed before confirmation: port=%+v draft=%+v dirty=%v", s.settings.Port, s.portDraft, s.app.SettingsDirty)
+	}
+	if _, err := os.Stat(s.app.SettingsPath); !os.IsNotExist(err) {
+		t.Fatalf("editing framing created a configuration before confirmation: %v", err)
+	}
+	if err := tt.Click("OK"); err != nil {
+		t.Fatal(err)
+	}
+	want := original
+	want.DataBits = "7"
+	if s.settings.Port != want || s.portDraft.DataBits != "7" || !s.app.SettingsDirty {
+		t.Fatalf("confirmed framing selection was not applied: port=%+v draft=%+v dirty=%v", s.settings.Port, s.portDraft, s.app.SettingsDirty)
+	}
+	completeSettingsSave(t, s, notified)
+	if stored := readSavedSettings(t, s.app.SettingsPath); stored.Port != want || s.app.SettingsDirty {
+		t.Fatalf("confirmed framing selection was not persisted: port=%+v dirty=%v", stored.Port, s.app.SettingsDirty)
+	}
 }
 
 func TestPortSettingsDraftDoesNotChangeSettings(t *testing.T) {
@@ -52,7 +91,7 @@ func TestPortSettingsCancelAndEscapeDiscardDraft(t *testing.T) {
 			original, revision := *s.settings, s.app.SettingsRevision
 			s.configureLog()
 			tt := gui.NewTester(s.view, 800, 600)
-			if err := tt.Click("Port settings"); err != nil {
+			if err := tt.Click("Port configuration"); err != nil {
 				t.Fatal(err)
 			}
 			if !s.portSettingsOpen {
@@ -72,10 +111,10 @@ func TestPortSettingsCancelAndEscapeDiscardDraft(t *testing.T) {
 			} else if err := tt.Click("Cancel"); err != nil {
 				t.Fatal(err)
 			}
-			if s.portSettingsOpen || !reflect.DeepEqual(*s.settings, original) || s.app.SettingsDirty || s.app.SettingsRevision != revision {
-				t.Fatal("dismissing the property dialog applied draft settings")
+			if s.portSettingsOpen || !reflect.DeepEqual(*s.settings, original) || s.portDraft != original.Port || s.app.SettingsDirty || s.app.SettingsRevision != revision {
+				t.Fatal("dismissing the property dialog did not restore settings and framing controls")
 			}
-			if err := tt.Click("Port settings"); err != nil {
+			if err := tt.Click("Port configuration"); err != nil {
 				t.Fatal(err)
 			}
 			if !s.portSettingsOpen || s.portDraft != original.Port || s.portSettingsError != (localizedText{}) {

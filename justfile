@@ -11,7 +11,7 @@ ldflags := "-s -w"
 test_dir := "/mnt/d/project/SerialGo"
 powershell := "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 
-_default: build
+_default: test
 
 _config:
     cp -- config.toml assets/default-config.toml

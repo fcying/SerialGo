@@ -22,16 +22,18 @@ type logOptions struct {
 }
 
 type receiveLog struct {
-	options              logOptions
-	events               []internal.Event
-	bytes                int
-	text                 ui.TextBuffer
-	scroll               ui.ScrollState
-	decoder              transform.Transformer
-	pending              []byte
-	last                 internal.Event
-	started, newline, cr bool
-	scrollToEnd          bool
+	options                                         logOptions
+	events                                          []internal.Event
+	bytes                                           int
+	text                                            ui.TextBuffer
+	scroll                                          ui.ScrollState
+	decoder                                         transform.Transformer
+	pending                                         []byte
+	last                                            internal.Event
+	started, newline, cr                            bool
+	scrollToEnd, autoScrollDisabled, preserveScroll bool
+	scrollAnchor                                    int
+	viewportHeight                                  float32
 }
 
 func (l *receiveLog) clear() {
@@ -50,6 +52,9 @@ func (l *receiveLog) configure(options logOptions) {
 }
 
 func (l *receiveLog) rebuild() {
+	if l.autoScrollDisabled {
+		l.captureScrollAnchor()
+	}
 	l.decoder = internal.Decoder(l.options.encoding)
 	l.pending = l.pending[:0]
 	l.started, l.newline, l.cr = false, true, false
@@ -59,7 +64,27 @@ func (l *receiveLog) rebuild() {
 		l.render(&out, event)
 	}
 	l.text.Set(out.String())
-	l.scrollToEnd = true
+	l.scrollToEnd = !l.autoScrollDisabled
+}
+
+func (l *receiveLog) captureScrollAnchor() {
+	if l.preserveScroll {
+		return
+	}
+	length := l.text.Len()
+	if length == 0 {
+		l.scrollAnchor = 0
+	} else {
+		totalHeight := l.scroll.MaxY + l.viewportHeight
+		if totalHeight <= 0 {
+			l.scrollAnchor = 0
+		} else {
+			center := min(max(l.scroll.Y+l.viewportHeight/2, 0), totalHeight)
+			l.scrollAnchor = int(float32(length) * center / totalHeight)
+			l.scrollAnchor = min(max(l.scrollAnchor, 0), length)
+		}
+	}
+	l.preserveScroll = true
 }
 
 // trim evicts complete oldest events but always keeps the newest one, even
@@ -113,9 +138,12 @@ func (l *receiveLog) append(events []internal.Event) {
 	if out.Len() == 0 {
 		return
 	}
+	if l.autoScrollDisabled {
+		l.captureScrollAnchor()
+	}
 	end := l.text.Len()
 	l.text.Replace(end, end, out.String())
-	l.scrollToEnd = true
+	l.scrollToEnd = !l.autoScrollDisabled
 }
 
 func (l *receiveLog) render(out *strings.Builder, event internal.Event) {

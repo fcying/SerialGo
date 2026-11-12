@@ -223,3 +223,51 @@ func TestReceiveLogEmptyEventsDoNotConsumeHistory(t *testing.T) {
 		t.Fatal("clear did not release retained history")
 	}
 }
+
+func TestReceiveLogAutoScrollCanPauseAndResume(t *testing.T) {
+	s := newController(&internal.App{})
+	s.settings.Language = "en"
+	s.log.viewportHeight = 160
+	s.configureLog()
+	s.log.append([]internal.Event{{Data: []byte(strings.Repeat("received line\n", 120))}})
+	tt := gui.NewTester(s.receivePane, 400, 160)
+	box, found := tt.Find("Receive log")
+	if !found || s.log.scroll.MaxY <= 0 {
+		t.Fatal("receive history does not overflow the window")
+	}
+	tt.ClickAt(box.X+10, box.Y+10)
+	tt.Key(gui.Ctrl, gui.KeyHome)
+	tt.Scroll(box.X+box.W/2, box.Y+box.H/2, 0, -100_000)
+	s.autoScroll = false
+	s.autoScrollChanged()
+	tt.Frame()
+	previousY := s.log.scroll.Y
+	previousText := s.log.text.String()
+	s.log.append([]internal.Event{{Data: []byte(strings.Repeat("new data\n", 40))}})
+	tt.Frame()
+	if s.log.text.String() == previousText || !strings.Contains(s.log.text.String(), "new data") {
+		t.Fatal("received text was not appended while auto scroll was disabled")
+	}
+	if s.log.scroll.Y < previousY-2 || s.log.scroll.Y > previousY+2 || s.log.scroll.Y >= s.log.scroll.MaxY {
+		t.Fatalf("disabled auto scroll did not preserve the viewport: before=%v after=%v max=%v", previousY, s.log.scroll.Y, s.log.scroll.MaxY)
+	}
+	s.log.scroll.Y = s.log.scroll.MaxY / 2
+	tt.Frame()
+	middleY := s.log.scroll.Y
+	beforeMixedText := s.log.text.Len()
+	s.log.append([]internal.Event{{Data: []byte(strings.Repeat("long incoming payload with variable line width ", 100) + "\n")}})
+	tt.Frame()
+	if s.log.text.Len() <= beforeMixedText || !strings.Contains(s.log.text.String(), "variable line width") {
+		t.Fatal("later receive data was not appended while auto scroll was disabled")
+	}
+	maxDrift := s.log.viewportHeight
+	if s.log.scroll.Y < middleY-maxDrift || s.log.scroll.Y > middleY+maxDrift || s.log.scroll.Y >= s.log.scroll.MaxY-s.log.viewportHeight/2 {
+		t.Fatalf("disabled auto scroll moved the middle viewport to the latest data: before=%v after=%v max=%v", middleY, s.log.scroll.Y, s.log.scroll.MaxY)
+	}
+	s.autoScroll = true
+	s.autoScrollChanged()
+	tt.Frame()
+	if s.log.scroll.Y != s.log.scroll.MaxY {
+		t.Fatalf("resuming auto scroll did not reveal the latest data: Y=%g, MaxY=%g", s.log.scroll.Y, s.log.scroll.MaxY)
+	}
+}

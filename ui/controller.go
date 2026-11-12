@@ -12,32 +12,44 @@ import (
 )
 
 type controller struct {
-	app                               *internal.App
-	settings                          *config.Settings
-	window                            *mygo.Window
-	log                               receiveLog
-	portMenuOpen, portMenuRefreshed   bool
-	portSettingsOpen, optionsOpen     bool
-	portDraft                         serialport.Settings
-	portBaudRatesDraft                []string
-	portSettingsError                 localizedText
-	baudPickers                       [2]baudPickerState
-	customBaudOpen, customBaudForPort bool
-	customBaudText                    string
-	customBaudError                   localizedText
-	baudDeleteOpen, baudDeleteForPort bool
-	baudDeleteValue                   string
-	baudDeleteError                   localizedText
-	alwaysOnTop, dialogBusy           bool
-	presetSplit, receiveSplit         float32
-	presetList                        ui.ListState
-	presetGeneration                  int
-	presetDeleteOpen                  bool
-	presetDeleteIndex                 int
+	app                                                               *internal.App
+	settings                                                          *config.Settings
+	window                                                            *mygo.Window
+	log                                                               receiveLog
+	portMenuOpen, portMenuRefreshed                                   bool
+	portSettingsOpen, optionsOpen                                     bool
+	portDraft                                                         serialport.Settings
+	portBaudRatesDraft                                                []string
+	portSettingsError                                                 localizedText
+	baudPickers                                                       [2]baudPickerState
+	connectionContentWidth, connectionBaudWidth                       float32
+	connectionLanguage                                                string
+	customBaudOpen, customBaudForPort                                 bool
+	customBaudText                                                    string
+	customBaudError                                                   localizedText
+	baudDeleteOpen, baudDeleteForPort                                 bool
+	baudDeleteValue                                                   string
+	baudDeleteError                                                   localizedText
+	receiveFontDialogOpen                                             bool
+	receiveFontNameDraft, receiveFontSizeDraft, receiveFontColorDraft string
+	receiveFontColorChoice                                            string
+	packetGapDraft                                                    string
+	packetGapError                                                    localizedText
+	receiveFontError                                                  localizedText
+	autoScroll, alwaysOnTop, dialogBusy                               bool
+	presetSplit, receiveSplit                                         float32
+	receiveSplitAdjusted                                              bool
+	presetList                                                        ui.ListState
+	presetGeneration                                                  int
+	presetDeleteOpen                                                  bool
+	presetDeleteIndex                                                 int
 }
 
 func newController(app *internal.App) *controller {
-	return &controller{app: app, settings: &app.Settings, presetSplit: 64}
+	return &controller{
+		app: app, settings: &app.Settings, portDraft: app.Settings.Port,
+		presetSplit: 64, autoScroll: true,
+	}
 }
 
 func Run(app *internal.App, title string) error {
@@ -49,7 +61,7 @@ func Run(app *internal.App, title string) error {
 	mygo.App.SetMenu(nil)
 	mygo.App.WhenReady(func() {
 		s.window = mygo.NewWindow(mygo.WindowOptions{
-			Title: title, Width: 800, Height: 600, MinWidth: 780, MinHeight: 420,
+			Title: title, Width: 800, Height: 600, MinWidth: 800, MinHeight: 420,
 			Content: ui.View(s.view),
 		})
 		app.Startup(s)
@@ -71,6 +83,17 @@ func (s *controller) AppendEvents(events []internal.Event) { s.log.append(events
 func (s *controller) statusText() string                   { return s.tr(s.app.Status.ZH, s.app.Status.EN) }
 func (s *controller) applyAlwaysOnTop()                    { s.window.SetAlwaysOnTop(s.alwaysOnTop) }
 
+func (s *controller) autoScrollChanged() {
+	s.log.autoScrollDisabled = !s.autoScroll
+	if s.autoScroll {
+		s.log.preserveScroll = false
+		s.log.scrollToEnd = true
+		return
+	}
+	s.log.scrollToEnd = false
+	s.log.captureScrollAnchor()
+}
+
 func (s *controller) configureLog() {
 	p := s.settings
 	var gap time.Duration
@@ -91,6 +114,28 @@ func (s *controller) displaySettingsChanged() {
 func (s *controller) applyDisplaySettings() {
 	s.displaySettingsChanged()
 	s.app.SaveUsedSettings()
+}
+
+func (s *controller) openOptions() {
+	s.packetGapDraft = s.settings.PacketGap
+	s.packetGapError = localizedText{}
+	s.optionsOpen = true
+}
+
+func (s *controller) packetGapChanged() {
+	if _, err := internal.Milliseconds(s.packetGapDraft, "分包超时", 1); err != nil {
+		s.packetGapError = localizedText{
+			zh: "时间戳分包超时必须为 1 到 86400000 ms 的整数",
+			en: "Timestamp packet gap must be an integer from 1 to 86400000 ms",
+		}
+		return
+	}
+	s.packetGapError = localizedText{}
+	if s.settings.PacketGap == s.packetGapDraft {
+		return
+	}
+	s.settings.PacketGap = s.packetGapDraft
+	s.displaySettingsChanged()
 }
 
 func (s *controller) chooseFile() {
@@ -134,19 +179,15 @@ func (s *controller) saveLog() {
 	if s.app.FileBusy {
 		return
 	}
-	s.saveDialog(s.tr("保存显示数据", "Save displayed data"), "SerialGo.txt", func(path string) {
+	s.saveDialog(s.tr("导出显示日志", "Export displayed log"), "SerialGo.txt", func(path string) {
 		s.app.SaveLog(path, s.log.text.String())
 	})
 }
 
-func (s *controller) toggleCapture() {
-	if s.app.FileBusy || !s.app.Connected() {
-		return
-	}
-	if s.app.CapturePath != "" {
-		s.app.StopCapture()
+func (s *controller) startCapture() {
+	if s.app.FileBusy || !s.app.Connected() || s.app.CapturePath != "" {
 		return
 	}
 	accept := s.app.CaptureTarget()
-	s.saveDialog(s.tr("接收原始字节到文件", "Receive raw bytes to file"), "SerialGo-rx.bin", accept)
+	s.saveDialog(s.tr("录制原始接收数据", "Record raw received data"), "SerialGo-rx.dat", accept)
 }

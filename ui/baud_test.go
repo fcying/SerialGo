@@ -18,6 +18,7 @@ func baudSettingsFixture(t *testing.T) (*controller, <-chan func()) {
 		Name: "COM17", Baud: "115200", DataBits: "8", Parity: "None", StopBits: "1", DTR: true,
 	}
 	s.settings.BaudRates = []string{"115200", "250000", "500000"}
+	s.portDraft = s.settings.Port
 	if err := config.Save(s.app.SettingsPath, *s.settings); err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +160,7 @@ func TestCustomBaudCancelAndEscapeThroughUI(t *testing.T) {
 					s.configureLog()
 					tt := gui.NewTester(s.view, 800, 600)
 					if forPort {
-						if err := tt.Click(s.tr("串口设置", "Port settings")); err != nil {
+						if err := tt.Click(s.tr("串口配置", "Port configuration")); err != nil {
 							t.Fatal(err)
 						}
 					}
@@ -197,7 +198,7 @@ func TestPropertyCustomBaudCommitsOnlyAtOuterConfirmation(t *testing.T) {
 			original := baudSettingsSnapshot(s)
 			s.configureLog()
 			tt := gui.NewTester(s.view, 800, 600)
-			if err := tt.Click(s.tr("串口设置", "Port settings")); err != nil {
+			if err := tt.Click(s.tr("串口配置", "Port configuration")); err != nil {
 				t.Fatal(err)
 			}
 			for _, value := range []string{"038400", "750000"} {
@@ -363,7 +364,7 @@ func TestNumericBaudOptionsRemainNormallySelectable(t *testing.T) {
 			s.configureLog()
 			tt := gui.NewTester(s.view, 800, 600)
 			if forPort {
-				if err := tt.Click(s.tr("串口设置", "Port settings")); err != nil {
+				if err := tt.Click(s.tr("串口配置", "Port configuration")); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -479,7 +480,7 @@ func TestBaudDeleteCancelAndEscapeDoNotSelectOrSave(t *testing.T) {
 					s.configureLog()
 					tt := gui.NewTester(s.view, 800, 600)
 					if forPort {
-						if err := tt.Click(s.tr("串口设置", "Port settings")); err != nil {
+						if err := tt.Click(s.tr("串口配置", "Port configuration")); err != nil {
 							t.Fatal(err)
 						}
 					}
@@ -507,7 +508,7 @@ func TestPropertyBaudDeletionCommitsOnlyAtOuterConfirmation(t *testing.T) {
 			original := baudSettingsSnapshot(s)
 			s.configureLog()
 			tt := gui.NewTester(s.view, 800, 600)
-			if err := tt.Click(s.tr("串口设置", "Port settings")); err != nil {
+			if err := tt.Click(s.tr("串口配置", "Port configuration")); err != nil {
 				t.Fatal(err)
 			}
 			openBaudDeleteThroughUI(t, tt, s, "115200", true)
@@ -541,13 +542,52 @@ func TestPropertyBaudDeletionCommitsOnlyAtOuterConfirmation(t *testing.T) {
 				if !reflect.DeepEqual(*s.settings, original) || s.app.SettingsDirty {
 					t.Fatal("outer cancellation committed the deletion")
 				}
-				if err := tt.Click(s.tr("串口设置", "Port settings")); err != nil {
+				if err := tt.Click(s.tr("串口配置", "Port configuration")); err != nil {
 					t.Fatal(err)
 				}
 				if s.portDraft != original.Port || !slices.Equal(s.portBaudRatesDraft, original.BaudRates) {
 					t.Fatal("reopening properties retained a canceled deletion")
 				}
 				requireBaudUnwritten(t, s, notified, original)
+			}
+		})
+	}
+}
+
+func TestBaudDigitsCenteredInTextArea(t *testing.T) {
+	for _, value := range []string{"9600", "115200", "1000000"} {
+		t.Run(value, func(t *testing.T) {
+			s := newController(&internal.App{Settings: config.Settings{
+				Language: "en", Port: serialport.Settings{Baud: value}, BaudRates: []string{value},
+			}})
+			tt := gui.NewTester(func(c *gui.Context) {
+				c.SetTheme(lightTheme)
+				gui.Row(c).Padding(10).Children(func() { s.baudPicker(c, false, controlHeight) })
+			}, 180, 60)
+			tt.SetScale(2)
+			picker, found := tt.AccessByRole(gui.RolePopUpButton, "Baud rate")
+			if !found {
+				t.Fatal("baud selector is missing")
+			}
+			left := picker.Bounds.X + baudPickerBorderWidth + baudPickerPaddingX
+			right := picker.Bounds.X + picker.Bounds.W - baudPickerBorderWidth - baudPickerPaddingX - baudPickerArrowSize - baudPickerGap
+			img := tt.Image()
+			minX, maxX := img.Bounds().Max.X, -1
+			for y := int((picker.Bounds.Y + 4) * 2); y < int((picker.Bounds.Y + picker.Bounds.H - 4) * 2); y++ {
+				for x := int(left * 2); x < int(right * 2); x++ {
+					pixel := img.RGBAAt(x, y)
+					if pixel.R < 100 && pixel.G < 100 && pixel.B < 100 {
+						minX, maxX = min(minX, x), max(maxX, x)
+					}
+				}
+			}
+			if maxX < minX {
+				t.Fatal("rendered baud digits are missing")
+			}
+			inkCenter := float32(minX+maxX+1) / 4
+			textAreaCenter := (left + right) / 2
+			if inkCenter < textAreaCenter-1 || inkCenter > textAreaCenter+1 {
+				t.Errorf("rendered digits are not centered in the text area: inkCenter=%.2f textAreaCenter=%.2f", inkCenter, textAreaCenter)
 			}
 		})
 	}

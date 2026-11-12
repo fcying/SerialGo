@@ -18,7 +18,11 @@ func (v *settingsTestView) AppendEvents([]internal.Event) {}
 
 func settingsSaveFixture(t *testing.T, path string) (*controller, <-chan func()) {
 	t.Helper()
-	app := &internal.App{SettingsPath: path, Settings: config.Settings{Language: "en", DisplayBufferLimit: config.NormalizeDisplayBufferLimit(0), Presets: []config.Preset{config.NewPreset()}}}
+	app := &internal.App{SettingsPath: path, Settings: config.Settings{
+		Language: "en", DisplayBufferLimit: config.NormalizeDisplayBufferLimit(0),
+		ReceiveFont: config.DefaultReceiveFont, ReceiveFontSize: config.DefaultReceiveFontSize, ReceiveFontColor: config.DefaultReceiveFontColor,
+		Presets: []config.Preset{config.NewPreset()},
+	}}
 	s := newController(app)
 	view := &settingsTestView{callbacks: make(chan func(), 32)}
 	app.Startup(view)

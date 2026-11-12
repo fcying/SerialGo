@@ -42,6 +42,33 @@ func TestPortSettingsConnectedFramingRemainsUnchanged(t *testing.T) {
 	}
 }
 
+func TestPortRefreshErrorPreservesLastKnownSelection(t *testing.T) {
+	app := &App{Settings: config.Settings{Port: serialport.Settings{Name: "COM7"}}}
+	app.SetPorts([]serialport.Info{{Name: "COM7", Description: "USB adapter"}})
+	portSettings := app.Settings.Port
+	portLabels := slices.Clone(app.PortLabels)
+	portChoice := app.PortChoice
+	revision := app.SettingsRevision
+	app.SettingsDirty = false
+	app.PortBusy = true
+	app.RefreshingPorts = true
+
+	app.applyPortRefresh(nil, errors.New("temporary enumeration failure"))
+	if app.PortBusy || app.RefreshingPorts || !app.StatusError {
+		t.Fatal("failed enumeration did not finish with an error status")
+	}
+	if app.Settings.Port != portSettings || app.PortChoice != portChoice || !slices.Equal(app.PortLabels, portLabels) || app.SettingsDirty || app.SettingsRevision != revision {
+		t.Fatal("failed enumeration changed the saved port, visible list or settings revision")
+	}
+
+	app.PortBusy = true
+	app.RefreshingPorts = true
+	app.applyPortRefresh([]serialport.Info{{Name: "COM7", Description: "updated adapter"}, {Name: "COM8"}}, nil)
+	if app.PortBusy || app.RefreshingPorts || app.Settings.Port.Name != "COM7" || app.PortChoice != "COM7 updated adapter" || len(app.PortLabels) != 2 || app.StatusError {
+		t.Fatalf("successful retry did not refresh the retained selection: %+v", app)
+	}
+}
+
 func TestPortSettingsLineFailureKeepsSettingsAndStatus(t *testing.T) {
 	for _, line := range []string{"DTR", "RTS"} {
 		for _, dirty := range []bool{false, true} {
@@ -194,9 +221,32 @@ func TestSaveLogAndCaptureFilesBelongToApp(t *testing.T) {
 	}
 	s.CapturePath = logPath
 	s.SaveLog(logPath, "must not overwrite")
+	if !s.FileBusy {
+		t.Fatal("active capture path check did not expose pending work")
+	}
+	awaitAppCallback(t, v)
+	if s.FileBusy {
+		t.Fatal("active capture path check left save work pending")
+	}
 	data, err = os.ReadFile(logPath)
 	if err != nil || string(data) != "displayed data" {
 		t.Fatal("display save overwrote active capture")
+	}
+	aliasPath := filepath.Join(dir, "capture-alias.bin")
+	if err := os.Link(logPath, aliasPath); err != nil {
+		t.Fatalf("create hard-link alias: %v", err)
+	}
+	s.SaveLog(aliasPath, "must not overwrite through an alias")
+	if !s.FileBusy {
+		t.Fatal("active capture alias check did not expose pending work")
+	}
+	awaitAppCallback(t, v)
+	if s.FileBusy {
+		t.Fatal("active capture alias check left save work pending")
+	}
+	data, err = os.ReadFile(logPath)
+	if err != nil || string(data) != "displayed data" {
+		t.Fatal("display save overwrote the active capture through a path alias")
 	}
 	s.CapturePath = ""
 	s.session = &Session{ctx: context.Background()}
@@ -219,6 +269,38 @@ func TestSaveLogAndCaptureFilesBelongToApp(t *testing.T) {
 		t.Fatal("capture stop retained file ownership")
 	}
 	s.jobs.Wait()
+}
+
+func TestStartupSettingsFallbackWarnsWithoutMaskingErrors(t *testing.T) {
+	settings := config.Settings{Encoding: "ASCII", PacketGap: "0"}
+	warning := normalizeStartupSettings(&settings)
+	if settings.Encoding != "UTF-8" || settings.PacketGap != "20" {
+		t.Fatalf("invalid settings were not reset to defaults: encoding=%q packet gap=%q", settings.Encoding, settings.PacketGap)
+	}
+	if warning.ZH == "" || warning.EN == "" {
+		t.Fatal("startup normalization did not create a bilingual warning")
+	}
+	app := &App{Status: Text{ZH: "未找到串口", EN: "No serial ports found"}, settingsWarning: warning}
+	app.showSettingsWarning()
+	if app.Status != warning || app.StatusError || app.settingsWarning != (Text{}) {
+		t.Fatalf("startup warning status = %+v; want %+v", app.Status, warning)
+	}
+	portError := Text{ZH: "刷新失败", EN: "Refresh failed"}
+	app = &App{Status: portError, StatusError: true, settingsWarning: warning}
+	app.showSettingsWarning()
+	if app.Status != portError || app.settingsWarning != warning {
+		t.Fatal("startup warning overwrote a port error or was lost")
+	}
+}
+
+func TestStartupSettingsNormalizationKeepsValidValues(t *testing.T) {
+	settings := config.Settings{Encoding: "GB18030", PacketGap: "86400000"}
+	if warning := normalizeStartupSettings(&settings); warning != (Text{}) {
+		t.Fatalf("valid startup settings produced a warning: %+v", warning)
+	}
+	if settings.Encoding != "GB18030" || settings.PacketGap != "86400000" {
+		t.Fatalf("valid startup settings changed: %+v", settings)
+	}
 }
 
 func TestSendValidationAndCancellationRemainFrameworkIndependent(t *testing.T) {

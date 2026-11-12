@@ -137,20 +137,39 @@ func (s *Session) Send(ctx context.Context, data []byte) error {
 	return nil
 }
 
+type fileSender interface {
+	Send(context.Context, []byte) error
+}
+
 func (s *Session) SendFile(ctx context.Context, path string, delay time.Duration) error {
+	return sendFile(ctx, path, delay, s)
+}
+
+func sendFile(ctx context.Context, path string, delay time.Duration, sender fileSender) error {
 	file, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 	buf := make([]byte, 256)
+	next := make([]byte, 256)
+	n, readErr := file.Read(buf)
 	for {
-		n, readErr := file.Read(buf)
-		if n > 0 {
-			err = s.Send(ctx, buf[:n])
-			if err != nil {
+		if n == 0 {
+			if errors.Is(readErr, io.EOF) {
+				return nil
+			}
+			if readErr != nil {
+				return readErr
+			}
+			if err = Wait(ctx, delay); err != nil {
 				return err
 			}
+			n, readErr = file.Read(buf)
+			continue
+		}
+		if err := sender.Send(ctx, buf[:n]); err != nil {
+			return err
 		}
 		if errors.Is(readErr, io.EOF) {
 			return nil
@@ -158,9 +177,28 @@ func (s *Session) SendFile(ctx context.Context, path string, delay time.Duration
 		if readErr != nil {
 			return readErr
 		}
-		if err = Wait(ctx, delay); err != nil {
-			return err
+		nextN, nextErr := file.Read(next)
+		waited := false
+		for nextN == 0 && nextErr == nil {
+			if err = Wait(ctx, delay); err != nil {
+				return err
+			}
+			waited = true
+			nextN, nextErr = file.Read(next)
 		}
+		if nextN == 0 && errors.Is(nextErr, io.EOF) {
+			return nil
+		}
+		if nextErr != nil && !errors.Is(nextErr, io.EOF) {
+			return nextErr
+		}
+		if !waited {
+			if err = Wait(ctx, delay); err != nil {
+				return err
+			}
+		}
+		buf, next = next, buf
+		n, readErr = nextN, nextErr
 	}
 }
 

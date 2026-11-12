@@ -14,6 +14,10 @@ Timestamp = false
 ShowPresets = false
 # Display history payload bytes; presets use decimal K/M units.
 DisplayBufferLimit = 200000
+# Receive display font defaults: 宋体, 9 pt, black.
+ReceiveFont = "宋体"
+ReceiveFontSize = 9
+ReceiveFontColor = "#000000"
 
 [Port]
 Name = ""
