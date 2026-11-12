@@ -1,4 +1,4 @@
-package ui
+package internal
 
 import (
 	"slices"
@@ -83,20 +83,18 @@ func (a *settingsSaver) enqueue(snapshot *settingsSnapshot) {
 	a.pending <- snapshot
 }
 
-func (s *controller) startSettingsSaver() {
+func (s *App) startSettingsSaver() {
 	if s.saver != nil {
 		return
 	}
-	window := s.window
 	var saver *settingsSaver
-	saver = newSettingsSaver(s.path, config.Save, func() {
-		// Update posts asynchronously; shutdown never waits on the UI loop.
-		window.Update(func() { s.collectSettingsResults(saver) })
+	saver = newSettingsSaver(s.SettingsPath, config.Save, func() {
+		s.dispatch(func() { s.collectSettingsResults(saver) })
 	})
 	s.saver = saver
 }
 
-func (s *controller) stopSettingsSaver() {
+func (s *App) stopSettingsSaver() {
 	a := s.saver
 	if a == nil {
 		return
@@ -111,33 +109,48 @@ func (s *controller) stopSettingsSaver() {
 	s.collectSettingsResults(a)
 }
 
-func (s *controller) settingsChanged() {
-	s.settingsDirty = true
-	s.settingsRevision++
+func (s *App) SettingsChanged() {
+	s.SettingsDirty = true
+	s.SettingsRevision++
 }
 
-func (s *controller) displaySettingsChanged() {
-	s.configureLog()
-	s.settingsChanged()
-}
-
-func (s *controller) applyDisplaySettings() {
-	s.displaySettingsChanged()
-	s.saveUsedSettings()
-}
-
-func (s *controller) clearSend() {
-	value := s.sendValue()
+func (s *App) ClearSend() {
+	value := s.SendValue()
 	if *value == "" {
 		return
 	}
 	*value = ""
-	s.settingsChanged()
+	s.SettingsChanged()
 }
 
-func (s *controller) saveUsedSettings() {
+func (s *App) SaveUsedSettings() {
+	s.saveUsedSnapshot(s.usedSettingsSnapshot())
+}
+
+// Capture the exact preferences accepted by an operation before its I/O starts.
+func (s *App) usedSettingsSnapshot() *settingsSnapshot {
 	a := s.saver
 	if a == nil || a.stopped {
+		return nil
+	}
+	select {
+	case <-s.closed:
+		return nil
+	default:
+	}
+	s.collectSettingsResults(a)
+	if !s.SettingsDirty || a.pendingRequest && a.requested == s.SettingsRevision {
+		return nil
+	}
+	settings := s.Settings
+	settings.BaudRates = slices.Clone(settings.BaudRates)
+	settings.Presets = slices.Clone(settings.Presets)
+	return &settingsSnapshot{revision: s.SettingsRevision, settings: settings}
+}
+
+func (s *App) saveUsedSnapshot(snapshot *settingsSnapshot) {
+	a := s.saver
+	if snapshot == nil || a == nil || a.stopped {
 		return
 	}
 	select {
@@ -146,18 +159,19 @@ func (s *controller) saveUsedSettings() {
 	default:
 	}
 	s.collectSettingsResults(a)
-	if !s.settingsDirty || a.pendingRequest && a.requested == s.settingsRevision {
+	// Completion of an older background operation must never supersede a
+	// newer accepted write, or clear dirty state for a later draft.
+	if snapshot.revision < a.requested || a.pendingRequest && a.requested == snapshot.revision {
 		return
 	}
-	a.requested, a.pendingRequest = s.settingsRevision, true
-	// Lists must not share backing arrays with later edits.
-	settings := s.settings
-	settings.BaudRates = slices.Clone(s.settings.BaudRates)
-	settings.Presets = slices.Clone(s.settings.Presets)
-	a.enqueue(&settingsSnapshot{revision: s.settingsRevision, settings: settings})
+	if !s.SettingsDirty && snapshot.revision == s.SettingsRevision {
+		return
+	}
+	a.requested, a.pendingRequest = snapshot.revision, true
+	a.enqueue(snapshot)
 }
 
-func (s *controller) collectSettingsResults(a *settingsSaver) {
+func (s *App) collectSettingsResults(a *settingsSaver) {
 	if s.saver != a {
 		return
 	}
@@ -168,8 +182,8 @@ func (s *controller) collectSettingsResults(a *settingsSaver) {
 				continue
 			}
 			a.pendingRequest = false
-			if result.err == nil && result.revision == s.settingsRevision {
-				s.settingsDirty = false
+			if result.err == nil && result.revision == s.SettingsRevision {
+				s.SettingsDirty = false
 			}
 			if a.stopped {
 				continue
@@ -180,13 +194,13 @@ func (s *controller) collectSettingsResults(a *settingsSaver) {
 			default:
 			}
 			if result.err != nil {
-				if s.statusError && !s.settingsSaveError {
+				if s.StatusError && !s.settingsSaveError {
 					continue
 				}
-				s.fail("保存参数失败", "Failed to save settings", result.err)
+				s.Fail("保存参数失败", "Failed to save settings", result.err)
 				s.settingsSaveError = true
 			} else if s.settingsSaveError {
-				s.status, s.statusError, s.settingsSaveError = localizedText{}, false, false
+				s.Status, s.StatusError, s.settingsSaveError = Text{}, false, false
 			}
 		default:
 			return
@@ -196,18 +210,18 @@ func (s *controller) collectSettingsResults(a *settingsSaver) {
 
 // Called after the event loop: serialize the final draft behind every used
 // snapshot, and leave an unchanged configuration untouched.
-func (s *controller) flushSettings() error {
+func (s *App) FlushSettings() error {
 	s.stopSettingsSaver()
-	if !s.settingsDirty {
+	if !s.SettingsDirty {
 		return nil
 	}
-	revision := s.settingsRevision
-	err := writeSettings(s.path, s.settings)
+	revision := s.SettingsRevision
+	err := writeSettings(s.SettingsPath, s.Settings)
 	if err != nil {
 		return err
 	}
-	if revision == s.settingsRevision {
-		s.settingsDirty = false
+	if revision == s.SettingsRevision {
+		s.SettingsDirty = false
 	}
 	return nil
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 
+	"github.com/fcying/SerialGo/internal"
 	"github.com/fcying/SerialGo/ui"
 )
 
@@ -12,7 +13,8 @@ const (
 )
 
 func main() {
-	err := ui.Run(appName + " v" + appVersion)
+	app := internal.NewApp()
+	err := ui.Run(app, appName+" v"+appVersion)
 	if err != nil {
 		log.Fatal(err)
 	}

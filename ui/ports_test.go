@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -11,59 +10,6 @@ import (
 
 	gui "github.com/egoist/mygo/ui"
 )
-
-func TestPortSelectionPersistsOnlyDeviceName(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.toml")
-	s, notified := settingsSaveFixture(t, path, config.Save)
-	s.settings.Port.Name = "COM12"
-	s.setPorts([]serialport.Info{
-		{Name: "COM12", Description: "USB-SERIAL CH340"},
-		{Name: "COM29", Description: "USB Serial (COM12) 中文"},
-		{Name: "COM99"},
-	})
-	for _, name := range []string{"COM29", "COM99"} {
-		if name == "COM29" {
-			s.portChoice = "COM29 USB Serial (COM12) 中文"
-		} else {
-			s.portChoice = "COM99"
-		}
-		s.selectPort()
-		if s.settings.Port.Name != name || !s.settingsDirty {
-			t.Fatalf("selection %q did not retain raw device identity %q", s.portChoice, name)
-		}
-		s.saveUsedSettings()
-		completeSettingsSave(t, s, notified)
-		stored := readSavedSettings(t, path)
-		if stored.Port.Name != name {
-			t.Fatalf("saved port = %q; want raw name %q", stored.Port.Name, name)
-		}
-	}
-}
-
-func TestPortMetadataRefreshPreservesSelection(t *testing.T) {
-	s := &controller{}
-	s.settings.Port.Name = "COM29"
-	s.setPorts([]serialport.Info{
-		{Name: "COM12", Description: "USB-SERIAL CH340"},
-		{Name: "COM29", Description: "Original device name"},
-	})
-	s.setPorts([]serialport.Info{
-		{Name: "COM29", Description: "Updated device name"},
-		{Name: "COM12", Description: "USB-SERIAL CH340"},
-	})
-	if s.settings.Port.Name != "COM29" || s.portChoice != "COM29 Updated device name" || s.settingsDirty {
-		t.Fatal("metadata-only refresh changed or dirtied the selected device")
-	}
-	s.setPorts([]serialport.Info{{Name: "COM99"}})
-	if s.settings.Port.Name != "COM99" || s.portChoice != "COM99" || !s.settingsDirty {
-		t.Fatal("removing the selected device did not select the remaining bare-name port")
-	}
-	s.settingsDirty = false
-	s.setPorts(nil)
-	if s.settings.Port.Name != "" || s.portChoice != "" || !s.settingsDirty {
-		t.Fatal("an empty refresh retained a removed device")
-	}
-}
 
 func portPickerTrigger(t *testing.T, tt *gui.Tester) gui.AccessInfo {
 	t.Helper()
@@ -101,7 +47,7 @@ func requirePortPickerSelection(t *testing.T, tt *gui.Tester, s *controller, nam
 }
 
 func TestPortPickerRefreshesChoicesOncePerOpening(t *testing.T) {
-	s := &controller{settings: config.Settings{Language: "en"}}
+	s := newController(&internal.App{Settings: config.Settings{Language: "en"}})
 	discovered := []serialport.Info{
 		{Name: "COM12", Description: "USB-SERIAL CH340"},
 		{Name: "COM29", Description: "USB Serial (COM12) 中文"},
@@ -111,7 +57,7 @@ func TestPortPickerRefreshesChoicesOncePerOpening(t *testing.T) {
 		gui.Row(c.Key("port-picker-test")).FillWidth().Children(func() {
 			s.portPicker(c, func() {
 				refreshes++
-				s.setPorts(discovered)
+				s.app.SetPorts(discovered)
 			})
 		})
 	}, 400, 300)
@@ -199,14 +145,14 @@ func TestPortPickerKeyboardExpansionRefreshesChoices(t *testing.T) {
 		key  gui.Key
 	}{{"Down", gui.KeyDown}, {"Enter", gui.KeyEnter}, {"Space", gui.KeySpace}} {
 		t.Run(key.name, func(t *testing.T) {
-			s := &controller{settings: config.Settings{Language: "en"}}
+			s := newController(&internal.App{Settings: config.Settings{Language: "en"}})
 			discovered := []serialport.Info{{Name: "COM12", Description: "First adapter"}, {Name: "COM29", Description: "USB Serial (COM12) 中文"}}
 			refreshes := 0
 			tt := gui.NewTester(func(c *gui.Context) {
 				gui.Row(c.Key("port-picker-test")).FillWidth().Children(func() {
 					s.portPicker(c, func() {
 						refreshes++
-						s.setPorts(discovered)
+						s.app.SetPorts(discovered)
 					})
 				})
 			}, 400, 300)
@@ -238,75 +184,26 @@ func TestPortPickerKeyboardExpansionRefreshesChoices(t *testing.T) {
 	}
 }
 
-func TestPortPickerConnectedDisablesExpansionAndEnumeration(t *testing.T) {
-	for _, empty := range []bool{false, true} {
-		name := "with devices"
-		if empty {
-			name = "without devices"
-		}
-		t.Run(name, func(t *testing.T) {
-			s := &controller{settings: config.Settings{Language: "en"}}
-			if !empty {
-				s.setPorts([]serialport.Info{{Name: "COM12", Description: "Connected adapter"}})
-			}
-			// A closed session still represents the controller's connected state,
-			// without touching a physical serial port or leaving a receive loop.
-			s.session = internal.NewSession(&serialport.Port{}, 115200)
-			if err := s.session.Close(); err != nil {
-				t.Fatal(err)
-			}
-			originalName, originalLabel := s.settings.Port.Name, s.portChoice
-			refreshes := 0
-			tt := gui.NewTester(func(c *gui.Context) {
-				gui.Row(c.Key("port-picker-test")).FillWidth().Children(func() {
-					s.portPicker(c, func() {
-						refreshes++
-						s.setPorts([]serialport.Info{{Name: "COM99", Description: "Must not be discovered"}})
-					})
-				})
-			}, 400, 300)
-			if !portPickerTrigger(t, tt).Disabled {
-				t.Fatal("connected picker is not disabled")
-			}
-			if !empty {
-				bounds := portPickerTrigger(t, tt).Bounds
-				tt.Move(bounds.X+bounds.W/2, bounds.Y+bounds.H/2)
-				tt.Advance(time.Second)
-				tip, ok := tt.AccessByRole(gui.RoleTooltip, "")
-				if !ok || tip.Name != originalLabel {
-					t.Fatalf("locked picker hover did not show the complete port name: %+v", tip)
-				}
-				tt.Move(399, 299)
-				tt.Advance(time.Second)
-				if _, ok := tt.AccessByRole(gui.RoleTooltip, ""); ok {
-					t.Fatal("port tooltip remained after the pointer left")
-				}
-			}
-			clickPortPickerTrigger(t, tt)
-			tt.Key(0, gui.KeyTab)
-			for _, key := range []gui.Key{gui.KeyDown, gui.KeyEnter, gui.KeySpace} {
-				tt.Key(0, key)
-			}
-			tt.Frame()
-			requirePortPickerSelection(t, tt, s, originalName, originalLabel)
-			if portPickerTrigger(t, tt).Expanded || refreshes != 0 {
-				t.Fatalf("connected picker expanded or enumerated: refreshes=%d", refreshes)
-			}
-			if _, ok := tt.AccessByRole(gui.RoleOption, ""); ok {
-				t.Fatal("connected picker exposed selectable options")
-			}
-		})
+func TestPortPickerRemainsOpenWhileAsyncRefreshCompletes(t *testing.T) {
+	s, callbacks := settingsSaveFixture(t, t.TempDir()+"/config.toml")
+	tt := gui.NewTester(func(c *gui.Context) {
+		gui.Row(c).FillWidth().Children(func() { s.portPicker(c, s.app.RefreshPorts) })
+	}, 400, 300)
+	clickPortPickerTrigger(t, tt)
+	tt.Frame()
+	trigger := portPickerTrigger(t, tt)
+	if !trigger.Expanded || trigger.Disabled || !s.app.RefreshingPorts {
+		t.Fatalf("refresh closed or locked the popup before its result: %+v", trigger)
 	}
-}
-
-func TestMainViewHasNoStandalonePortRefreshButton(t *testing.T) {
-	s := &controller{settings: config.Settings{Language: "en"}}
-	s.configureLog()
-	tt := gui.NewTester(s.view, 800, 600)
-	if trigger := portPickerTrigger(t, tt); trigger.Disabled || trigger.Expanded {
-		t.Fatalf("main view must offer the empty, closed port picker: %+v", trigger)
+	select {
+	case complete := <-callbacks:
+		complete()
+	case <-time.After(5 * time.Second):
+		t.Fatal("port enumeration did not complete")
 	}
-	if _, ok := tt.AccessByRole(gui.RoleButton, "Refresh"); ok {
-		t.Fatal("main view still exposes a standalone port refresh button")
+	tt.Frame()
+	trigger = portPickerTrigger(t, tt)
+	if !trigger.Expanded || trigger.Disabled || s.app.PortBusy || s.app.RefreshingPorts {
+		t.Fatalf("refresh result did not leave the popup available: %+v", trigger)
 	}
 }

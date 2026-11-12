@@ -48,7 +48,7 @@ func TestReceiveLogRendersSavedBytesInHex(t *testing.T) {
 }
 
 func TestReceiveLogNewDataScrollsToBottom(t *testing.T) {
-	s := &controller{}
+	s := newController(&internal.App{})
 	s.settings.Language = "zh-CN"
 	s.log.configure(logOptions{encoding: "UTF-8"})
 	s.log.append([]internal.Event{{Data: []byte(strings.Repeat("received line\n", 120))}})
@@ -93,7 +93,7 @@ func TestReceiveLogNewDataScrollsToBottom(t *testing.T) {
 
 func TestTimestampPacketToggleReformatsHistory(t *testing.T) {
 	path := t.TempDir() + "/config.toml"
-	s, notified := settingsSaveFixture(t, path, config.Save)
+	s, notified := settingsSaveFixture(t, path)
 	s.settings.PacketGap = "20"
 	s.configureLog()
 	start := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
@@ -130,5 +130,96 @@ func TestTimestampPacketToggleReformatsHistory(t *testing.T) {
 	completeSettingsSave(t, s, notified)
 	if readSavedSettings(t, path).Timestamp {
 		t.Fatal("disabled timestamp packet display was not saved")
+	}
+}
+
+func TestReceiveLogUsesSelectedByteCapacity(t *testing.T) {
+	for _, preset := range config.DisplayBufferPresets() {
+		t.Run(preset.Label, func(t *testing.T) {
+			var l receiveLog
+			l.configure(logOptions{encoding: "UTF-8", limit: preset.Bytes})
+			half := preset.Bytes / 2
+			first := internal.Event{Data: []byte(strings.Repeat("a", half))}
+			second := internal.Event{Data: []byte(strings.Repeat("b", half))}
+			l.append([]internal.Event{first, second})
+			if l.bytes != preset.Bytes || len(l.events) != 2 || l.text.Len() != preset.Bytes {
+				t.Fatalf("exact capacity lost data: bytes=%d events=%d text=%d", l.bytes, len(l.events), l.text.Len())
+			}
+			l.append([]internal.Event{{Data: []byte("c")}})
+			if l.bytes != half+1 || len(l.events) != 2 || l.text.String() != string(second.Data)+"c" {
+				t.Fatalf("overflow did not evict exactly the oldest whole event: bytes=%d events=%d", l.bytes, len(l.events))
+			}
+		})
+	}
+}
+
+func TestReceiveLogKeepsLargeCapacityWithSmallPackets(t *testing.T) {
+	presets := config.DisplayBufferPresets()
+	limit := presets[len(presets)-1].Bytes
+	var l receiveLog
+	l.configure(logOptions{encoding: "UTF-8", limit: limit})
+	events := make([]internal.Event, 10_000)
+	for i := range events {
+		events[i] = internal.Event{Data: []byte{'x'}}
+	}
+	l.append(events)
+	l.append([]internal.Event{{Data: []byte(strings.Repeat("y", limit-len(events)))}})
+	if l.bytes != limit || len(l.events) != len(events)+1 || !strings.HasPrefix(l.text.String(), strings.Repeat("x", len(events))) {
+		t.Fatalf("small packets prematurely truncated selected capacity: bytes=%d events=%d", l.bytes, len(l.events))
+	}
+	l.append([]internal.Event{{Data: []byte{'z'}}})
+	if l.bytes > limit || l.events[len(l.events)-1].Data[0] != 'z' {
+		t.Fatalf("overflow did not preserve the newest data within the selected limit: bytes=%d events=%d", l.bytes, len(l.events))
+	}
+}
+
+func TestReceiveLogLimitChangesTrimImmediately(t *testing.T) {
+	presets := config.DisplayBufferPresets()
+	var l receiveLog
+	options := logOptions{encoding: "UTF-8", limit: presets[1].Bytes}
+	l.configure(options)
+	l.append([]internal.Event{
+		{Data: []byte(strings.Repeat("a", presets[0].Bytes))},
+		{Data: []byte(strings.Repeat("b", presets[0].Bytes))},
+	})
+	options.limit = presets[0].Bytes
+	l.configure(options)
+	if l.bytes != presets[0].Bytes || len(l.events) != 1 || l.text.String() != string(l.events[0].Data) || l.events[0].Data[0] != 'b' {
+		t.Fatalf("lower limit did not trim and rebuild immediately: bytes=%d events=%d", l.bytes, len(l.events))
+	}
+	options.limit = presets[1].Bytes
+	l.configure(options)
+	if len(l.events) != 1 || l.bytes != presets[0].Bytes {
+		t.Fatal("raising the limit restored discarded history")
+	}
+}
+
+func TestReceiveLogKeepsNewestOversizedEvent(t *testing.T) {
+	limit := config.DisplayBufferPresets()[0].Bytes
+	var l receiveLog
+	l.configure(logOptions{encoding: "UTF-8", limit: limit})
+	oversized := internal.Event{Data: []byte(strings.Repeat("x", limit+1))}
+	l.append([]internal.Event{{Data: []byte("old")}, oversized})
+	if len(l.events) != 1 || l.bytes != limit+1 || l.text.String() != string(oversized.Data) {
+		t.Fatal("newest oversized event was truncated or discarded")
+	}
+	l.append([]internal.Event{{Data: []byte("new")}})
+	if len(l.events) != 1 || l.bytes != 3 || l.text.String() != "new" {
+		t.Fatal("oversized event was not evicted after newer data arrived")
+	}
+}
+
+func TestReceiveLogEmptyEventsDoNotConsumeHistory(t *testing.T) {
+	var l receiveLog
+	l.configure(logOptions{encoding: "UTF-8"})
+	l.append([]internal.Event{{Data: []byte("data")}})
+	l.scrollToEnd = false
+	l.append(make([]internal.Event, 10_000))
+	if l.bytes != 4 || len(l.events) != 1 || l.text.String() != "data" || l.scrollToEnd {
+		t.Fatal("empty events consumed history or changed the rendered log")
+	}
+	l.clear()
+	if l.bytes != 0 || len(l.events) != 0 || l.text.String() != "" {
+		t.Fatal("clear did not release retained history")
 	}
 }

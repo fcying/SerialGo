@@ -5,14 +5,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fcying/SerialGo/config"
 	"github.com/fcying/SerialGo/internal"
 
 	"github.com/egoist/mygo/ui"
 	"golang.org/x/text/transform"
 )
-
-const historyLimit = 200_000
-const recordLimit = 8192
 
 const hexDigits = "0123456789ABCDEF"
 
@@ -20,6 +18,7 @@ type logOptions struct {
 	hex, timestamp, showSent bool
 	encoding                 string
 	gap                      time.Duration
+	limit                    int
 }
 
 type receiveLog struct {
@@ -42,8 +41,10 @@ func (l *receiveLog) clear() {
 }
 
 func (l *receiveLog) configure(options logOptions) {
+	options.limit = config.NormalizeDisplayBufferLimit(options.limit)
 	if l.options != options || l.decoder == nil {
 		l.options = options
+		l.trim()
 		l.rebuild()
 	}
 }
@@ -61,29 +62,53 @@ func (l *receiveLog) rebuild() {
 	l.scrollToEnd = true
 }
 
+// trim evicts complete oldest events but always keeps the newest one, even
+// when a single event exceeds the selected byte limit. Empty events are not
+// retained, so metadata is bounded by the payload budget without an independent
+// record count that would truncate large buffers receiving small packets.
+func (l *receiveLog) trim() bool {
+	if l.bytes <= l.options.limit {
+		return false
+	}
+	// Leave room for incoming data instead of rebuilding a full buffer per byte.
+	target := l.options.limit - 16_384
+	i := 0
+	for l.bytes > target && i < len(l.events)-1 {
+		l.bytes -= len(l.events[i].Data)
+		i++
+	}
+	if i == 0 {
+		return false
+	}
+	remaining := copy(l.events, l.events[i:])
+	clear(l.events[remaining:])
+	l.events = l.events[:remaining]
+	return true
+}
+
 func (l *receiveLog) append(events []internal.Event) {
 	if len(events) == 0 {
 		return
 	}
+	if l.decoder == nil {
+		l.configure(l.options)
+	}
 	for _, event := range events {
+		if len(event.Data) == 0 {
+			continue
+		}
 		l.events = append(l.events, event)
 		l.bytes += len(event.Data)
 	}
-	if l.bytes > historyLimit || len(l.events) > recordLimit {
-		i := 0
-		for (l.bytes > historyLimit-16_384 || len(l.events)-i > recordLimit-1024) && i < len(l.events)-1 {
-			l.bytes -= len(l.events[i].Data)
-			i++
-		}
-		remaining := copy(l.events, l.events[i:])
-		clear(l.events[remaining:])
-		l.events = l.events[:remaining]
+	if l.trim() {
 		l.rebuild()
 		return
 	}
 	var out strings.Builder
 	for _, event := range events {
-		l.render(&out, event)
+		if len(event.Data) != 0 {
+			l.render(&out, event)
+		}
 	}
 	if out.Len() == 0 {
 		return

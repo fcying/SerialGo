@@ -1,50 +1,20 @@
 package ui
 
 import (
-	"slices"
-
-	"github.com/fcying/SerialGo/internal/i18n"
-
 	"github.com/egoist/mygo/ui"
 )
 
 func (s *controller) openPortSettings() {
-	s.portDraft = s.settings.Port
-	s.portBaudRatesDraft = slices.Clone(s.settings.BaudRates)
+	s.portDraft, s.portBaudRatesDraft = s.app.PortSettingsDraft()
 	s.portSettingsError = localizedText{}
 	s.portSettingsOpen = true
 }
 
 func (s *controller) applyPortSettings() {
-	previous := s.settings.Port
-	next := s.portDraft
-	next.Name = previous.Name
-	nextBaudRates := s.portBaudRatesDraft
 	s.portSettingsError = localizedText{}
-	if s.session != nil {
-		// Framing cannot change while the current session owns the port.
-		next.Baud = previous.Baud
-		next.DataBits = previous.DataBits
-		next.Parity = previous.Parity
-		next.StopBits = previous.StopBits
-		nextBaudRates = s.settings.BaudRates
-		if next.DTR != previous.DTR || next.RTS != previous.RTS {
-			err := s.session.SetLines(next.DTR, next.RTS)
-			if err != nil {
-				s.portSettingsError = localizedText{
-					zh: "设置控制线失败: " + i18n.ErrorText(err, false),
-					en: "Failed to set control lines: " + i18n.ErrorText(err, true),
-				}
-				return
-			}
-		}
-	}
-	if next != previous || !slices.Equal(nextBaudRates, s.settings.BaudRates) {
-		s.settings.Port = next
-		s.settings.BaudRates = slices.Clone(nextBaudRates)
-		s.settingsChanged()
-		s.note("串口设置已更新", "Port settings updated")
-		s.saveUsedSettings()
+	if err := s.app.ApplyPortSettings(s.portDraft, s.portBaudRatesDraft); err != nil {
+		s.portSettingsError = dialogError(err)
+		return
 	}
 	s.portSettingsOpen = false
 }
@@ -52,7 +22,7 @@ func (s *controller) applyPortSettings() {
 func (s *controller) portSettingsDialog(c *ui.Context) {
 	ui.Modal(c.Key("port-settings-dialog"), &s.portSettingsOpen, func() {
 		p := &s.portDraft
-		open := s.session != nil
+		open := s.app.Connected() || s.app.PortBusy
 		ui.Column(c.Key("properties")).Width(340).Gap(10).Children(func() {
 			ui.Text(c.Key("title"), s.tr("串口设置", "Port settings")).FontSize(16).FontWeight(600)
 			ui.Scroll(c.Key("fields")).FillWidth().MaxHeight(240).Children(func() {

@@ -12,6 +12,8 @@ ReceiveHex = false
 ShowSent = false
 Timestamp = false
 ShowPresets = false
+# Display history payload bytes; presets use decimal K/M units.
+DisplayBufferLimit = 200000
 
 [Port]
 Name = ""

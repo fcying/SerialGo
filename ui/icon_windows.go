@@ -81,7 +81,7 @@ func (s *controller) setWindowIcon() error {
 	update := func() {
 		refreshErr := refresh()
 		if refreshErr != nil {
-			s.window.Update(func() { s.fail("设置窗口图标失败", "Failed to set window icon", refreshErr) })
+			s.window.Update(func() { s.app.Fail("设置窗口图标失败", "Failed to set window icon", refreshErr) })
 		}
 	}
 	s.window.OnMove(update)

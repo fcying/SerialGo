@@ -1,0 +1,387 @@
+package internal
+
+import (
+	"context"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/fcying/SerialGo/communication/serialport"
+	"github.com/fcying/SerialGo/config"
+	"github.com/fcying/SerialGo/internal/i18n"
+)
+
+func connectedAppFixture(t *testing.T) *App {
+	t.Helper()
+	p := NewSession(&serialport.Port{}, 115200)
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return &App{Settings: config.Settings{
+		Language: "en", BaudRates: []string{"9600", "115200", "250000"},
+		Port: serialport.Settings{Name: "COM17", Baud: "115200", DataBits: "8", Parity: "None", StopBits: "1"},
+	}, session: p}
+}
+
+func TestPortSettingsConnectedFramingRemainsUnchanged(t *testing.T) {
+	s := connectedAppFixture(t)
+	before := s.Settings
+	draft, rates := s.PortSettingsDraft()
+	draft.Name, draft.Baud, draft.DataBits, draft.Parity, draft.StopBits = "friendly label", "9600", "7", "Odd", "2"
+	if err := s.ApplyPortSettings(draft, rates[:1]); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(s.Settings, before) || s.SettingsDirty || s.SettingsRevision != 0 {
+		t.Fatal("connected properties changed raw name, framing or baud list")
+	}
+}
+
+func TestPortSettingsLineFailureKeepsSettingsAndStatus(t *testing.T) {
+	for _, line := range []string{"DTR", "RTS"} {
+		for _, dirty := range []bool{false, true} {
+			t.Run(line+"/"+map[bool]string{false: "clean", true: "dirty"}[dirty], func(t *testing.T) {
+				s := connectedAppFixture(t)
+				s.SettingsDirty = dirty
+				s.Status = Text{ZH: "原状态", EN: "Original status"}
+				before, status, revision := s.Settings, s.Status, s.SettingsRevision
+				draft, rates := s.PortSettingsDraft()
+				if line == "DTR" {
+					draft.DTR = true
+				} else {
+					draft.RTS = true
+				}
+				for range 2 {
+					err := s.ApplyPortSettings(draft, rates)
+					if err == nil || !strings.Contains(i18n.ErrorText(err, true), os.ErrClosed.Error()) || i18n.ErrorText(err, true) == i18n.ErrorText(err, false) {
+						t.Fatalf("missing localized driver error: %v", err)
+					}
+					if !reflect.DeepEqual(s.Settings, before) || s.SettingsDirty != dirty || s.SettingsRevision != revision || s.Status != status || s.StatusError {
+						t.Fatal("failed control-line operation changed settings or main status")
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestConnectedBaudCommandsCannotChangeSettingsOrDraft(t *testing.T) {
+	for _, forPort := range []bool{false, true} {
+		s := connectedAppFixture(t)
+		before := s.Settings
+		draft, rates := s.PortSettingsDraft()
+		initialDraft, initialRates := draft, slices.Clone(rates)
+		var err error
+		if forPort {
+			err = s.CustomBaud("38400", &draft, &rates)
+		} else {
+			err = s.CustomBaud("38400", nil, nil)
+		}
+		if err == nil {
+			t.Fatal("connected custom baud accepted")
+		}
+		if forPort {
+			err = s.DeleteBaud("115200", &draft, &rates)
+		} else {
+			err = s.DeleteBaud("115200", nil, nil)
+		}
+		if err == nil {
+			t.Fatal("connected baud deletion accepted")
+		}
+		s.SelectBaud("9600")
+		if !reflect.DeepEqual(s.Settings, before) || draft != initialDraft || !slices.Equal(rates, initialRates) || s.SettingsDirty {
+			t.Fatal("connected baud command mutated settings or draft")
+		}
+	}
+}
+
+func TestPropertyBaudChangesStagedBeforeConnectionCannotCommit(t *testing.T) {
+	for _, deletion := range []bool{false, true} {
+		connected := connectedAppFixture(t)
+		s := &App{Settings: connected.Settings}
+		before := s.Settings
+		draft, rates := s.PortSettingsDraft()
+		var err error
+		if deletion {
+			err = s.DeleteBaud("115200", &draft, &rates)
+		} else {
+			err = s.CustomBaud("38400", &draft, &rates)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.session = connected.session
+		if err := s.ApplyPortSettings(draft, rates); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(s.Settings, before) || s.SettingsDirty {
+			t.Fatal("connection allowed staged baud mutation to commit")
+		}
+	}
+}
+
+func TestPresetLimitAndActiveSendPreventStructuralEdits(t *testing.T) {
+	s := &App{}
+	for range config.PresetCount {
+		if !s.AddPreset() {
+			t.Fatal("preset added below limit was rejected")
+		}
+	}
+	if s.AddPreset() || len(s.Settings.Presets) != config.PresetCount {
+		t.Fatal("preset limit exceeded")
+	}
+	s.Settings.Presets = []config.Preset{{Label: "active", Data: "keep"}}
+	s.cancelSend = func() {}
+	revision := s.SettingsRevision
+	if s.AddPreset() || s.DeletePreset(0) || s.DeletePreset(-1) || s.SettingsRevision != revision || len(s.Settings.Presets) != 1 || s.Settings.Presets[0].Data != "keep" {
+		t.Fatal("active send allowed structural edits")
+	}
+}
+
+type appTestView struct {
+	callbacks chan func()
+	records   []Event
+}
+
+func (v *appTestView) Dispatch(fn func())          { v.callbacks <- fn }
+func (v *appTestView) AppendEvents(events []Event) { v.records = append(v.records, events...) }
+
+func awaitAppCallback(t *testing.T, v *appTestView) {
+	t.Helper()
+	select {
+	case fn := <-v.callbacks:
+		fn()
+	case <-time.After(5 * time.Second):
+		t.Fatal("application worker did not post completion")
+	}
+}
+
+func TestAppDrainsSnapshotAndOwnsCountsAndCaptureFailure(t *testing.T) {
+	v := &appTestView{}
+	p := &Session{events: make(chan Event, 4)}
+	s := &App{view: v, session: p, CapturePath: "capture.bin"}
+	p.events <- Event{Data: []byte{1, 2}, Sent: true}
+	p.events <- Event{Data: []byte{3, 4, 5}}
+	p.events <- Event{Err: io.ErrShortWrite}
+	s.drain(p)
+	if s.Tx != 2 || s.Rx != 3 || len(v.records) != 2 || s.CapturePath != "" || !s.StatusError {
+		t.Fatal("events did not update domain counters, capture state and display callback")
+	}
+	s.ClearCounts()
+	if s.Tx != 0 || s.Rx != 0 {
+		t.Fatal("count reset did not clear both counters")
+	}
+}
+
+func TestSaveLogAndCaptureFilesBelongToApp(t *testing.T) {
+	dir := t.TempDir()
+	v := &appTestView{callbacks: make(chan func(), 8)}
+	s := &App{view: v}
+	logPath := filepath.Join(dir, "display.txt")
+	s.SaveLog(logPath, "displayed data")
+	if !s.FileBusy {
+		t.Fatal("display save did not expose pending work")
+	}
+	awaitAppCallback(t, v)
+	data, err := os.ReadFile(logPath)
+	if err != nil || string(data) != "displayed data" || s.StatusError {
+		t.Fatalf("display save failed: %q %v", data, err)
+	}
+	s.CapturePath = logPath
+	s.SaveLog(logPath, "must not overwrite")
+	data, err = os.ReadFile(logPath)
+	if err != nil || string(data) != "displayed data" {
+		t.Fatal("display save overwrote active capture")
+	}
+	s.CapturePath = ""
+	s.session = &Session{ctx: context.Background()}
+	accept := s.CaptureTarget()
+	s.session = &Session{ctx: context.Background()}
+	stalePath := filepath.Join(dir, "stale.bin")
+	accept(stalePath)
+	if _, err := os.Stat(stalePath); !os.IsNotExist(err) {
+		t.Fatal("stale capture dialog created a file")
+	}
+	capturePath := filepath.Join(dir, "rx.bin")
+	s.CaptureTarget()(capturePath)
+	awaitAppCallback(t, v)
+	if s.CapturePath != capturePath || s.session.capture == nil {
+		t.Fatal("capture did not transfer file ownership to session")
+	}
+	s.StopCapture()
+	awaitAppCallback(t, v)
+	if s.CapturePath != "" || s.session.capture != nil {
+		t.Fatal("capture stop retained file ownership")
+	}
+	s.jobs.Wait()
+}
+
+func TestSendValidationAndCancellationRemainFrameworkIndependent(t *testing.T) {
+	p := &Session{ctx: context.Background(), events: make(chan Event, 1)}
+	s := &App{session: p, Settings: config.Settings{SendHex: true, Encoding: "UTF-8"}}
+	s.SendText("not hex")
+	if !s.StatusError || s.Sending() {
+		t.Fatal("invalid send started a job")
+	}
+	s.StatusError = false
+	s.Settings.SendHex = false
+	s.Settings.Interval = "0"
+	s.Repeat = true
+	s.SendText("hello")
+	if !s.StatusError || s.Sending() {
+		t.Fatal("invalid repeat interval started a job")
+	}
+	s.StatusError = false
+	s.Settings.Presets = []config.Preset{{Enabled: true, Hex: true, Data: "zz"}}
+	s.SendPresets(-1)
+	if !s.StatusError || s.Sending() {
+		t.Fatal("invalid preset started a job")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancelSend = cancel
+	s.StopSending()
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatal("stop did not cancel active send")
+	}
+}
+
+func TestShutdownCollectsBackgroundSaveAndFlushesLatestDraft(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	v := &appTestView{callbacks: make(chan func(), 8)}
+	s := &App{SettingsPath: path, Settings: config.Settings{Language: "en"}}
+	s.Startup(v)
+	s.Settings.SendText = "used"
+	s.SettingsChanged()
+	s.SaveUsedSettings()
+	select {
+	case <-v.callbacks:
+	case <-time.After(5 * time.Second):
+		t.Fatal("settings writer did not post acknowledgement")
+	}
+	s.Settings.SendText = "final draft"
+	s.SettingsChanged()
+	if err := s.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	if stored := readSavedSettings(t, path); stored.SendText != "final draft" || s.SettingsDirty {
+		t.Fatal("shutdown did not flush latest draft after background write")
+	}
+}
+
+func TestShutdownReclaimsPendingOpenPortWithoutFrontendCallback(t *testing.T) {
+	port := &serialport.Port{}
+	s := &App{closed: make(chan struct{})}
+	s.jobs.Add(1)
+	go func() {
+		defer s.jobs.Done()
+		s.pendingPortMu.Lock()
+		s.pendingPort = port
+		s.pendingPortMu.Unlock()
+	}()
+	if err := s.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	if s.pendingPort != nil {
+		t.Fatal("shutdown retained pending opened port")
+	}
+	if _, err := port.Write([]byte{1}); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("pending port was not closed: %v", err)
+	}
+}
+
+func TestShutdownReclaimsCaptureWhenCompletionIsDiscarded(t *testing.T) {
+	v := &appTestView{callbacks: make(chan func(), 8)}
+	s := &App{closed: make(chan struct{}), view: v}
+	p := NewSession(&serialport.Port{}, 115200)
+	s.session, s.stopPump = p, make(chan struct{})
+	path := filepath.Join(t.TempDir(), "rx.bin")
+	s.CaptureTarget()(path)
+	// Shutdown must join the open/SetCapture worker even if its posted
+	// completion never reaches the frontend, and reclaim any transferred file.
+	if err := s.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	p.captureMu.Lock()
+	retained := p.capture
+	p.captureMu.Unlock()
+	if retained != nil {
+		t.Fatal("shutdown retained capture file after discarded callback")
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAsyncFileUseSavesAcceptedSnapshotNotLaterDraft(t *testing.T) {
+	dir := t.TempDir()
+	v := &appTestView{callbacks: make(chan func(), 8)}
+	s := &App{SettingsPath: filepath.Join(dir, "config.toml"), Settings: config.Settings{SendText: "accepted", Presets: []config.Preset{{Data: "accepted preset"}}, BaudRates: []string{"115200"}}}
+	s.Startup(v)
+	s.SettingsChanged()
+	s.SaveLog(filepath.Join(dir, "log.txt"), "display")
+	s.Settings.SendText = "later draft"
+	s.Settings.Presets[0].Data = "later preset"
+	s.Settings.BaudRates[0] = "9600"
+	s.SettingsChanged()
+	awaitAppCallback(t, v)
+	awaitAppCallback(t, v)
+	saved := readSavedSettings(t, s.SettingsPath)
+	if saved.SendText != "accepted" || saved.Presets[0].Data != "accepted preset" || !slices.Equal(saved.BaudRates, []string{"115200"}) || !s.SettingsDirty {
+		t.Fatal("background completion saved newer drafts or lost immutable settings snapshot")
+	}
+	if err := s.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	if saved := readSavedSettings(t, s.SettingsPath); saved.SendText != "later draft" {
+		t.Fatal("shutdown did not flush later draft")
+	}
+}
+
+func TestAppSendFormatUsesHexCRLFAndConfiguredEncoding(t *testing.T) {
+	s := &App{Settings: config.Settings{Encoding: "GB18030", SendHex: true, CRLF: true}}
+	data, err := Encode("01 03 FF", s.format(s.Settings.SendHex, s.Settings.CRLF))
+	if err != nil || string(data) != string([]byte{1, 3, 255, '\r', '\n'}) {
+		t.Fatalf("HEX+CRLF format = % x, %v", data, err)
+	}
+	data, err = Encode("中", s.format(false, true))
+	if err != nil || string(data) != string([]byte{0xD6, 0xD0, '\r', '\n'}) {
+		t.Fatalf("configured text encoding = % x, %v", data, err)
+	}
+}
+
+func TestPendingPortOperationRejectsSettingsMutation(t *testing.T) {
+	s := &App{Settings: config.Settings{Port: serialport.Settings{Name: "COM1", Baud: "9600"}, BaudRates: []string{"9600", "115200"}}}
+	s.SetPorts([]serialport.Info{{Name: "COM1"}, {Name: "COM2"}})
+	s.PortBusy = true
+	before := s.Settings
+	s.PortChoice = "COM2"
+	s.SelectPort()
+	s.SelectBaud("115200")
+	draft, rates := s.PortSettingsDraft()
+	draft.Baud = "115200"
+	if s.ApplyPortSettings(draft, rates) == nil || s.CustomBaud("38400", nil, nil) == nil || s.DeleteBaud("9600", nil, nil) == nil {
+		t.Fatal("pending serial operation accepted a settings mutation")
+	}
+	if !reflect.DeepEqual(s.Settings, before) || s.SettingsDirty {
+		t.Fatal("pending operation settings snapshot diverged")
+	}
+}
+
+func TestShutdownWaitsForLogSaveWithDiscardedCompletion(t *testing.T) {
+	v := &appTestView{callbacks: make(chan func(), 8)}
+	s := &App{view: v, closed: make(chan struct{})}
+	path := filepath.Join(t.TempDir(), "display.txt")
+	s.SaveLog(path, "immutable display snapshot")
+	if err := s.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "immutable display snapshot" {
+		t.Fatalf("shutdown abandoned pending file write: %q %v", data, err)
+	}
+}

@@ -2,27 +2,20 @@ package ui
 
 import (
 	"fmt"
-	"slices"
-
-	"github.com/fcying/SerialGo/config"
-
 	"github.com/egoist/mygo/ui"
 )
 
 func (s *controller) addPreset() {
-	if s.cancelSend != nil || len(s.settings.Presets) >= config.PresetCount {
+	if !s.app.AddPreset() {
 		return
 	}
-	s.settings.Presets = append(s.settings.Presets, config.NewPreset())
 	s.presetGeneration++
 	s.presetList = ui.ListState{}
 	s.presetList.ScrollToEnd()
-	s.settingsChanged()
-	s.saveUsedSettings()
 }
 
 func (s *controller) openPresetDelete(index int) {
-	if s.cancelSend != nil || index < 0 || index >= len(s.settings.Presets) {
+	if s.app.Sending() || index < 0 || index >= len(s.settings.Presets) {
 		return
 	}
 	s.presetDeleteIndex = index
@@ -31,18 +24,15 @@ func (s *controller) openPresetDelete(index int) {
 
 func (s *controller) applyPresetDelete() {
 	index := s.presetDeleteIndex
-	if s.cancelSend != nil || index < 0 || index >= len(s.settings.Presets) {
+	if !s.app.DeletePreset(index) {
 		return
 	}
-	s.settings.Presets = slices.Delete(s.settings.Presets, index, index+1)
 	s.presetGeneration++
 	s.presetList = ui.ListState{}
 	if len(s.settings.Presets) > 0 {
 		s.presetList.ScrollIntoView(min(index, len(s.settings.Presets)-1))
 	}
 	s.presetDeleteOpen = false
-	s.settingsChanged()
-	s.saveUsedSettings()
 }
 
 func (s *controller) presetDeleteDialog(c *ui.Context) {
@@ -54,7 +44,7 @@ func (s *controller) presetDeleteDialog(c *ui.Context) {
 				fmt.Sprintf("Delete preset %d? Following presets will be renumbered.", s.presetDeleteIndex+1),
 			)).FillWidth()
 			ui.Row(c.Key("actions")).FillWidth().Gap(8).Justify(ui.End).Children(func() {
-				ui.Button(c.Key("delete"), s.tr("删除", "Delete")).Width(76).Height(28).Label(s.tr("确认删除条目", "Confirm preset deletion")).Disabled(s.cancelSend != nil).OnClick(s.applyPresetDelete)
+				ui.Button(c.Key("delete"), s.tr("删除", "Delete")).Width(76).Height(28).Label(s.tr("确认删除条目", "Confirm preset deletion")).Disabled(s.app.Sending()).OnClick(s.applyPresetDelete)
 				ui.Button(c.Key("cancel"), s.tr("取消", "Cancel")).Width(76).Height(28).AutoFocus().OnClick(func() { s.presetDeleteOpen = false })
 			})
 		})

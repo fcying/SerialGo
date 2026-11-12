@@ -2,8 +2,6 @@ package ui
 
 import (
 	"slices"
-	"strconv"
-	"strings"
 
 	"github.com/egoist/mygo/ui"
 )
@@ -13,64 +11,6 @@ type baudPickerState struct {
 	rates                   []string
 	options                 []string
 	open                    bool
-}
-
-func normalizedBaud(text string) (string, bool) {
-	value, err := strconv.ParseUint(strings.TrimSpace(text), 10, 32)
-	if err != nil || value == 0 {
-		return "", false
-	}
-	return strconv.FormatUint(value, 10), true
-}
-
-func baudRateChoices(values []string) []string {
-	rates := make([]uint64, 0, len(values))
-	for _, text := range values {
-		value, err := strconv.ParseUint(strings.TrimSpace(text), 10, 32)
-		if err == nil && value > 0 {
-			rates = append(rates, value)
-		}
-	}
-	slices.Sort(rates)
-	rates = slices.Compact(rates)
-	choices := make([]string, len(rates))
-	for i, rate := range rates {
-		choices[i] = strconv.FormatUint(rate, 10)
-	}
-	return choices
-}
-
-// The list and value are canonical positive decimal strings, sorted numerically.
-func insertBaudRate(rates []string, value string) []string {
-	number, _ := strconv.ParseUint(value, 10, 32)
-	index := len(rates)
-	for i, text := range rates {
-		if text == value {
-			return rates
-		}
-		other, _ := strconv.ParseUint(text, 10, 32)
-		if number < other {
-			index = i
-			break
-		}
-	}
-	result := make([]string, len(rates)+1)
-	copy(result, rates[:index])
-	result[index] = value
-	copy(result[index+1:], rates[index:])
-	return result
-}
-
-func (s *controller) initializeBaudRates() {
-	s.settings.BaudRates = baudRateChoices(s.settings.BaudRates)
-	current, valid := normalizedBaud(s.settings.Port.Baud)
-	if !valid || !slices.Contains(s.settings.BaudRates, current) {
-		current = ""
-		if len(s.settings.BaudRates) > 0 {
-			current = s.settings.BaudRates[0]
-		}
-	}
-	s.settings.Port.Baud = current
 }
 
 func (s *controller) baudPicker(c *ui.Context, forPort bool, height float32) ui.Element {
@@ -96,13 +36,13 @@ func (s *controller) baudPicker(c *ui.Context, forPort bool, height float32) ui.
 	}
 	theme := c.Theme()
 	sel := ui.SelectBaseOpen(c, &state.choice, &state.open)
-	if s.session != nil {
+	if s.app.Connected() || s.app.PortBusy {
 		sel.SetOpen(false)
 	}
 	trigger := sel.Trigger.Width(0).MinWidth(0).Grow(1).Height(height).
 		Padding(controlPadY, 3).Gap(2).Radius(theme.Radius).Border(1, theme.Border).
 		Background(theme.Surface).TextColor(theme.Text).AlignItems(ui.Center).
-		Label(s.tr("波特率", "Baud rate")).Disabled(s.session != nil).OnChange(func() {
+		Label(s.tr("波特率", "Baud rate")).Disabled(s.app.Connected() || s.app.PortBusy).OnChange(func() {
 		if state.choice == customLabel {
 			state.choice = *value
 			s.openCustomBaud(forPort)
@@ -111,10 +51,12 @@ func (s *controller) baudPicker(c *ui.Context, forPort bool, height float32) ui.
 		if state.choice == *value {
 			return
 		}
-		*value, state.value = state.choice, state.choice
-		if !forPort {
-			s.settingsChanged()
+		if forPort {
+			*value = state.choice
+		} else {
+			s.app.SelectBaud(state.choice)
 		}
+		state.value, state.choice = *value, *value
 	})
 	if trigger.Pressed() {
 		trigger.Background(theme.SurfacePressed)
@@ -142,7 +84,7 @@ func (s *controller) baudPicker(c *ui.Context, forPort bool, height float32) ui.
 						}
 						if option != customLabel {
 							item.Tooltip(s.tr("右键删除此波特率", "Right-click to delete this baud rate")).ContextMenu(func(m *ui.Menu) {
-								chosen := m.Item(s.tr("删除", "Delete")).Disabled(s.session != nil).Chosen()
+								chosen := m.Item(s.tr("删除", "Delete")).Disabled(s.app.Connected() || s.app.PortBusy).Chosen()
 								if chosen {
 									sel.SetOpen(false)
 									s.openBaudDelete(option, forPort)
@@ -159,7 +101,7 @@ func (s *controller) baudPicker(c *ui.Context, forPort bool, height float32) ui.
 }
 
 func (s *controller) openCustomBaud(forPort bool) {
-	if s.session != nil {
+	if s.app.Connected() || s.app.PortBusy {
 		return
 	}
 	s.customBaudForPort = forPort
@@ -172,26 +114,15 @@ func (s *controller) openCustomBaud(forPort bool) {
 }
 
 func (s *controller) applyCustomBaud() {
-	if s.session != nil {
-		s.customBaudError = localizedText{zh: "串口已打开, 不能修改波特率", en: "The port is open; the baud rate cannot be changed"}
-		return
-	}
-	value, valid := normalizedBaud(s.customBaudText)
-	if !valid {
-		s.customBaudError = localizedText{zh: "请输入 1 到 4294967295 之间的整数", en: "Enter an integer between 1 and 4294967295"}
-		return
-	}
+	var err error
 	if s.customBaudForPort {
-		s.portBaudRatesDraft = insertBaudRate(s.portBaudRatesDraft, value)
-		s.portDraft.Baud = value
+		err = s.app.CustomBaud(s.customBaudText, &s.portDraft, &s.portBaudRatesDraft)
 	} else {
-		rates := insertBaudRate(s.settings.BaudRates, value)
-		if value != s.settings.Port.Baud || !slices.Equal(rates, s.settings.BaudRates) {
-			s.settings.BaudRates = rates
-			s.settings.Port.Baud = value
-			s.settingsChanged()
-			s.saveUsedSettings()
-		}
+		err = s.app.CustomBaud(s.customBaudText, nil, nil)
+	}
+	if err != nil {
+		s.customBaudError = dialogError(err)
+		return
 	}
 	s.customBaudOpen = false
 	s.customBaudError = localizedText{}
@@ -220,7 +151,7 @@ func (s *controller) openBaudDelete(value string, forPort bool) {
 		rates = s.portBaudRatesDraft
 		index = 1
 	}
-	if s.session != nil || !slices.Contains(rates, value) {
+	if s.app.Connected() || s.app.PortBusy || !slices.Contains(rates, value) {
 		return
 	}
 	s.baudPickers[index].open = false
@@ -231,34 +162,15 @@ func (s *controller) openBaudDelete(value string, forPort bool) {
 }
 
 func (s *controller) applyBaudDelete() {
-	if s.session != nil {
-		s.baudDeleteError = localizedText{zh: "串口已打开, 不能删除波特率", en: "The port is open; baud rates cannot be deleted"}
-		return
-	}
-	rates := &s.settings.BaudRates
-	current := &s.settings.Port.Baud
+	var err error
 	if s.baudDeleteForPort {
-		rates = &s.portBaudRatesDraft
-		current = &s.portDraft.Baud
+		err = s.app.DeleteBaud(s.baudDeleteValue, &s.portDraft, &s.portBaudRatesDraft)
+	} else {
+		err = s.app.DeleteBaud(s.baudDeleteValue, nil, nil)
 	}
-	index := slices.Index(*rates, s.baudDeleteValue)
-	if index < 0 {
-		s.baudDeleteOpen = false
+	if err != nil {
+		s.baudDeleteError = dialogError(err)
 		return
-	}
-	next := make([]string, len(*rates)-1)
-	copy(next, (*rates)[:index])
-	copy(next[index:], (*rates)[index+1:])
-	*rates = next
-	if *current == s.baudDeleteValue {
-		*current = ""
-		if len(next) > 0 {
-			*current = next[0]
-		}
-	}
-	if !s.baudDeleteForPort {
-		s.settingsChanged()
-		s.saveUsedSettings()
 	}
 	s.baudDeleteOpen = false
 	s.baudDeleteError = localizedText{}

@@ -484,3 +484,55 @@ func TestInvalidConfigDoesNotOverwriteFileOrDefaults(t *testing.T) {
 		})
 	}
 }
+
+func TestDisplayBufferLimitRoundTrip(t *testing.T) {
+	for _, preset := range DisplayBufferPresets() {
+		t.Run(preset.Label, func(t *testing.T) {
+			settings := defaults()
+			settings.DisplayBufferLimit = preset.Bytes
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := Save(path, settings); err != nil {
+				t.Fatal(err)
+			}
+			got, _, err := load(path)
+			if err != nil || got.DisplayBufferLimit != preset.Bytes {
+				t.Fatalf("limit after reload = %d; want %d (err=%v)", got.DisplayBufferLimit, preset.Bytes, err)
+			}
+		})
+	}
+}
+
+func TestMissingAndInvalidDisplayBufferLimitsUseTemplateWithoutWriting(t *testing.T) {
+	template := defaults()
+	template.DisplayBufferLimit = DisplayBufferPresets()[0].Bytes
+	useDefaultTemplate(t, template, nil)
+	for _, source := range []string{
+		"SendText = \"legacy config\"\n",
+		"DisplayBufferLimit = 0\n",
+		"DisplayBufferLimit = -1\n",
+		"DisplayBufferLimit = 512000\n",
+		"DisplayBufferLimit = 999999999\n",
+	} {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(path, []byte(source), 0600); err != nil {
+			t.Fatal(err)
+		}
+		got, gotPath, err := load(path)
+		if err != nil || gotPath != path || got.DisplayBufferLimit != template.DisplayBufferLimit {
+			t.Fatalf("loading %q: limit=%d path=%q err=%v", source, got.DisplayBufferLimit, gotPath, err)
+		}
+		contents, err := os.ReadFile(path)
+		if err != nil || string(contents) != source {
+			t.Fatalf("loading rewrote config: contents=%q err=%v", contents, err)
+		}
+	}
+	path := filepath.Join(t.TempDir(), "config.toml")
+	template.DisplayBufferLimit = -1
+	if err := Save(path, template); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := load(path)
+	if err != nil || got.DisplayBufferLimit != DisplayBufferPresets()[0].Bytes {
+		t.Fatalf("saving invalid limit did not normalize it: limit=%d err=%v", got.DisplayBufferLimit, err)
+	}
+}

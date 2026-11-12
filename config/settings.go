@@ -28,6 +28,39 @@ type Preset struct {
 	Hex, CRLF, Enabled    bool
 }
 
+// DisplayBufferPreset uses decimal K/M labels.
+type DisplayBufferPreset struct {
+	Label string
+	Bytes int
+}
+
+func DisplayBufferPresets() [5]DisplayBufferPreset {
+	return [5]DisplayBufferPreset{
+		{Label: "200K", Bytes: 200_000},
+		{Label: "500K", Bytes: 500_000},
+		{Label: "1M", Bytes: 1_000_000},
+		{Label: "2M", Bytes: 2_000_000},
+		{Label: "5M", Bytes: 5_000_000},
+	}
+}
+
+func validDisplayBufferLimit(bytes int) bool {
+	for _, preset := range DisplayBufferPresets() {
+		if bytes == preset.Bytes {
+			return true
+		}
+	}
+	return false
+}
+
+// NormalizeDisplayBufferLimit falls back to the embedded root template.
+func NormalizeDisplayBufferLimit(bytes int) int {
+	if validDisplayBufferLimit(bytes) {
+		return bytes
+	}
+	return defaultSettings.DisplayBufferLimit
+}
+
 type Settings struct {
 	Port                                serialport.Settings
 	BaudRates                           []string
@@ -37,6 +70,7 @@ type Settings struct {
 	Interval, PacketGap, FileDelay      string
 	SendHex, CRLF, ReceiveHex, ShowSent bool
 	Timestamp, ShowPresets              bool
+	DisplayBufferLimit                  int      // Retained event payload bytes, not rendered text bytes.
 	Presets                             []Preset `toml:"-"`
 }
 
@@ -55,6 +89,9 @@ func parseDefaultSettings(source string) (Settings, error) {
 	}
 	if len(stored.Presets) != defaultPresetCount || stored.Presets[0].Interval == "" {
 		return Settings{}, fmt.Errorf("invalid embedded default configuration: expected %d presets with an interval", defaultPresetCount)
+	}
+	if !validDisplayBufferLimit(settings.DisplayBufferLimit) {
+		return Settings{}, errors.New("invalid embedded default configuration: unsupported display buffer limit")
 	}
 	settings.Presets = stored.Presets
 	return settings, nil
@@ -146,6 +183,7 @@ func decode(path string, s *Settings) error {
 	if s.Language != "zh-CN" && s.Language != "en" {
 		s.Language = defaultSettings.Language
 	}
+	s.DisplayBufferLimit = NormalizeDisplayBufferLimit(s.DisplayBufferLimit)
 	return nil
 }
 
@@ -182,6 +220,7 @@ func Save(path string, s Settings) error {
 			fmt.Sprintf("Too many presets: got %d, maximum %d", len(s.Presets), PresetCount),
 		)
 	}
+	s.DisplayBufferLimit = NormalizeDisplayBufferLimit(s.DisplayBufferLimit)
 	// An explicit empty list records manual deletion and must survive reload.
 	if s.BaudRates == nil {
 		s.BaudRates = []string{}

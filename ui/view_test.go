@@ -7,6 +7,7 @@ import (
 
 	"github.com/fcying/SerialGo/communication/serialport"
 	"github.com/fcying/SerialGo/config"
+	"github.com/fcying/SerialGo/internal"
 
 	gui "github.com/egoist/mygo/ui"
 )
@@ -21,16 +22,16 @@ func TestStatusBarKeepsLongTextOnOneLine(t *testing.T) {
 		for _, width := range []int{780, 800, 1000} {
 			for _, scale := range []float32{1, 1.25, 1.5, 1.6, 2} {
 				t.Run(fmt.Sprintf("%s_width_%d_scale_%g", language.code, width, scale), func(t *testing.T) {
-					s := &controller{
-						settings: config.Settings{Language: language.code, Port: serialport.Settings{
+					s := newController(&internal.App{
+						Settings: config.Settings{Language: language.code, Port: serialport.Settings{
 							Name: "COM1", Baud: "115200", DataBits: "8", StopBits: "1", Parity: "None",
 						}},
-						tx: ^uint64(0), statusError: true,
-						status: localizedText{
-							zh: "打开串口失败: " + strings.Repeat("The port is unavailable. ", 10),
-							en: "Failed to open port: " + strings.Repeat("The port is unavailable. ", 10),
+						Tx: ^uint64(0), StatusError: true,
+						Status: internal.Text{
+							ZH: "打开串口失败: " + strings.Repeat("The port is unavailable. ", 10),
+							EN: "Failed to open port: " + strings.Repeat("The port is unavailable. ", 10),
 						},
-					}
+					})
 					s.configureLog()
 					tt := gui.NewTester(s.view, width, 600)
 					tt.SetScale(scale)
@@ -105,7 +106,7 @@ func TestStatusBarKeepsLongTextOnOneLine(t *testing.T) {
 func TestSendAreaResizePreservesDraftAndVisibleActions(t *testing.T) {
 	for _, height := range []int{420, 600} {
 		t.Run(fmt.Sprint(height), func(t *testing.T) {
-			s := &controller{settings: config.Settings{Language: "en", SendText: "draft\nsecond line"}}
+			s := newController(&internal.App{Settings: config.Settings{Language: "en", SendText: "draft\nsecond line"}})
 			s.configureLog()
 			tt := gui.NewTester(s.view, 800, height)
 			before, found := tt.Find("Send area")

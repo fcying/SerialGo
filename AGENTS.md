@@ -2,8 +2,9 @@
 
 ## Architecture
 - `main.go` is the application entry point. `appName` and `appVersion` define the application name and version; the window title uses only `appName + " v" + appVersion`.
-- `ui/` builds the native interface with MyGo `ui.View`, without WebView, Node.js, or TypeScript bindings. `ui/controller.go` manages UI state, background tasks, and cancellation; `ui/view.go` defines layout and controls. Background I/O must not block the UI thread; publish results through `Window.Update`.
-- `communication/serialport/` encapsulates device enumeration and I/O; `internal/` manages serial sessions and data encoding/decoding; `config/` handles settings persistence. Dependency versions are pinned in `go.mod`.
+- `main.go` constructs `internal.App` and passes it to `ui.Run(app, title)`. `internal/app.go` is the framework-independent business entry point for connections, sending, capture/export, counters and operation status; `internal/settings_actions.go` and `internal/settings_save.go` own settings rules and persistence. Business code must not import MyGo or another UI framework.
+- `ui/` builds the native interface with MyGo `ui.View`, without WebView, Node.js, or TypeScript bindings. It owns controls, interaction drafts, confirmations, native dialogs and receive-display state, and calls App commands rather than performing business I/O. The `internal.View` adapter dispatches frontend-thread updates through `Window.Update` and delivers receive events. App state belongs to the frontend thread; serial enumeration/open/close, transmission, file I/O and settings writes run in background workers. Call `App.Shutdown` after the UI loop to drain work and flush drafts. Control-line confirmation retains its synchronous driver-error result.
+- `communication/serialport/` encapsulates device enumeration and I/O; `internal/` also manages serial sessions and encoding/decoding; `config/` defines settings and persistence format. Dependency versions are pinned in `go.mod`.
 - Maintain only `assets/icon.svg` as the icon source. `cmd/appicon/` uses the existing SVG renderer to generate PNG, multi-size ICO, and Windows `.syso` resources; do not commit or manually edit generated files. The PNG is embedded in the application at build time for window use.
 
 ## Build and Tests

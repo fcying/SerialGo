@@ -3,6 +3,8 @@ package ui
 import (
 	"os"
 
+	"github.com/fcying/SerialGo/internal/i18n"
+
 	"github.com/egoist/mygo"
 	_ "github.com/egoist/mygo/locales/zh-Hans"
 )
@@ -30,16 +32,9 @@ func (s *controller) tr(zh, en string) string {
 }
 
 func (s *controller) setLanguage(language string) {
-	if language != "zh-CN" {
-		language = "en"
+	if s.app.SetLanguage(language) {
+		mygo.App.SetLocale(s.settings.Language)
 	}
-	if language == s.settings.Language {
-		return
-	}
-	s.settings.Language = language
-	mygo.App.SetLocale(language)
-	s.settingsChanged()
-	s.saveUsedSettings()
 }
 
 func (s *controller) toggleLanguage() {
@@ -48,4 +43,8 @@ func (s *controller) toggleLanguage() {
 	} else {
 		s.setLanguage("zh-CN")
 	}
+}
+
+func dialogError(err error) localizedText {
+	return localizedText{zh: i18n.ErrorText(err, false), en: i18n.ErrorText(err, true)}
 }

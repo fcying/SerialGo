@@ -4,9 +4,9 @@ import "github.com/egoist/mygo/ui"
 
 func (s *controller) portPicker(c *ui.Context, refresh func()) {
 	// Keep the hover anchor enabled while the selector is locked.
-	ui.Row(c.Key("port-tooltip")).Width(0).MinWidth(0).Grow(1).Tooltip(s.portChoice).Children(func() {
-		connected := s.session != nil
-		sel := ui.SelectBaseOpen(c, &s.portChoice, &s.portMenuOpen)
+	ui.Row(c.Key("port-tooltip")).Width(0).MinWidth(0).Grow(1).Tooltip(s.app.PortChoice).Children(func() {
+		connected := s.app.Connected() || s.app.PortBusy && !s.app.RefreshingPorts
+		sel := ui.SelectBaseOpen(c, &s.app.PortChoice, &s.portMenuOpen)
 		if connected {
 			sel.SetOpen(false)
 		}
@@ -18,8 +18,8 @@ func (s *controller) portPicker(c *ui.Context, refresh func()) {
 		trigger := sel.Trigger.Width(0).MinWidth(0).Grow(1).Height(controlHeight).
 			Padding(controlPadY, 3).Gap(4).Radius(theme.Radius).Border(1, theme.Border).
 			Background(theme.Surface).TextColor(theme.Text).AlignItems(ui.Center).
-			Label(s.tr("端口号", "Port")).Value(s.portChoice).Tooltip(s.portChoice).
-			Disabled(connected).OnChange(s.selectPort)
+			Label(s.tr("端口号", "Port")).Value(s.app.PortChoice).Tooltip(s.app.PortChoice).
+			Disabled(connected).OnChange(s.app.SelectPort)
 		if !connected {
 			if trigger.Pressed() {
 				trigger.Background(theme.SurfacePressed)
@@ -28,7 +28,7 @@ func (s *controller) portPicker(c *ui.Context, refresh func()) {
 			}
 		}
 		trigger.Children(func() {
-			label := s.portChoice
+			label := s.app.PortChoice
 			if label == "" {
 				label = s.tr("选择串口", "Select port")
 			}
@@ -43,14 +43,14 @@ func (s *controller) portPicker(c *ui.Context, refresh func()) {
 			panel.Padding(3).Radius(theme.Radius).Background(theme.Background).Border(1, theme.Border).Children(func() {
 				ui.Scroll(c.Key("port-options")).FillWidth().MaxHeight(240).Children(func() {
 					ui.Column(c.Key("choices")).FillWidth().Gap(2).Children(func() {
-						if len(s.portLabels) == 0 {
+						if len(s.app.PortLabels) == 0 {
 							ui.Text(c.Key("empty"), s.tr("未找到串口", "No serial ports found")).Padding(4, 6).SingleLine()
 						}
-						for _, label := range s.portLabels {
+						for _, label := range s.app.PortLabels {
 							item := sel.Item(label).Padding(4, 6).Radius(theme.Radius).Tooltip(label)
 							if item.Highlighted() {
 								item.Background(theme.Accent).TextColor(theme.AccentText)
-							} else if label == s.portChoice {
+							} else if label == s.app.PortChoice {
 								item.Background(theme.Surface)
 							}
 							item.Children(func() { ui.Text(c.Key("label"), label).SingleLine() })
