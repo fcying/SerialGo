@@ -579,3 +579,20 @@ func TestStatusTooltipShowsCurrentFullMessage(t *testing.T) {
 		})
 	}
 }
+
+func TestTimestampedFileName(t *testing.T) {
+	now := time.Date(2025, time.March, 4, 5, 6, 7, 0, time.UTC)
+	for _, test := range []struct {
+		extension string
+		want      string
+	}{
+		{extension: ".txt", want: "SerialGo_20250304_050607.txt"},
+		{extension: ".dat", want: "SerialGo_20250304_050607.dat"},
+	} {
+		t.Run(test.extension, func(t *testing.T) {
+			if got := timestampedFileName(now, test.extension); got != test.want {
+				t.Fatalf("timestamped filename = %q, want %q", got, test.want)
+			}
+		})
+	}
+}

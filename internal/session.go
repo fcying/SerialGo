@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
@@ -12,6 +13,16 @@ import (
 	"github.com/fcying/SerialGo/internal/i18n"
 )
 
+// Bound queued payload so slow storage cannot block serial reads or grow memory without limit.
+const (
+	receiveBufferSize      = 4 * 1024
+	captureBufferSize      = 128 * 1024
+	captureQueueBufferSize = 512 * 1024
+	captureFlushInterval   = time.Second
+)
+
+var errCaptureQueueFull = errors.New("receive recording queue is full")
+
 type Event struct {
 	At         time.Time
 	Data       []byte
@@ -20,15 +31,32 @@ type Event struct {
 	ReadFailed bool
 }
 
+type captureWriter struct {
+	file      io.WriteCloser
+	queue     []byte
+	queueHead int
+	queueSize int
+	wake      chan struct{}
+	stop      chan struct{}
+	done      chan struct{}
+	failure   error
+	result    error
+	stopped   bool
+	reported  bool
+}
+
 type Session struct {
-	port       *serialport.Port
-	ctx        context.Context
-	cancel     context.CancelFunc
-	events     chan Event
-	writeChunk int
-	readDone   chan struct{}
-	captureMu  sync.Mutex
-	capture    *os.File
+	port          *serialport.Port
+	ctx           context.Context
+	cancel        context.CancelFunc
+	events        chan Event
+	writeChunk    int
+	readDone      chan struct{}
+	captureMu     sync.Mutex
+	captureOps    sync.Mutex
+	capture       *captureWriter
+	captureWorker *captureWriter
+	captureError  error
 }
 
 func NewSession(port *serialport.Port, baud int) *Session {
@@ -52,25 +80,14 @@ func (s *Session) emit(event Event) {
 
 func (s *Session) receive() {
 	defer close(s.readDone)
-	buf := make([]byte, 4096)
+	buf := make([]byte, receiveBufferSize)
 	for s.ctx.Err() == nil {
 		n, err := s.port.Read(buf)
 		if n > 0 {
 			at := time.Now()
-			s.captureMu.Lock()
-			var captureErr error
-			if s.capture != nil {
-				_, captureErr = s.capture.Write(buf[:n])
-				if captureErr != nil {
-					captureErr = errors.Join(captureErr, s.capture.Close())
-					s.capture = nil
-				}
-			}
-			s.captureMu.Unlock()
-			s.emit(Event{At: at, Data: append([]byte(nil), buf[:n]...)})
-			if captureErr != nil {
-				s.emit(Event{Err: i18n.WrapError("接收文件写入失败", "Receive file write failed", captureErr)})
-			}
+			data := append([]byte(nil), buf[:n]...)
+			s.enqueueCapture(data)
+			s.emit(Event{At: at, Data: data})
 		}
 		if err != nil {
 			s.emit(Event{Err: i18n.WrapError("接收失败", "Receive failed", err), ReadFailed: true})
@@ -79,37 +96,236 @@ func (s *Session) receive() {
 	}
 }
 
-func (s *Session) SetLines(dtr, rts bool) error { return s.port.SetLines(dtr, rts) }
+func (s *Session) enqueueCapture(data []byte) {
+	s.captureMu.Lock()
+	capture := s.capture
+	if capture == nil {
+		s.captureMu.Unlock()
+		return
+	}
+	available := len(capture.queue) - capture.queueSize
+	accepted := min(len(data), available)
+	tail := (capture.queueHead + capture.queueSize) % len(capture.queue)
+	first := min(accepted, len(capture.queue)-tail)
+	copy(capture.queue[tail:tail+first], data[:first])
+	copy(capture.queue[:accepted-first], data[first:accepted])
+	capture.queueSize += accepted
+	if accepted != len(data) {
+		s.capture = nil
+		capture.failure = errCaptureQueueFull
+		capture.stopped = true
+		close(capture.stop)
+		s.captureMu.Unlock()
+		return
+	}
+	s.captureMu.Unlock()
+	select {
+	case capture.wake <- struct{}{}:
+	default:
+	}
+}
 
-// SetCapture takes ownership of file only on success. Passing nil stops capture.
-func (s *Session) SetCapture(file *os.File) error {
+func (s *Session) dequeueCapture(capture *captureWriter, dst []byte) int {
 	s.captureMu.Lock()
 	defer s.captureMu.Unlock()
-	if s.ctx.Err() != nil {
-		return s.ctx.Err()
+	n := min(capture.queueSize, len(dst))
+	if n == 0 {
+		return 0
 	}
-	if s.capture != nil {
-		err := s.capture.Close()
-		s.capture = nil
-		if err != nil {
-			return err
+	first := min(n, len(capture.queue)-capture.queueHead)
+	copy(dst[:first], capture.queue[capture.queueHead:capture.queueHead+first])
+	copy(dst[first:n], capture.queue[:n-first])
+	capture.queueHead = (capture.queueHead + n) % len(capture.queue)
+	capture.queueSize -= n
+	return n
+}
+
+func (s *Session) runCapture(capture *captureWriter) {
+	defer close(capture.done)
+	ticker := time.NewTicker(captureFlushInterval)
+	defer ticker.Stop()
+	writer := bufio.NewWriterSize(capture.file, captureBufferSize)
+	scratch := make([]byte, receiveBufferSize)
+	for {
+		n := s.dequeueCapture(capture, scratch)
+		if n > 0 {
+			if err := writeCaptureChunk(writer, scratch[:n]); err != nil {
+				s.finishCapture(capture, writer, err)
+				return
+			}
+			select {
+			case <-ticker.C:
+				if err := writer.Flush(); err != nil {
+					s.finishCapture(capture, writer, err)
+					return
+				}
+			default:
+			}
+			continue
+		}
+		select {
+		case <-capture.wake:
+		case <-ticker.C:
+			if err := writer.Flush(); err != nil {
+				s.finishCapture(capture, writer, err)
+				return
+			}
+		case <-capture.stop:
+			for {
+				n := s.dequeueCapture(capture, scratch)
+				if n == 0 {
+					break
+				}
+				if err := writeCaptureChunk(writer, scratch[:n]); err != nil {
+					s.finishCapture(capture, writer, err)
+					return
+				}
+			}
+			s.finishCapture(capture, writer, nil)
+			return
 		}
 	}
-	s.capture = file
+}
+
+func writeCaptureChunk(writer *bufio.Writer, data []byte) error {
+	if _, err := writer.Write(data); err != nil {
+		return err
+	}
+	if writer.Buffered() == writer.Size() {
+		return writer.Flush()
+	}
 	return nil
+}
+
+func (s *Session) finishCapture(capture *captureWriter, writer *bufio.Writer, writeErr error) {
+	s.captureMu.Lock()
+	report := !capture.stopped || capture.failure != nil
+	if s.capture == capture {
+		s.capture = nil
+	}
+	if !capture.stopped {
+		capture.stopped = true
+		close(capture.stop)
+	}
+	failure := capture.failure
+	s.captureMu.Unlock()
+
+	if writeErr == nil {
+		writeErr = writer.Flush()
+	}
+	result := errors.Join(failure, writeErr, capture.file.Close())
+	var reportedErr error
+	if report && result != nil {
+		if errors.Is(failure, errCaptureQueueFull) {
+			reportedErr = i18n.WrapError("接收文件写入队列已满, 已停止录制", "Receive recording queue is full; recording stopped", result)
+		} else {
+			reportedErr = i18n.WrapError("接收文件写入失败", "Receive file write failed", result)
+		}
+	}
+
+	s.captureMu.Lock()
+	capture.queue = nil
+	capture.queueHead = 0
+	capture.queueSize = 0
+	capture.result = result
+	if reportedErr != nil {
+		capture.reported = true
+		s.captureError = errors.Join(s.captureError, reportedErr)
+	}
+	s.captureMu.Unlock()
+	if reportedErr != nil {
+		s.emit(Event{Err: reportedErr})
+	}
+}
+
+func (s *Session) SetLines(dtr, rts bool) error { return s.port.SetLines(dtr, rts) }
+
+// SetCapture takes ownership of file only on success. Passing nil flushes and closes the active capture.
+func (s *Session) SetCapture(file *os.File) error {
+	if file == nil {
+		return s.setCapture(nil)
+	}
+	return s.setCapture(file)
+}
+
+func (s *Session) setCapture(file io.WriteCloser) error {
+	s.captureOps.Lock()
+	defer s.captureOps.Unlock()
+	if err := s.stopCaptureLocked(); err != nil {
+		return err
+	}
+	if file == nil {
+		return nil
+	}
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
+	capture := &captureWriter{
+		file:  file,
+		queue: make([]byte, captureQueueBufferSize),
+		wake:  make(chan struct{}, 1),
+		stop:  make(chan struct{}),
+		done:  make(chan struct{}),
+	}
+	s.captureMu.Lock()
+	if err := s.ctx.Err(); err != nil {
+		s.captureMu.Unlock()
+		return err
+	}
+	s.capture = capture
+	s.captureWorker = capture
+	s.captureMu.Unlock()
+	go s.runCapture(capture)
+	return nil
+}
+
+// stopCaptureLocked requires captureOps to serialize capture lifecycle changes.
+func (s *Session) stopCaptureLocked() error {
+	s.captureMu.Lock()
+	capture := s.captureWorker
+	if capture == nil {
+		s.captureMu.Unlock()
+		return nil
+	}
+	if s.capture == capture {
+		s.capture = nil
+	}
+	if !capture.stopped {
+		capture.stopped = true
+		close(capture.stop)
+	}
+	s.captureMu.Unlock()
+
+	<-capture.done
+
+	s.captureMu.Lock()
+	if s.captureWorker == capture {
+		s.captureWorker = nil
+	}
+	result, reported := capture.result, capture.reported
+	s.captureMu.Unlock()
+	if reported {
+		return nil
+	}
+	return result
+}
+
+func (s *Session) acknowledgeCaptureError() {
+	s.captureMu.Lock()
+	s.captureError = nil
+	s.captureMu.Unlock()
 }
 
 func (s *Session) Close() error {
 	s.cancel()
 	err := s.port.Close()
 	<-s.readDone
+	err = errors.Join(err, s.SetCapture(nil))
 	s.captureMu.Lock()
-	defer s.captureMu.Unlock()
-	if s.capture != nil {
-		err = errors.Join(err, s.capture.Close())
-		s.capture = nil
-	}
-	return err
+	captureErr := s.captureError
+	s.captureError = nil
+	s.captureMu.Unlock()
+	return errors.Join(err, captureErr)
 }
 
 // Send is called by one job at a time; partial writes count as sent bytes.

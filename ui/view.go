@@ -106,6 +106,11 @@ func (s *controller) receivePane(c *ui.Context) {
 		TextColor(ui.Hex(config.NormalizeReceiveFontColor(p.ReceiveFontColor))).
 		TrackScroll(&s.log.scroll).Label(s.tr("接收窗口", "Receive log"))
 	if s.log.scrollToEnd {
+		selectionStart, selectionEnd := area.TextSelection()
+		if selectionStart != selectionEnd {
+			// Keep the pending follow request until the selection is cleared.
+			return
+		}
 		// Buffer updates reveal the old caret unless it follows the new tail.
 		end := s.log.text.Len()
 		area.SetTextSelection(end, end)

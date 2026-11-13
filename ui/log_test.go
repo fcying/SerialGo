@@ -271,3 +271,48 @@ func TestReceiveLogAutoScrollCanPauseAndResume(t *testing.T) {
 		t.Fatalf("resuming auto scroll did not reveal the latest data: Y=%g, MaxY=%g", s.log.scroll.Y, s.log.scroll.MaxY)
 	}
 }
+
+func TestReceiveLogAutoScrollWaitsForSelectionToClear(t *testing.T) {
+	s := newController(&internal.App{})
+	s.settings.Language = "en"
+	s.log.viewportHeight = 160
+	s.configureLog()
+	s.log.append([]internal.Event{{Data: []byte(strings.Repeat("received line\n", 120))}})
+
+	tt := gui.NewTester(s.receivePane, 400, 160)
+	box, found := tt.Find("Receive log")
+	if !found || s.log.scroll.MaxY <= 0 {
+		t.Fatal("receive history does not overflow the window")
+	}
+	leftX, rightX, y := box.X+10, box.X+80, box.Y+10
+	tt.Press(leftX, y)
+	tt.Move(rightX, y)
+	tt.Release(rightX, y)
+
+	tt.SetClipboard("selection not copied")
+	tt.Key(gui.Ctrl, gui.KeyC)
+	selectedText := tt.Clipboard()
+	if selectedText == "selection not copied" || selectedText == "" {
+		t.Fatal("mouse drag did not select receive text")
+	}
+
+	s.log.append([]internal.Event{{Data: []byte(strings.Repeat("new data\n", 40))}})
+	tt.Frame()
+	if !s.autoScroll || s.log.autoScrollDisabled || !s.log.scrollToEnd {
+		t.Fatal("receiving data disabled auto scroll or lost its pending follow request")
+	}
+	if s.log.scroll.Y >= s.log.scroll.MaxY {
+		t.Fatalf("auto scroll followed the latest data during text selection: Y=%v, MaxY=%v", s.log.scroll.Y, s.log.scroll.MaxY)
+	}
+
+	tt.SetClipboard("selection cleared")
+	tt.Key(gui.Ctrl, gui.KeyC)
+	if got := tt.Clipboard(); got != selectedText {
+		t.Fatalf("new data changed the selected text: got %q, want %q", got, selectedText)
+	}
+
+	tt.ClickAt(box.X+200, box.Y+60)
+	if !s.autoScroll || s.log.autoScrollDisabled || s.log.scrollToEnd || s.log.scroll.Y != s.log.scroll.MaxY {
+		t.Fatalf("auto scroll did not resume after clearing selection: enabled=%v disabled=%v pending=%v Y=%v MaxY=%v", s.autoScroll, s.log.autoScrollDisabled, s.log.scrollToEnd, s.log.scroll.Y, s.log.scroll.MaxY)
+	}
+}

@@ -10,7 +10,7 @@
 ## Build and Tests
 - Use `just` for application builds; do not add standalone build scripts. `justfile` uses Bash default-script mode. Builds require Go 1.27.4 or later.
 - Build-script logs must be in English.
-- `just` defaults to `build`, which calls `just windows`. `windows` is an independent build entry point producing `build/windows-amd64/SerialGo.exe`; `just linux` produces `build/linux-amd64/SerialGo`. Do not use aliases. The default build does not launch the application.
+- `just windows`. `windows` is an independent build entry point producing `build/windows-amd64/SerialGo.exe`; `just linux` produces `build/linux-amd64/SerialGo`. Do not use aliases. The default build does not launch the application.
 - Windows and Linux builds both run `_icon` first to generate icon resources. Before running focused Go tests directly from a clean working tree, run `just _icon`.
 - `just test` depends directly on `windows`, not on `build`, whose target may change. If `/mnt/d/project/SerialGo` already exists, replace only its `SerialGo.exe`; otherwise skip copying and do not create the directory. If copying fails, convert the destination path with `wslpath`, terminate the Windows process at that path through `/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe`, and retry copying once. After the final copy succeeds, enter the deployment directory and launch the EXE in the background with `setsid`. Do not rebuild or modify configuration.
 - Select focused tests according to the changes. Encoding tests are in `internal/`; receive-display tests are in `ui/`. On Linux, build only by default; do not run tests by default.

@@ -109,11 +109,12 @@ func (s *App) Shutdown() error {
 		}
 	}
 	s.StopSending()
+	var shutdownErr error
 	if s.session != nil {
 		p := s.session
 		s.session = nil
 		close(s.stopPump)
-		_ = p.Close()
+		shutdownErr = errors.Join(shutdownErr, p.Close())
 	}
 	s.jobs.Wait()
 	s.pendingPortMu.Lock()
@@ -123,7 +124,7 @@ func (s *App) Shutdown() error {
 	if pendingPort != nil {
 		_ = pendingPort.Close()
 	}
-	return s.FlushSettings()
+	return errors.Join(shutdownErr, s.FlushSettings())
 }
 
 func (s *App) Connected() bool { return s.session != nil }
@@ -267,6 +268,7 @@ func (s *App) drain(p *Session) {
 		s.view.AppendEvents(records)
 	}
 	if captureErr != nil {
+		p.acknowledgeCaptureError()
 		s.CapturePath = ""
 		s.Fail("已停止接收存文件", "Receive-to-file stopped", captureErr)
 	}

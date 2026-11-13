@@ -263,10 +263,15 @@ func TestSaveLogAndCaptureFilesBelongToApp(t *testing.T) {
 	if s.CapturePath != capturePath || s.session.capture == nil {
 		t.Fatal("capture did not transfer file ownership to session")
 	}
+	s.session.enqueueCapture([]byte("stop flush"))
 	s.StopCapture()
 	awaitAppCallback(t, v)
 	if s.CapturePath != "" || s.session.capture != nil {
 		t.Fatal("capture stop retained file ownership")
+	}
+	data, err = os.ReadFile(capturePath)
+	if err != nil || string(data) != "stop flush" {
+		t.Fatalf("stop did not flush buffered capture: %q %v", data, err)
 	}
 	s.jobs.Wait()
 }
@@ -376,6 +381,62 @@ func TestShutdownReclaimsPendingOpenPortWithoutFrontendCallback(t *testing.T) {
 	}
 }
 
+func TestCaptureWriteFailureStopsAndReports(t *testing.T) {
+	writeErr := errors.New("disk full")
+	file := &captureTestFile{writeErr: writeErr}
+	p := &Session{ctx: context.Background(), events: make(chan Event, 4)}
+	v := &appTestView{}
+	s := &App{view: v, session: p, CapturePath: "rx.bin"}
+	if err := p.setCapture(file); err != nil {
+		t.Fatal(err)
+	}
+	p.enqueueCapture([]byte("pending"))
+	var event Event
+	select {
+	case event = <-p.Events():
+	case <-time.After(captureTestTimeout):
+		t.Fatal("capture write failure was not reported")
+	}
+	if !errors.Is(event.Err, writeErr) || event.ReadFailed {
+		t.Fatalf("capture failure event = %+v", event)
+	}
+	p.events <- event
+	s.drain(p)
+	if s.CapturePath != "" || !s.StatusError {
+		t.Fatal("capture failure did not stop recording and report an error")
+	}
+	p.captureMu.Lock()
+	active := p.capture != nil
+	p.captureMu.Unlock()
+	if active {
+		t.Fatal("capture remained active after a write failure")
+	}
+	if err := p.SetCapture(nil); err != nil {
+		t.Fatal(err)
+	}
+	_, closed := file.snapshot()
+	if !closed {
+		t.Fatal("failed capture file remained open")
+	}
+}
+
+func TestShutdownFlushesBufferedCaptureAndReportsFailure(t *testing.T) {
+	writeErr := errors.New("disk full")
+	file := &captureTestFile{writeErr: writeErr}
+	p := NewSession(&serialport.Port{}, 115200)
+	s := &App{closed: make(chan struct{}), session: p, stopPump: make(chan struct{})}
+	if err := p.setCapture(file); err != nil {
+		t.Fatal(err)
+	}
+	p.enqueueCapture([]byte("pending"))
+	if err := s.Shutdown(); !errors.Is(err, writeErr) {
+		t.Fatalf("shutdown did not return capture flush failure: %v", err)
+	}
+	_, closed := file.snapshot()
+	if !closed {
+		t.Fatal("shutdown left the capture file open")
+	}
+}
 func TestShutdownReclaimsCaptureWhenCompletionIsDiscarded(t *testing.T) {
 	v := &appTestView{callbacks: make(chan func(), 8)}
 	s := &App{closed: make(chan struct{}), view: v}
@@ -383,6 +444,8 @@ func TestShutdownReclaimsCaptureWhenCompletionIsDiscarded(t *testing.T) {
 	s.session, s.stopPump = p, make(chan struct{})
 	path := filepath.Join(t.TempDir(), "rx.bin")
 	s.CaptureTarget()(path)
+	awaitSessionCapture(t, p)
+	p.enqueueCapture([]byte("shutdown flush"))
 	// Shutdown must join the open/SetCapture worker even if its posted
 	// completion never reaches the frontend, and reclaim any transferred file.
 	if err := s.Shutdown(); err != nil {
@@ -393,6 +456,10 @@ func TestShutdownReclaimsCaptureWhenCompletionIsDiscarded(t *testing.T) {
 	p.captureMu.Unlock()
 	if retained != nil {
 		t.Fatal("shutdown retained capture file after discarded callback")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "shutdown flush" {
+		t.Fatalf("shutdown did not flush buffered capture: %q %v", data, err)
 	}
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)

@@ -175,11 +175,15 @@ func (s *controller) saveDialog(title, defaultPath string, accept func(string)) 
 	}()
 }
 
+func timestampedFileName(now time.Time, extension string) string {
+	return "SerialGo_" + now.Format("20060102_150405") + extension
+}
+
 func (s *controller) saveLog() {
 	if s.app.FileBusy {
 		return
 	}
-	s.saveDialog(s.tr("导出显示日志", "Export displayed log"), "SerialGo.txt", func(path string) {
+	s.saveDialog(s.tr("导出显示日志", "Export displayed log"), timestampedFileName(time.Now(), ".txt"), func(path string) {
 		s.app.SaveLog(path, s.log.text.String())
 	})
 }
@@ -189,5 +193,5 @@ func (s *controller) startCapture() {
 		return
 	}
 	accept := s.app.CaptureTarget()
-	s.saveDialog(s.tr("录制原始接收数据", "Record raw received data"), "SerialGo-rx.dat", accept)
+	s.saveDialog(s.tr("录制原始接收数据", "Record raw received data"), timestampedFileName(time.Now(), ".dat"), accept)
 }
