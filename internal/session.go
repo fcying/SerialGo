@@ -19,6 +19,8 @@ const (
 	captureBufferSize      = 128 * 1024
 	captureQueueBufferSize = 512 * 1024
 	captureFlushInterval   = time.Second
+	displayBufferSize      = 512 * 1024
+	displayEventLimit      = 512
 )
 
 var errCaptureQueueFull = errors.New("receive recording queue is full")
@@ -57,6 +59,13 @@ type Session struct {
 	capture       *captureWriter
 	captureWorker *captureWriter
 	captureError  error
+	displayMu     sync.Mutex
+	displayEvents [displayEventLimit]Event
+	displayHead   int
+	displayCount  int
+	displayBytes  int
+	displayRx     uint64
+	displayTx     uint64
 }
 
 func NewSession(port *serialport.Port, baud int) *Session {
@@ -72,10 +81,74 @@ func NewSession(port *serialport.Port, baud int) *Session {
 func (s *Session) Events() <-chan Event { return s.events }
 
 func (s *Session) emit(event Event) {
+	if event.Err == nil {
+		s.enqueueDisplay(event)
+		return
+	}
 	select {
 	case s.events <- event:
 	case <-s.ctx.Done():
 	}
+}
+
+func (s *Session) enqueueDisplay(event Event) {
+	dataBytes := len(event.Data)
+	if dataBytes == 0 {
+		return
+	}
+	s.displayMu.Lock()
+	if event.Sent {
+		s.displayTx += uint64(dataBytes)
+	} else {
+		s.displayRx += uint64(dataBytes)
+	}
+	if dataBytes > displayBufferSize {
+		event.Data = append([]byte(nil), event.Data[dataBytes-displayBufferSize:]...)
+		dataBytes = displayBufferSize
+	}
+	for s.displayCount > 0 && (s.displayCount >= displayEventLimit || s.displayBytes+dataBytes > displayBufferSize) {
+		s.dropOldestDisplayLocked()
+	}
+	tail := (s.displayHead + s.displayCount) % displayEventLimit
+	s.displayEvents[tail] = event
+	s.displayCount++
+	s.displayBytes += dataBytes
+	s.displayMu.Unlock()
+}
+
+func (s *Session) dropOldestDisplayLocked() {
+	event := &s.displayEvents[s.displayHead]
+	s.displayBytes -= len(event.Data)
+	*event = Event{}
+	s.displayHead = (s.displayHead + 1) % displayEventLimit
+	s.displayCount--
+}
+
+func (s *Session) drainDisplay() ([]Event, uint64, uint64) {
+	s.displayMu.Lock()
+	events := make([]Event, s.displayCount)
+	for i := range events {
+		index := (s.displayHead + i) % displayEventLimit
+		events[i] = s.displayEvents[index]
+		s.displayEvents[index] = Event{}
+	}
+	rx, tx := s.displayRx, s.displayTx
+	s.displayHead, s.displayCount, s.displayBytes = 0, 0, 0
+	s.displayRx, s.displayTx = 0, 0
+	s.displayMu.Unlock()
+	return events, rx, tx
+}
+
+func (s *Session) hasDisplay() bool {
+	s.displayMu.Lock()
+	defer s.displayMu.Unlock()
+	return s.displayCount != 0 || s.displayRx != 0 || s.displayTx != 0
+}
+
+func (s *Session) clearDisplayCounters() {
+	s.displayMu.Lock()
+	s.displayRx, s.displayTx = 0, 0
+	s.displayMu.Unlock()
 }
 
 func (s *Session) receive() {

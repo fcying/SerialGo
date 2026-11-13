@@ -190,18 +190,97 @@ func awaitAppCallback(t *testing.T, v *appTestView) {
 
 func TestAppDrainsSnapshotAndOwnsCountsAndCaptureFailure(t *testing.T) {
 	v := &appTestView{}
-	p := &Session{events: make(chan Event, 4)}
+	p := &Session{ctx: context.Background(), events: make(chan Event, 1)}
 	s := &App{view: v, session: p, CapturePath: "capture.bin"}
-	p.events <- Event{Data: []byte{1, 2}, Sent: true}
-	p.events <- Event{Data: []byte{3, 4, 5}}
+	p.emit(Event{Data: []byte{1, 2}, Sent: true})
+	p.emit(Event{Data: make([]byte, displayBufferSize)})
+	p.emit(Event{Data: []byte("latest")})
+	if len(p.Events()) != 0 {
+		t.Fatal("ordinary display data occupied the error channel")
+	}
 	p.events <- Event{Err: io.ErrShortWrite}
 	s.drain(p)
-	if s.Tx != 2 || s.Rx != 3 || len(v.records) != 2 || s.CapturePath != "" || !s.StatusError {
-		t.Fatal("events did not update domain counters, capture state and display callback")
+	if s.Tx != 2 || s.Rx != uint64(displayBufferSize+len("latest")) || len(v.records) != 1 || string(v.records[0].Data) != "latest" || s.CapturePath != "" || !s.StatusError {
+		t.Fatal("display overflow lost counters, retained stale data, or hid an error")
 	}
 	s.ClearCounts()
+	p.emit(Event{Data: []byte("pending")})
+	s.ClearCounts()
+	s.drain(p)
 	if s.Tx != 0 || s.Rx != 0 {
-		t.Fatal("count reset did not clear both counters")
+		t.Fatal("pending pre-reset display bytes were counted after reset")
+	}
+	p.emit(Event{Data: []byte("new")})
+	s.drain(p)
+	if s.Tx != 0 || s.Rx != 3 {
+		t.Fatal("post-reset receive bytes were not counted")
+	}
+}
+
+func TestAppPumpDrainsPendingDisplayEvents(t *testing.T) {
+	v := &appTestView{callbacks: make(chan func(), 1)}
+	p := &Session{events: make(chan Event, 1)}
+	s := &App{view: v, session: p, closed: make(chan struct{})}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		s.pump(p, stop)
+		close(done)
+	}()
+	defer func() {
+		close(stop)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("application event pump did not stop")
+		}
+	}()
+	p.emit(Event{Data: []byte("received")})
+	awaitAppCallback(t, v)
+	if s.Rx != uint64(len("received")) || len(v.records) != 1 || string(v.records[0].Data) != "received" {
+		t.Fatal("event pump did not drain and display queued receive data")
+	}
+}
+
+func TestAppPumpCoalescesPendingDisplayDispatch(t *testing.T) {
+	v := &appTestView{callbacks: make(chan func(), 16)}
+	p := &Session{events: make(chan Event, 1)}
+	s := &App{view: v, session: p, closed: make(chan struct{})}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		s.pump(p, stop)
+		close(done)
+	}()
+	defer func() {
+		close(stop)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("application event pump did not stop")
+		}
+	}()
+
+	p.emit(Event{Data: []byte("first")})
+	var first func()
+	select {
+	case first = <-v.callbacks:
+	case <-time.After(5 * time.Second):
+		t.Fatal("application event pump did not dispatch receive data")
+	}
+	time.Sleep(10 * eventPumpInterval)
+	if len(v.callbacks) != 0 {
+		t.Fatalf("queued %d duplicate UI updates while the first was pending", len(v.callbacks))
+	}
+	first()
+	if s.Rx != uint64(len("first")) || len(v.records) != 1 || string(v.records[0].Data) != "first" {
+		t.Fatal("pending UI update did not drain its display batch")
+	}
+
+	p.emit(Event{Data: []byte("next")})
+	awaitAppCallback(t, v)
+	if s.Rx != uint64(len("firstnext")) || len(v.records) != 2 || string(v.records[1].Data) != "next" {
+		t.Fatal("event pump did not schedule a new update after draining the previous one")
 	}
 }
 

@@ -30,6 +30,7 @@
 
 ## Bilingual Maintenance
 - Keep this root `AGENTS.md` in English. Keep `README.md` in English and `README.zh-CN.md` in Simplified Chinese, with reciprocal language links and synchronized behavior, build instructions, and limitations.
+- Keep `README.md` and `README.zh-CN.md` as user-facing product introductions and usage/build guides. Put architecture and internal-design details in `ARCHITECTURE.md` and `ARCHITECTURE.zh-CN.md`, not in README files.
 - Maintain Chinese and English UI text together. Keep language switching inside the Options dialog, without a duplicate toolbar language button or menu bar. Its button shows `简体中文` in English and `English` in Chinese, with the accessible name `语言 / Language`. Language switching must take effect immediately and persist to the executable-adjacent configuration; the default is `en`, with `zh-CN` for Simplified Chinese. Older configurations without a language and invalid language values normalize to `en`.
 - Localize application-owned menus, controls, dialogs, statuses, tooltips, and error descriptions consistently, including already-visible status messages. Do not translate serial data, user input, preset labels or contents, protocol values, or original operating-system/library error details. Switching languages must not reset or rewrite those values.
 - Configure MyGo's locale as session-only so `config.toml` remains the sole preferences store. Do not create separate language settings in user directories.

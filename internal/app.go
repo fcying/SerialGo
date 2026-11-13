@@ -10,12 +10,15 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fcying/SerialGo/communication/serialport"
 	"github.com/fcying/SerialGo/config"
 	"github.com/fcying/SerialGo/internal/i18n"
 )
+
+const eventPumpInterval = 10 * time.Millisecond
 
 // View confines all application state and display updates to the frontend thread.
 // Dispatch must post asynchronously and may discard callbacks after shutdown.
@@ -164,7 +167,12 @@ func (s *App) showSettingsWarning() {
 	s.settingsWarning = Text{}
 }
 
-func (s *App) ClearCounts() { s.Tx, s.Rx = 0, 0 }
+func (s *App) ClearCounts() {
+	if s.session != nil {
+		s.session.clearDisplayCounters()
+	}
+	s.Tx, s.Rx = 0, 0
+}
 
 func (s *App) SendValue() *string {
 	if s.Settings.SendHex {
@@ -222,7 +230,8 @@ func (s *App) SelectPort() {
 }
 
 func (s *App) pump(p *Session, stop <-chan struct{}) {
-	ticker := time.NewTicker(25 * time.Millisecond)
+	var dispatchPending atomic.Bool
+	ticker := time.NewTicker(eventPumpInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -231,38 +240,39 @@ func (s *App) pump(p *Session, stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-ticker.C:
-			if len(p.Events()) != 0 {
-				s.dispatch(func() {
-					if s.session == p {
-						s.drain(p)
-					}
-				})
+			if len(p.Events()) == 0 && !p.hasDisplay() {
+				continue
 			}
+			if !dispatchPending.CompareAndSwap(false, true) {
+				continue
+			}
+			s.dispatch(func() {
+				defer dispatchPending.Store(false)
+				if s.session == p {
+					s.drain(p)
+				}
+			})
 		}
 	}
 }
 
 func (s *App) drain(p *Session) {
+	records, rx, tx := p.drainDisplay()
+	s.Rx += rx
+	s.Tx += tx
 	ch := p.Events()
-	var records []Event
 	var readErr, captureErr error
 	// Process a snapshot so an active producer cannot monopolize the UI.
 	for range len(ch) {
 		event := <-ch
-		if event.Err != nil {
-			if !event.ReadFailed {
-				captureErr = event.Err
-			} else {
-				readErr = event.Err
-			}
+		if event.Err == nil {
 			continue
 		}
-		if event.Sent {
-			s.Tx += uint64(len(event.Data))
+		if !event.ReadFailed {
+			captureErr = event.Err
 		} else {
-			s.Rx += uint64(len(event.Data))
+			readErr = event.Err
 		}
-		records = append(records, event)
 	}
 	if s.view != nil {
 		s.view.AppendEvents(records)

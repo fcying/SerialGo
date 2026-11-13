@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -266,5 +267,109 @@ func TestCaptureQueueTracksBytesAcrossWraparound(t *testing.T) {
 	full := make([]byte, len(capture.queue))
 	if n := s.dequeueCapture(capture, full); n != len(full) || string(full) != "12345678" {
 		t.Fatalf("queue-full tail = %q (%d bytes)", full, n)
+	}
+}
+
+func TestSessionDisplayQueueDropsOldestAtEventLimit(t *testing.T) {
+	s := &Session{}
+	for i := range displayEventLimit + 1 {
+		s.emit(Event{Data: []byte{byte(i)}})
+	}
+	events, rx, tx := s.drainDisplay()
+	if len(events) != displayEventLimit || rx != displayEventLimit+1 || tx != 0 {
+		t.Fatalf("event-limited display queue = %d events, RX=%d TX=%d", len(events), rx, tx)
+	}
+	if events[0].Data[0] != 1 || events[len(events)-1].Data[0] != 0 {
+		t.Fatal("display queue did not retain the newest events in order")
+	}
+}
+
+func TestSessionDisplayQueueCopiesOversizedEventTail(t *testing.T) {
+	data := make([]byte, displayBufferSize+1)
+	data[0], data[1] = 0x11, 0x22
+	s := &Session{}
+	s.emit(Event{Data: data})
+	events, rx, tx := s.drainDisplay()
+	if len(events) != 1 || len(events[0].Data) != displayBufferSize || events[0].Data[0] != 0x22 || rx != displayBufferSize+1 || tx != 0 {
+		t.Fatal("oversized display event was not trimmed to its newest bytes")
+	}
+	if &events[0].Data[0] == &data[1] {
+		t.Fatal("display queue retained the oversized event's backing array")
+	}
+}
+
+func TestSessionDisplayQueueConcurrentEnqueueAndDrain(t *testing.T) {
+	const producers = 4
+	const eventsPerProducer = 1000
+	s := &Session{}
+	start := make(chan struct{})
+	done := make(chan struct{})
+	var producersDone sync.WaitGroup
+	for producer := range producers {
+		producersDone.Add(1)
+		go func(producer int) {
+			defer producersDone.Done()
+			<-start
+			for i := range eventsPerProducer {
+				s.emit(Event{Data: []byte{byte(producer)}, Sent: i%2 == 0})
+			}
+		}(producer)
+	}
+	go func() {
+		producersDone.Wait()
+		close(done)
+	}()
+	close(start)
+	var totalRx, totalTx uint64
+	for {
+		_, rx, tx := s.drainDisplay()
+		totalRx += rx
+		totalTx += tx
+		select {
+		case <-done:
+			_, rx, tx = s.drainDisplay()
+			totalRx += rx
+			totalTx += tx
+			want := uint64(producers * eventsPerProducer / 2)
+			if totalRx != want || totalTx != want || s.hasDisplay() {
+				t.Fatalf("concurrent display totals = RX %d, TX %d", totalRx, totalTx)
+			}
+			return
+		default:
+			runtime.Gosched()
+		}
+	}
+}
+
+func TestDisplayQueueOverflowDoesNotAffectCapture(t *testing.T) {
+	const chunks = displayBufferSize/receiveBufferSize + 8
+	file := &captureTestFile{writeCompleted: make(chan struct{}, 8)}
+	s := &Session{ctx: context.Background(), events: make(chan Event, 2)}
+	if err := s.setCapture(file); err != nil {
+		t.Fatal(err)
+	}
+	chunk := bytes.Repeat([]byte{0x5A}, receiveBufferSize)
+	for i := range chunks {
+		s.enqueueCapture(chunk)
+		s.emit(Event{Data: chunk})
+		if (i+1)%(captureBufferSize/receiveBufferSize) == 0 {
+			select {
+			case <-file.writeCompleted:
+			case <-time.After(captureTestTimeout):
+				t.Fatal("capture writer did not keep pace with display overflow test")
+			}
+		}
+	}
+	if err := s.SetCapture(nil); err != nil {
+		t.Fatal(err)
+	}
+	data, closed := file.snapshot()
+	want := bytes.Repeat([]byte{0x5A}, chunks*receiveBufferSize)
+	if !bytes.Equal(data, want) || !closed {
+		t.Fatalf("UI display overflow affected DAT capture: bytes=%d closed=%v", len(data), closed)
+	}
+	events, rx, tx := s.drainDisplay()
+	if len(events) != displayBufferSize/receiveBufferSize || rx != uint64(chunks*receiveBufferSize) || tx != 0 {
+		t.Fatalf("UI queue retained %d events and counted RX=%d TX=%d", len(events), rx, tx)
 	}
 }
