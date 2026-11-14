@@ -24,6 +24,7 @@ const (
 )
 
 var errCaptureQueueFull = errors.New("receive recording queue is full")
+var errFileNotRegular = i18n.NewError("仅支持发送普通文件", "only regular files are supported")
 
 type Event struct {
 	At         time.Time
@@ -435,6 +436,14 @@ func (s *Session) SendFile(ctx context.Context, path string, delay time.Duration
 }
 
 func sendFile(ctx context.Context, path string, delay time.Duration, sender fileSender) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return errFileNotRegular
+	}
+
 	file, err := os.Open(path)
 	if err != nil {
 		return err

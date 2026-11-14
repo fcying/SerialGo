@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"errors"
 	"slices"
 	"strconv"
 	"strings"
@@ -148,8 +149,8 @@ func (s *App) ApplyPortSettings(next serialport.Settings, rates []string) error 
 		next.Baud, next.DataBits, next.Parity, next.StopBits = previous.Baud, previous.DataBits, previous.Parity, previous.StopBits
 		rates = s.Settings.BaudRates
 		if next.DTR != previous.DTR || next.RTS != previous.RTS {
-			if err := s.session.SetLines(next.DTR, next.RTS); err != nil {
-				return i18n.WrapError("设置控制线失败", "Failed to set control lines", err)
+			if err := applyControlLines(s.session.SetLines, previous, next); err != nil {
+				return err
 			}
 		}
 	}
@@ -158,6 +159,20 @@ func (s *App) ApplyPortSettings(next serialport.Settings, rates []string) error 
 		s.SettingsChanged()
 		s.Note("串口设置已更新", "Port settings updated")
 		s.SaveUsedSettings()
+	}
+	return nil
+}
+
+func applyControlLines(setLines func(bool, bool) error, previous, next serialport.Settings) error {
+	if err := setLines(next.DTR, next.RTS); err != nil {
+		restoreErr := setLines(previous.DTR, previous.RTS)
+		if restoreErr != nil {
+			return errors.Join(
+				i18n.WrapError("设置控制线失败", "Failed to set control lines", err),
+				i18n.WrapError("恢复原控制线配置失败, 硬件状态可能与配置不一致", "Failed to restore previous control-line settings; hardware state may not match configuration", restoreErr),
+			)
+		}
+		return i18n.WrapError("设置控制线失败, 已重新应用原配置状态", "Failed to set control lines; previous configured state was reapplied", err)
 	}
 	return nil
 }

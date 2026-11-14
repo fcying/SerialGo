@@ -91,6 +91,19 @@ func TestReceiveLogNewDataScrollsToBottom(t *testing.T) {
 	}
 }
 
+func clickLogCheckbox(t *testing.T, tt *gui.Tester, label string) {
+	t.Helper()
+	checkbox, found := tt.AccessByRole(gui.RoleCheckBox, label)
+	if !found {
+		t.Fatalf("checkbox %q not found", label)
+	}
+	x := checkbox.Bounds.X + checkbox.Bounds.H/2
+	y := checkbox.Bounds.Y + checkbox.Bounds.H/2
+	tt.Press(x, y)
+	tt.Release(x, y)
+	tt.Frame()
+}
+
 func TestTimestampPacketToggleReformatsHistory(t *testing.T) {
 	path := t.TempDir() + "/config.toml"
 	s, notified := settingsSaveFixture(t, path)
@@ -106,13 +119,8 @@ func TestTimestampPacketToggleReformatsHistory(t *testing.T) {
 	if got := s.log.text.String(); got != "abcdef" {
 		t.Fatalf("disabled packet display = %q", got)
 	}
-	if err := tt.Click("Options"); err != nil {
-		t.Fatal(err)
-	}
-	label := "Timestamp and packets"
-	if err := tt.Click(label); err != nil {
-		t.Fatal(err)
-	}
+	label := s.tr("时间戳", "Timestamp")
+	clickLogCheckbox(t, tt, label)
 	want := "[12:00:00.000] abcd\n[12:00:00.039] ef"
 	if got := s.log.text.String(); got != want {
 		t.Fatalf("enabled packet display = %q; want %q", got, want)
@@ -121,9 +129,7 @@ func TestTimestampPacketToggleReformatsHistory(t *testing.T) {
 	if !readSavedSettings(t, path).Timestamp {
 		t.Fatal("enabled timestamp packet display was not saved")
 	}
-	if err := tt.Click(label); err != nil {
-		t.Fatal(err)
-	}
+	clickLogCheckbox(t, tt, label)
 	if got := s.log.text.String(); got != "abcdef" {
 		t.Fatalf("disabling packet display did not restore continuous data: %q", got)
 	}

@@ -97,6 +97,68 @@ func TestPortSettingsLineFailureKeepsSettingsAndStatus(t *testing.T) {
 	}
 }
 
+func TestApplyControlLinesRestoresPreviousSettingsAfterPartialFailure(t *testing.T) {
+	previous := serialport.Settings{DTR: false, RTS: false}
+	next := serialport.Settings{DTR: true, RTS: true}
+	actual := previous
+	applyErr := errors.New("RTS control line failed")
+	calls := 0
+	setLines := func(dtr, rts bool) error {
+		calls++
+		if calls == 1 {
+			actual.DTR = dtr
+			return applyErr
+		}
+		actual.DTR, actual.RTS = dtr, rts
+		return nil
+	}
+
+	err := applyControlLines(setLines, previous, next)
+	if !errors.Is(err, applyErr) {
+		t.Fatalf("applyControlLines() error = %v, want original error %v", err, applyErr)
+	}
+	if calls != 2 {
+		t.Fatalf("SetLines() calls = %d, want initial apply and rollback", calls)
+	}
+	if actual.DTR != previous.DTR || actual.RTS != previous.RTS {
+		t.Fatalf("restored lines = DTR %t, RTS %t; want DTR %t, RTS %t", actual.DTR, actual.RTS, previous.DTR, previous.RTS)
+	}
+	if !strings.Contains(i18n.ErrorText(err, true), "previous configured state was reapplied") {
+		t.Fatalf("error does not report successful rollback: %v", err)
+	}
+}
+
+func TestApplyControlLinesReportsFailedRestore(t *testing.T) {
+	previous := serialport.Settings{DTR: false, RTS: false}
+	next := serialport.Settings{DTR: true, RTS: true}
+	actual := previous
+	applyErr := errors.New("RTS control line failed")
+	restoreErr := errors.New("DTR restore failed")
+	calls := 0
+	setLines := func(dtr, rts bool) error {
+		calls++
+		if calls == 1 {
+			actual.DTR = dtr
+			return applyErr
+		}
+		return restoreErr
+	}
+
+	err := applyControlLines(setLines, previous, next)
+	if !errors.Is(err, applyErr) || !errors.Is(err, restoreErr) {
+		t.Fatalf("applyControlLines() error = %v, want both apply and restore errors", err)
+	}
+	if calls != 2 {
+		t.Fatalf("SetLines() calls = %d, want initial apply and rollback", calls)
+	}
+	if actual.DTR == previous.DTR {
+		t.Fatal("test setup did not leave DTR in its partially applied state")
+	}
+	if !strings.Contains(i18n.ErrorText(err, true), "hardware state may not match configuration") {
+		t.Fatalf("error does not report uncertain hardware state: %v", err)
+	}
+}
+
 func TestConnectedBaudCommandsCannotChangeSettingsOrDraft(t *testing.T) {
 	for _, forPort := range []bool{false, true} {
 		s := connectedAppFixture(t)
@@ -353,6 +415,114 @@ func TestSaveLogAndCaptureFilesBelongToApp(t *testing.T) {
 		t.Fatalf("stop did not flush buffered capture: %q %v", data, err)
 	}
 	s.jobs.Wait()
+}
+
+func TestSaveAndCaptureDoNotOverwriteActiveSendSourceAlias(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "send.bin")
+	aliasPath := filepath.Join(dir, "send-alias.bin")
+	want := []byte("serial payload split across chunks")
+	if err := os.WriteFile(sourcePath, want, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(sourcePath, aliasPath); err != nil {
+		t.Fatalf("create hard-link alias: %v", err)
+	}
+
+	view := &appTestView{callbacks: make(chan func(), 8)}
+	connection := &Session{ctx: context.Background()}
+	s := &App{view: view, session: connection, FilePath: sourcePath}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	sent := make(chan []byte, 1)
+	defer func() {
+		if !released {
+			close(release)
+		}
+		s.jobs.Wait()
+		if err := connection.SetCapture(nil); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	s.startSending(Text{ZH: "发送文件", EN: "File send"}, sourcePath, func(_ context.Context, _ *Session) error {
+		file, err := os.Open(sourcePath)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		first := make([]byte, 1)
+		n, err := file.Read(first)
+		if err != nil {
+			return err
+		}
+		close(started)
+		<-release
+		rest, err := io.ReadAll(file)
+		if err != nil {
+			return err
+		}
+		sent <- append(first[:n], rest...)
+		return nil
+	})
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("file-send worker did not open its source")
+	}
+
+	s.SelectFile(filepath.Join(dir, "another-file.bin"))
+	s.SaveLog(aliasPath, "overwrite")
+	awaitAppCallback(t, view)
+	if s.Status.EN != "Do not overwrite the file currently being sent" {
+		t.Fatalf("save collision status = %q", s.Status.EN)
+	}
+	data, err := os.ReadFile(sourcePath)
+	if err != nil || !slices.Equal(data, want) {
+		t.Fatalf("display save changed send source: %q %v", data, err)
+	}
+
+	s.CaptureTarget()(aliasPath)
+	awaitAppCallback(t, view)
+	if s.CapturePath != "" || s.FileBusy || s.Status.EN != "Do not overwrite the file currently being sent" {
+		t.Fatalf("capture collision state: path=%q busy=%t status=%q", s.CapturePath, s.FileBusy, s.Status.EN)
+	}
+	data, err = os.ReadFile(sourcePath)
+	if err != nil || !slices.Equal(data, want) {
+		t.Fatalf("capture changed send source: %q %v", data, err)
+	}
+
+	close(release)
+	released = true
+	select {
+	case got := <-sent:
+		if !slices.Equal(got, want) {
+			t.Fatalf("file-send data = %q, want %q", got, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("file-send worker did not finish after release")
+	}
+	awaitAppCallback(t, view)
+	if s.sendingFilePath != "" {
+		t.Fatalf("completed file send retained source path %q", s.sendingFilePath)
+	}
+}
+
+func TestSendFileCannotStartWhileFileOutputIsBusy(t *testing.T) {
+	s := &App{
+		Settings: config.Settings{FileDelay: "1"},
+		session:  &Session{},
+		FilePath: "send.bin",
+		FileBusy: true,
+	}
+	if s.CanSendFile() {
+		t.Fatal("file send was enabled during a file output operation")
+	}
+	s.SendFile()
+	if s.cancelSend != nil || s.sendingFilePath != "" || s.StatusError {
+		t.Fatal("file send started while a file output operation was busy")
+	}
 }
 
 func TestStartupSettingsFallbackWarnsWithoutMaskingErrors(t *testing.T) {

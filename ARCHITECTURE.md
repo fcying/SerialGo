@@ -2,7 +2,7 @@
 
 English | [简体中文](ARCHITECTURE.zh-CN.md)
 
-[User guide](README.md) | [Roadmap](ROADMAP.md)
+[User guide](README.md)
 
 ## Application boundary
 

@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 A native serial-port debugging assistant for Windows and Linux, with text/HEX transmission, receive logging, file transfer, and editable send presets.
 
-[Architecture](ARCHITECTURE.md) | [Roadmap](ROADMAP.md)
+[Architecture](ARCHITECTURE.md)
 
 ## Screenshots
 
@@ -48,7 +48,7 @@ Both baud selectors initially offer `9600`, `19200`, `57600`, `115200`, `921600`
 - **Timestamp** splits display packets at the configured idle gap and adds timestamps. Set **Timestamp packet gap** in Options, default `20 ms`. Invalid edits remain uncommitted with an error until corrected.
 - **Auto scroll** follows incoming data. Disable it to keep your viewport while reception continues; re-enable it to return to the latest line. Selecting text temporarily pauses following until the selection is cleared, without disabling auto scroll. Scrolling back alone does not disable following. Auto scroll is not saved.
 - **Clear** clears the receive log. The footer shows S/R counters for actual transmitted and received bytes; **Reset** clears them. Serial settings use a compact format such as **1000000 bps · 8N1**; hover over serial settings or operation status to read their full text.
-- **Open file** selects a file; hover over **Send file** to see its full path. **Delay** sets the millisecond wait between file-send chunks, with no extra wait after the last chunk.
+- **Open file** selects a file; hover over **Send file** to see its full path. **Delay** sets the millisecond wait between file-send chunks, with no extra wait after the last chunk. Only regular files are supported.
 - **Save data** exports the displayed log as `.txt`. **Record data** saves raw received bytes to `.dat`. If recording cannot keep up with reception, it stops with an error instead of blocking reception or silently dropping data. Stopping, disconnecting, or exiting flushes and closes the capture. Recording requires a connection and does not resume after restart; completed `.dat` files remain on disk.
 
 ### Display history limit

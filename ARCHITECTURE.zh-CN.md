@@ -2,7 +2,7 @@
 
 [English](ARCHITECTURE.md) | 简体中文
 
-[使用说明](README.zh-CN.md) | [路线图](ROADMAP.zh-CN.md)
+[使用说明](README.zh-CN.md)
 
 ## 应用边界
 
