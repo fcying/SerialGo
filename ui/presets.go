@@ -37,13 +37,13 @@ func (s *controller) applyPresetDelete() {
 
 func (s *controller) presetDeleteDialog(c *ui.Context) {
 	ui.Modal(c.Key("preset-delete-dialog"), &s.presetDeleteOpen, func() {
-		ui.Column(c.Key("confirmation")).Width(310).Gap(10).Children(func() {
+		ui.Column(c.Key("confirmation")).Width(310).Gap(sectionGap).Children(func() {
 			ui.Text(c.Key("title"), s.tr("删除发送条目", "Delete preset")).FontSize(16).FontWeight(600)
 			ui.Text(c.Key("prompt"), s.tr(
 				fmt.Sprintf("删除第 %d 条发送条目? 后续条目将重新编号.", s.presetDeleteIndex+1),
 				fmt.Sprintf("Delete preset %d? Following presets will be renumbered.", s.presetDeleteIndex+1),
 			)).FillWidth()
-			ui.Row(c.Key("actions")).FillWidth().Gap(8).Justify(ui.End).Children(func() {
+			ui.Row(c.Key("actions")).FillWidth().Gap(wideGap).Justify(ui.End).Children(func() {
 				ui.Button(c.Key("delete"), s.tr("删除", "Delete")).Width(76).Height(28).Label(s.tr("确认删除条目", "Confirm preset deletion")).Disabled(s.app.Sending()).OnClick(s.applyPresetDelete)
 				ui.Button(c.Key("cancel"), s.tr("取消", "Cancel")).Width(76).Height(28).AutoFocus().OnClick(func() { s.presetDeleteOpen = false })
 			})

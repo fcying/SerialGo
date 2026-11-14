@@ -27,7 +27,7 @@ func TestPortFramingSelectionAppliesOnlyOnConfirmation(t *testing.T) {
 	s.configureLog()
 	original := s.settings.Port
 	tt := gui.NewTester(s.view, 1280, 600)
-	if err := tt.Click("Port configuration"); err != nil {
+	if err := tt.Click("Port settings"); err != nil {
 		t.Fatal(err)
 	}
 	trigger, found := tt.AccessByRole(gui.RolePopUpButton, "Data bits")
@@ -57,6 +57,97 @@ func TestPortFramingSelectionAppliesOnlyOnConfirmation(t *testing.T) {
 	completeSettingsSave(t, s, notified)
 	if stored := readSavedSettings(t, s.app.SettingsPath); stored.Port != want || s.app.SettingsDirty {
 		t.Fatalf("confirmed framing selection was not persisted: port=%+v dirty=%v", stored.Port, s.app.SettingsDirty)
+	}
+}
+
+func TestPortSettingDropdownValuesAreCentered(t *testing.T) {
+	s, _ := portSettingsFixture(t)
+	s.configureLog()
+	var expectedBaudWidth float32
+	var expectedDialogContentWidth float32
+	tt := gui.NewTester(func(c *gui.Context) {
+		s.view(c)
+		standardWidth, _ := c.MeasureText(0, gui.Span{Text: "1000000"})
+		selectedWidth, _ := c.MeasureText(0, gui.Span{Text: s.settings.Port.Baud})
+		expectedBaudWidth = max(standardWidth, selectedWidth) + baudPickerChromeWidth
+		fieldRowWidth := portSettingsFieldLabelWidth + sectionGap + expectedBaudWidth
+		actionRowWidth := 2*portSettingsActionButtonWidth + wideGap
+		expectedDialogContentWidth = max(fieldRowWidth, actionRowWidth)
+	}, 800, 600)
+	if err := tt.Click("Port settings"); err != nil {
+		t.Fatal(err)
+	}
+	tt.SetScale(2)
+	dialog, dialogFound := tt.AccessByRole(gui.RoleDialog, "Port settings")
+	if !dialogFound {
+		t.Fatal("port settings dialog is missing")
+	}
+	if dialog.Bounds.W < expectedDialogContentWidth-0.01 || dialog.Bounds.W >= 340 {
+		t.Fatalf("port settings dialog width=%v, want content width %v and narrower than 340", dialog.Bounds.W, expectedDialogContentWidth)
+	}
+	dialogCenter := dialog.Bounds.X + dialog.Bounds.W/2
+	if dialogCenter < 399.5 || dialogCenter > 400.5 {
+		t.Fatalf("port settings dialog center=%v, want 400 for symmetric side padding", dialogCenter)
+	}
+	baudPicker, baudFound := tt.AccessByRole(gui.RolePopUpButton, "Baud rate")
+	if !baudFound {
+		t.Fatal("baud selector is missing from Port settings")
+	}
+	if baudPicker.Bounds.W < expectedBaudWidth-0.01 || baudPicker.Bounds.W > expectedBaudWidth+0.01 {
+		t.Fatalf("port-settings baud width=%v, want %v", baudPicker.Bounds.W, expectedBaudWidth)
+	}
+	selectors := []struct {
+		label string
+		value string
+	}{
+		{label: "Data bits", value: "8"},
+		{label: "Stop bits", value: "1"},
+		{label: "Parity", value: "None"},
+	}
+	pickers := make([]gui.AccessInfo, len(selectors))
+	for i, test := range selectors {
+		picker, found := tt.AccessByRole(gui.RolePopUpButton, test.label)
+		if !found || picker.Value != test.value {
+			t.Fatalf("%s dropdown value = %q, found=%v; want %q", test.label, picker.Value, found, test.value)
+		}
+		pickers[i] = picker
+		if picker.Bounds.W < baudPicker.Bounds.W-0.01 || picker.Bounds.W > baudPicker.Bounds.W+0.01 {
+			t.Errorf("%s selector width=%v, want baud selector width %v", test.label, picker.Bounds.W, baudPicker.Bounds.W)
+		}
+	}
+	probe, probeFound := tt.Find("Port settings")
+	if !probeFound {
+		t.Fatal("port settings text render probe is missing")
+	}
+	skipIfTextPixelsUnavailable(t, tt, probe)
+	img := tt.Image()
+	for i, test := range selectors {
+		picker := pickers[i]
+		left := picker.Bounds.X + baudPickerBorderWidth + serialSelectorPaddingX
+		right := picker.Bounds.X + picker.Bounds.W - baudPickerBorderWidth - serialSelectorPaddingX - serialSelectorArrowPaddingX - baudPickerArrowSize - microGap
+		minX, maxX := img.Bounds().Max.X, -1
+		yStart := int((picker.Bounds.Y + 4) * 2)
+		yEnd := int((picker.Bounds.Y + picker.Bounds.H - 4) * 2)
+		xStart := int(left * 2)
+		xEnd := int(right * 2)
+		for yOffset := range yEnd - yStart {
+			y := yStart + yOffset
+			for xOffset := range xEnd - xStart {
+				x := xStart + xOffset
+				pixel := img.RGBAAt(x, y)
+				if pixel.R < 100 && pixel.G < 100 && pixel.B < 100 {
+					minX, maxX = min(minX, x), max(maxX, x)
+				}
+			}
+		}
+		if maxX < minX {
+			t.Fatalf("%s dropdown value %q did not render: picker=%+v textArea=%.2f..%.2f", test.label, test.value, picker.Bounds, left, right)
+		}
+		inkCenter := float32(minX+maxX+1) / 4
+		textAreaCenter := (left + right) / 2
+		if inkCenter < textAreaCenter-1 || inkCenter > textAreaCenter+1 {
+			t.Errorf("%s value is not centered: inkCenter=%.2f textAreaCenter=%.2f", test.label, inkCenter, textAreaCenter)
+		}
 	}
 }
 
@@ -91,7 +182,7 @@ func TestPortSettingsCancelAndEscapeDiscardDraft(t *testing.T) {
 			original, revision := *s.settings, s.app.SettingsRevision
 			s.configureLog()
 			tt := gui.NewTester(s.view, 800, 600)
-			if err := tt.Click("Port configuration"); err != nil {
+			if err := tt.Click("Port settings"); err != nil {
 				t.Fatal(err)
 			}
 			if !s.portSettingsOpen {
@@ -114,7 +205,7 @@ func TestPortSettingsCancelAndEscapeDiscardDraft(t *testing.T) {
 			if s.portSettingsOpen || !reflect.DeepEqual(*s.settings, original) || s.portDraft != original.Port || s.app.SettingsDirty || s.app.SettingsRevision != revision {
 				t.Fatal("dismissing the property dialog did not restore settings and framing controls")
 			}
-			if err := tt.Click("Port configuration"); err != nil {
+			if err := tt.Click("Port settings"); err != nil {
 				t.Fatal(err)
 			}
 			if !s.portSettingsOpen || s.portDraft != original.Port || s.portSettingsError != (localizedText{}) {

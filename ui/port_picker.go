@@ -16,7 +16,7 @@ func (s *controller) portPicker(c *ui.Context, refresh func()) {
 		}
 		theme := c.Theme()
 		trigger := sel.Trigger.Width(0).MinWidth(0).Grow(1).Height(controlHeight).
-			Padding(controlPadY, 3).Gap(4).Radius(theme.Radius).Border(1, theme.Border).
+			Padding(controlPadY, serialSelectorArrowPaddingX, controlPadY, 0).Gap(controlGap).Radius(theme.Radius).Border(1, theme.Border).
 			Background(theme.Surface).TextColor(theme.Text).AlignItems(ui.Center).
 			Label(s.tr("端口号", "Port")).Value(s.app.PortChoice).Tooltip(s.app.PortChoice).
 			Disabled(connected).OnChange(s.app.SelectPort)
@@ -32,7 +32,7 @@ func (s *controller) portPicker(c *ui.Context, refresh func()) {
 			if label == "" {
 				label = s.tr("选择串口", "Select port")
 			}
-			ui.Text(c.Key("selected"), label).Width(0).MinWidth(0).Grow(1).SingleLine()
+			ui.Text(c.Key("selected"), label).Width(0).MinWidth(0).Grow(1).Padding(0, serialSelectorPaddingX).SingleLine().TextAlign(ui.Center)
 			ui.Box(c.Key("arrow")).Size(8, 8).Shrink(0).Draw(func(p *ui.Painter, r ui.Rect) {
 				var path ui.Path
 				path.MoveTo(r.X+r.W*0.1, r.Y+r.H*0.3).LineTo(r.X+r.W*0.5, r.Y+r.H*0.7).LineTo(r.X+r.W*0.9, r.Y+r.H*0.3)
@@ -42,7 +42,7 @@ func (s *controller) portPicker(c *ui.Context, refresh func()) {
 		sel.Popup(func(panel ui.Element) {
 			panel.Padding(3).Radius(theme.Radius).Background(theme.Background).Border(1, theme.Border).Children(func() {
 				ui.Scroll(c.Key("port-options")).FillWidth().MaxHeight(240).Children(func() {
-					ui.Column(c.Key("choices")).FillWidth().Gap(2).Children(func() {
+					ui.Column(c.Key("choices")).FillWidth().Gap(compactGap).Children(func() {
 						if len(s.app.PortLabels) == 0 {
 							ui.Text(c.Key("empty"), s.tr("未找到串口", "No serial ports found")).Padding(4, 6).SingleLine()
 						}

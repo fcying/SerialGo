@@ -85,14 +85,14 @@ func (s *controller) applyReceiveFontDialog() {
 
 func (s *controller) receiveFontDialog(c *ui.Context) {
 	ui.Modal(c.Key("receive-font-dialog"), &s.receiveFontDialogOpen, func() {
-		ui.Column(c.Key("font-settings")).Width(360).Gap(10).Children(func() {
+		ui.Column(c.Key("font-settings")).Width(360).Gap(sectionGap).Children(func() {
 			ui.Text(c.Key("title"), s.tr("接收窗口字体", "Receive font")).FontSize(16).FontWeight(600)
-			ui.Row(c.Key("family-row")).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Row(c.Key("family-row")).FillWidth().Gap(wideGap).AlignItems(ui.Center).Children(func() {
 				ui.Text(c.Key("family-label"), s.tr("字体", "Font")).Width(72)
 				ui.TextInput(c.Key("family"), &s.receiveFontNameDraft).Width(0).MinWidth(0).Grow(1).Height(controlHeight).PaddingY(controlPadY).
 					MaxLength(128).Label(s.tr("接收字体名称", "Receive font family"))
 			})
-			ui.Row(c.Key("size-color-row")).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Row(c.Key("size-color-row")).FillWidth().Gap(wideGap).AlignItems(ui.Center).Children(func() {
 				ui.Text(c.Key("size-label"), s.tr("字号", "Size"))
 				ui.Select(c.Key("size"), &s.receiveFontSizeDraft, receiveFontSizes).Width(72).Height(controlHeight).PaddingY(controlPadY).
 					Label(s.tr("字体大小 (pt)", "Font size (pt)"))
@@ -129,7 +129,7 @@ func (s *controller) receiveFontDialog(c *ui.Context) {
 			if s.receiveFontError.en != "" {
 				ui.Text(c.Key("error"), s.tr(s.receiveFontError.zh, s.receiveFontError.en)).FillWidth().TextColor(c.Theme().Danger)
 			}
-			ui.Row(c.Key("actions")).FillWidth().Gap(8).Justify(ui.End).Children(func() {
+			ui.Row(c.Key("actions")).FillWidth().Gap(wideGap).Justify(ui.End).Children(func() {
 				ui.Button(c.Key("ok"), s.tr("确定", "OK")).Width(76).Height(28).OnClick(s.applyReceiveFontDialog)
 				ui.Button(c.Key("cancel"), s.tr("取消", "Cancel")).Width(76).Height(28).OnClick(func() { s.receiveFontDialogOpen = false })
 			})
@@ -138,7 +138,7 @@ func (s *controller) receiveFontDialog(c *ui.Context) {
 }
 
 func (s *controller) receiveFontButton(c *ui.Context) {
-	ui.Row(c.Key("receive-font-options")).Gap(6).AlignItems(ui.Center).Children(func() {
+	ui.Row(c.Key("receive-font-options")).Gap(groupGap).AlignItems(ui.Center).Children(func() {
 		ui.Text(c.Key("font-label"), s.tr("接收窗口字体", "Receive font"))
 		ui.Button(c.Key("configure-font"), s.tr("字体...", "Font...")).Height(controlHeight).PaddingY(controlPadY).
 			Label(s.tr("配置接收窗口字体", "Configure receive font")).OnClick(s.openReceiveFontDialog)

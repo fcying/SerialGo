@@ -28,7 +28,7 @@ func displayBufferOptions(c *ui.Context, settings *config.Settings, onChange fun
 	if settings.Language == "zh-CN" {
 		label, tooltip = "显示缓冲上限", "保留的数据字节数; K = 1000 字节, M = 1000000 字节"
 	}
-	ui.Row(c.Key("buffer-options")).Gap(6).AlignItems(ui.Center).Children(func() {
+	ui.Row(c.Key("buffer-options")).Gap(groupGap).AlignItems(ui.Center).Children(func() {
 		ui.Text(c.Key("buffer-label"), label)
 		ui.Select(c.Key("buffer-limit"), &selected, displayBufferLabels).Width(88).Height(controlHeight).PaddingY(controlPadY).
 			Label(label).Tooltip(tooltip).OnChange(func() {

@@ -17,8 +17,8 @@ func TestStatusBarKeepsLongTextOnOneLine(t *testing.T) {
 	for _, language := range []struct {
 		code, serialConfig, redundantStatus, statusLabel string
 	}{
-		{"zh-CN", "1000000bps,8,1,None", "COM1 已关闭  1000000bps,8,1,None", "操作状态"},
-		{"en", "1000000bps,8,1,None", "COM1 Closed  1000000bps,8,1,None", "Operation status"},
+		{"zh-CN", "1000000 bps · 8N1", "COM1 已关闭  1000000 bps · 8N1", "操作状态"},
+		{"en", "1000000 bps · 8N1", "COM1 Closed  1000000 bps · 8N1", "Operation status"},
 	} {
 		for _, width := range []int{780, 800, 1000} {
 			for _, scale := range []float32{1, 1.25, 1.5, 1.6, 2} {
@@ -44,6 +44,7 @@ func TestStatusBarKeepsLongTextOnOneLine(t *testing.T) {
 						"S: 18446744073709551615",
 						language.serialConfig,
 						language.statusLabel,
+						s.tr("清零", "Reset"),
 						s.tr("收发计数清零", "Reset counters"),
 					} {
 						bounds, found := tt.Find(text)
@@ -54,6 +55,11 @@ func TestStatusBarKeepsLongTextOnOneLine(t *testing.T) {
 						lineCenter := line.Y + line.H/2
 						if center < lineCenter-1 || center > lineCenter+1 || bounds.Y < 0 || bounds.Y+bounds.H > 600 {
 							t.Errorf("status field %q extends outside its footer line: field=%+v line=%+v", text, bounds, line)
+						}
+					}
+					if language.code == "zh-CN" {
+						if _, found := tt.Find("清计数"); found {
+							t.Error("old reset caption remains visible")
 						}
 					}
 					if _, found := tt.Find(language.redundantStatus); found {
@@ -73,7 +79,7 @@ func TestStatusBarKeepsLongTextOnOneLine(t *testing.T) {
 					for _, label := range []string{
 						s.tr("选项", "Options"),
 						s.tr("清空发送区", "Clear send area"),
-						s.tr("保存", "Save"),
+						s.tr("保存数据", "Save data"),
 						s.tr("HEX 显示", "HEX display"),
 						s.tr("HEX 发送", "HEX send"),
 					} {
@@ -108,7 +114,6 @@ func TestStatusBarKeepsLongTextOnOneLine(t *testing.T) {
 					}
 					for _, label := range []string{
 						"语言 / Language",
-						s.tr("显示发送记录", "Show sent data"),
 						s.tr("文本编码", "Text encoding"),
 						s.tr("时间戳分包超时 (ms)", "Timestamp packet gap (ms)"),
 					} {
@@ -117,9 +122,32 @@ func TestStatusBarKeepsLongTextOnOneLine(t *testing.T) {
 							t.Errorf("option %q is missing or clipped: %+v", label, bounds)
 						}
 					}
+					if _, found := tt.Find(s.tr("显示发送记录", "Show sent data")); found {
+						t.Error("Show sent remains in the Options dialog")
+					}
 				})
 			}
 		}
+	}
+}
+
+func TestFormatSerialConfig(t *testing.T) {
+	tests := []struct {
+		name, baud, dataBits, parity, stopBits, want string
+	}{
+		{"none", "1000000", "8", "None", "1", "1000000 bps · 8N1"},
+		{"odd", "115200", "7", "Odd", "1", "115200 bps · 7O1"},
+		{"even", "9600", "7", "Even", "2", "9600 bps · 7E2"},
+		{"mark", "38400", "8", "Mark", "1", "38400 bps · 8M1"},
+		{"space with fractional stop bit", "19200", "8", "Space", "1.5", "19200 bps · 8S1.5"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := formatSerialConfig(test.baud, test.dataBits, test.parity, test.stopBits)
+			if got != test.want {
+				t.Fatalf("formatSerialConfig() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 
@@ -202,7 +230,7 @@ func TestSendAreaResizePreservesDraftAndVisibleActions(t *testing.T) {
 
 func TestCompactControlsStayInsidePanels(t *testing.T) {
 	for _, language := range []string{"en", "zh-CN"} {
-		for _, width := range []int{789, 800, 811, 1280} {
+		for _, width := range []int{minWindowWidth, minWindowWidth + 20, minWindowWidth + 40, 1280} {
 			t.Run(fmt.Sprintf("%s_%d", language, width), func(t *testing.T) {
 				app := &internal.App{Settings: config.Settings{
 					Language:  language,
@@ -213,26 +241,29 @@ func TestCompactControlsStayInsidePanels(t *testing.T) {
 				}}
 				s := newController(app)
 				s.configureLog()
-				var baudTextWidth, baudLabelWidth, configLabelWidth float32
+				var baudTextWidth, settingsLabelWidth, autoScrollTextWidth float32
+				var expectedReceiveOptionsWidth float32
 				tt := gui.NewTester(func(c *gui.Context) {
 					s.view(c)
 					baudTextWidth, _ = c.MeasureText(0, gui.Span{Text: "1000000"})
-					baudLabelWidth, _ = c.MeasureText(0, gui.Span{Text: s.tr("波特率", "Baud")})
-					configLabelWidth, _ = c.MeasureText(0, gui.Span{Text: s.tr("配置", "Config")})
+					settingsLabelWidth, _ = c.MeasureText(0, gui.Span{Text: s.tr("设置", "Settings")})
+					autoScrollTextWidth, _ = c.MeasureText(0, gui.Span{Text: s.tr("自动滚动", "Auto scroll")})
+					autoScrollCheckboxWidth := autoScrollTextWidth + c.Theme().Space(4) + c.Theme().Space(2)
+					expectedReceiveOptionsWidth = receiveOptionsFirstColumnWidth + controlGap + autoScrollCheckboxWidth + panelChromeWidth
 				}, width, 420)
 				expectedPickerWidth := baudTextWidth + baudPickerChromeWidth
-				expectedConnectionWidth := baudLabelWidth + 2*serialPanelRowGap + expectedPickerWidth + configLabelWidth + serialConfigButtonChromeWidth + serialPanelChromeWidth
-				expectedSendWidth := float32(width) - 2*2 - 3*4 - expectedConnectionWidth - 156 - 184
+				expectedConnectionWidth := controlGap + expectedPickerWidth + settingsLabelWidth + serialConfigButtonChromeWidth + panelChromeWidth
+				expectedSendWidth := float32(width) - 2*2 - 3*4 - expectedConnectionWidth - expectedReceiveOptionsWidth - 184
 				groups := []struct {
 					panel         string
 					expectedWidth float32
 					controls      []string
 				}{
 					{s.tr("连接控制", "Connection panel"), expectedConnectionWidth, []string{
-						s.tr("端口号", "Port"), s.tr("波特率", "Baud"), s.tr("波特率", "Baud rate"), s.tr("打开", "Open"), s.tr("串口配置", "Port configuration"),
+						s.tr("端口号", "Port"), s.tr("波特率", "Baud rate"), s.tr("打开", "Open"), s.tr("设置", "Settings"),
 					}},
-					{s.tr("接收显示控制", "Receive display controls"), 156, []string{
-						s.tr("HEX 显示", "HEX display"), s.tr("时间戳", "Timestamp"), s.tr("自动换行", "CRLF"),
+					{s.tr("接收显示控制", "Receive display controls"), expectedReceiveOptionsWidth, []string{
+						s.tr("HEX 显示", "HEX display"), s.tr("时间戳", "Timestamp"), s.tr("显示发送", "Show sent"),
 						s.tr("自动滚动", "Auto scroll"), s.tr("清除接收窗口", "Clear receive log"), s.tr("选项", "Options"),
 					}},
 					{s.tr("文件操作", "File operations"), 184, []string{
@@ -240,14 +271,14 @@ func TestCompactControlsStayInsidePanels(t *testing.T) {
 						s.tr("文件分段延时 (ms)", "File chunk delay (ms)"), s.tr("停止", "Stop"),
 					}},
 					{s.tr("发送面板", "Send panel"), expectedSendWidth, []string{
-						s.tr("HEX 发送", "HEX send"), s.tr("定时发送", "Repeat"), s.tr("定时发送间隔 (ms)", "Repeat interval (ms)"),
+						s.tr("HEX 发送", "HEX send"), "CRLF", s.tr("定时发送", "Repeat"), s.tr("定时发送间隔 (ms)", "Repeat interval (ms)"),
 						s.tr("发送区", "Send area"), s.tr("多条发送面板", "Preset panel"), s.tr("发送", "Send"), s.tr("清空发送区", "Clear send area"),
 					}},
 				}
 				var previousRight, firstY, firstHeight float32
 				for i, group := range groups {
 					panel, found := tt.Find(group.panel)
-					if !found || panel.X < previousRight || panel.X+panel.W > float32(width)+1 || panel.H > 96 ||
+					if !found || panel.X < previousRight || panel.X+panel.W > float32(width)+1 || panel.H > float32(minSendWorkspaceHeight)+1 ||
 						(group.expectedWidth > 0 && (panel.W < group.expectedWidth-0.01 || panel.W > group.expectedWidth+0.01)) {
 						t.Fatalf("panel %q is missing, clipped, overlapping, or unexpectedly sized: bounds=%+v expectedWidth=%.1f", group.panel, panel, group.expectedWidth)
 					}
@@ -272,44 +303,38 @@ func TestCompactControlsStayInsidePanels(t *testing.T) {
 				if !found || baudText.W+0.01 < baudTextWidth {
 					t.Errorf("seven-digit baud rate is clipped: bounds=%+v requiredWidth=%v", baudText, baudTextWidth)
 				}
-				baudLabel, baudLabelFound := tt.Find(s.tr("波特率", "Baud"))
 				baudPicker, baudPickerFound := tt.AccessByRole(gui.RolePopUpButton, s.tr("波特率", "Baud rate"))
 				portPicker, portPickerFound := tt.AccessByRole(gui.RolePopUpButton, s.tr("端口号", "Port"))
-				if !baudLabelFound || !baudPickerFound || !portPickerFound {
-					t.Fatal("baud label, baud selector, or port selector is missing")
-				}
-				labelCenter := baudLabel.Y + baudLabel.H/2
-				pickerCenter := baudPicker.Bounds.Y + baudPicker.Bounds.H/2
-				if labelCenter < pickerCenter-1 || labelCenter > pickerCenter+1 ||
-					baudLabel.X+baudLabel.W > baudPicker.Bounds.X || baudPicker.Bounds.W < baudTextWidth ||
-					baudPicker.Bounds.X+baudPicker.Bounds.W > connectionPanel.X+connectionPanel.W {
-					t.Errorf("baud label and selector do not fit together: label=%+v picker=%+v required=%v panel=%+v", baudLabel, baudPicker.Bounds, baudTextWidth, connectionPanel)
+				if !baudPickerFound || !portPickerFound {
+					t.Fatal("baud selector or port selector is missing")
 				}
 				valueCenter := baudText.X + baudText.W/2
-				selectorCenter := baudPicker.Bounds.X + (baudPicker.Bounds.W-baudPickerArrowSize-baudPickerGap)/2
+				textAreaLeft := baudPicker.Bounds.X + baudPickerBorderWidth + serialSelectorPaddingX
+				textAreaRight := baudPicker.Bounds.X + baudPicker.Bounds.W - baudPickerBorderWidth - 2*serialSelectorPaddingX - baudPickerArrowSize - microGap
+				selectorCenter := (textAreaLeft + textAreaRight) / 2
 				if valueCenter < selectorCenter-0.5 || valueCenter > selectorCenter+0.5 {
 					t.Errorf("selected baud value is not centered: text=%+v picker=%+v", baudText, baudPicker.Bounds)
 				}
 				if baudPicker.Bounds.W < expectedPickerWidth-0.01 || baudPicker.Bounds.W > expectedPickerWidth+0.01 {
 					t.Errorf("baud selector is not fitted to the seven-digit value: bounds=%+v expectedWidth=%.1f", baudPicker.Bounds, expectedPickerWidth)
 				}
-				configButton, configFound := tt.AccessByRole(gui.RoleButton, s.tr("串口配置", "Port configuration"))
+				settingsButton, settingsFound := tt.AccessByRole(gui.RoleButton, s.tr("串口设置", "Port settings"))
 				indicator, indicatorFound := tt.Find(s.tr("串口已关闭", "Serial port closed"))
 				open, openFound := tt.AccessByRole(gui.RoleButton, s.tr("打开", "Open"))
-				if !configFound || !indicatorFound || !openFound {
-					t.Fatal("connection action row is missing Config, status light, or Open")
+				if !settingsFound || !indicatorFound || !openFound {
+					t.Fatal("connection action row is missing Settings, status light, or Open")
 				}
 				portRight := portPicker.Bounds.X + portPicker.Bounds.W
-				configRight := configButton.Bounds.X + configButton.Bounds.W
-				if portRight < configRight-0.01 || portRight > configRight+0.01 {
-					t.Errorf("port selector right edge must align with Config: port=%+v config=%+v", portPicker.Bounds, configButton.Bounds)
+				settingsRight := settingsButton.Bounds.X + settingsButton.Bounds.W
+				if portRight < settingsRight-0.01 || portRight > settingsRight+0.01 {
+					t.Errorf("port selector right edge must align with Settings: port=%+v settings=%+v", portPicker.Bounds, settingsButton.Bounds)
 				}
 				baudCenter := baudPicker.Bounds.Y + baudPicker.Bounds.H/2
-				configCenter := configButton.Bounds.Y + configButton.Bounds.H/2
-				if configButton.Bounds.Y != baudPicker.Bounds.Y || configCenter < baudCenter-1 || configCenter > baudCenter+1 ||
-					configButton.Bounds.X < baudPicker.Bounds.X+baudPicker.Bounds.W-0.01 ||
-					configButton.Bounds.X+configButton.Bounds.W > connectionPanel.X+connectionPanel.W {
-					t.Errorf("Config must fit after the baud selector on the same row: baud=%+v config=%+v panel=%+v", baudPicker.Bounds, configButton.Bounds, connectionPanel)
+				settingsCenter := settingsButton.Bounds.Y + settingsButton.Bounds.H/2
+				if settingsButton.Bounds.Y != baudPicker.Bounds.Y || settingsCenter < baudCenter-1 || settingsCenter > baudCenter+1 ||
+					settingsButton.Bounds.X < baudPicker.Bounds.X+baudPicker.Bounds.W-0.01 ||
+					settingsButton.Bounds.X+settingsButton.Bounds.W > connectionPanel.X+connectionPanel.W {
+					t.Errorf("Settings must fit after the baud selector on the same row: baud=%+v settings=%+v panel=%+v", baudPicker.Bounds, settingsButton.Bounds, connectionPanel)
 				}
 				indicatorCenter := indicator.Y + indicator.H/2
 				openCenter := open.Bounds.Y + open.Bounds.H/2
@@ -331,6 +356,26 @@ func TestCompactControlsStayInsidePanels(t *testing.T) {
 				if columnOffset < -1 || columnOffset > 1 {
 					t.Errorf("receive checkboxes do not share the second column: timestamp=%+v auto-scroll=%+v", timestamp, autoScroll)
 				}
+				receivePanel, receivePanelFound := tt.Find(s.tr("接收显示控制", "Receive display controls"))
+				autoScrollCheckbox, autoScrollCheckboxFound := tt.AccessByRole(gui.RoleCheckBox, s.tr("自动滚动", "Auto scroll"))
+				if !receivePanelFound || !autoScrollCheckboxFound {
+					t.Fatal("receive panel or auto-scroll checkbox is missing")
+				}
+				autoScrollRightInset := receivePanel.X + receivePanel.W - autoScrollCheckbox.Bounds.X - autoScrollCheckbox.Bounds.W
+				expectedRightInset := panelInsetX
+				if autoScrollRightInset < expectedRightInset-0.01 || autoScrollRightInset > expectedRightInset+0.01 {
+					t.Errorf("receive panel right padding must align with Auto scroll: panel=%+v auto-scroll=%+v rightInset=%v", receivePanel, autoScrollCheckbox.Bounds, autoScrollRightInset)
+				}
+				receiveClear, receiveClearFound := tt.AccessByRole(gui.RoleButton, s.tr("清除接收窗口", "Clear receive log"))
+				receiveOptionsButton, receiveOptionsFound := tt.AccessByRole(gui.RoleButton, s.tr("选项", "Options"))
+				if !receiveClearFound || !receiveOptionsFound {
+					t.Fatal("receive action buttons are missing")
+				}
+				expectedActionButtonWidth := (expectedReceiveOptionsWidth - panelChromeWidth - controlGap) / 2
+				if receiveClear.Bounds.W < expectedActionButtonWidth-0.01 || receiveClear.Bounds.W > expectedActionButtonWidth+0.01 ||
+					receiveOptionsButton.Bounds.W < expectedActionButtonWidth-0.01 || receiveOptionsButton.Bounds.W > expectedActionButtonWidth+0.01 {
+					t.Errorf("receive action buttons do not fit the compact panel: clear=%+v options=%+v expectedWidth=%v", receiveClear.Bounds, receiveOptionsButton.Bounds, expectedActionButtonWidth)
+				}
 				for _, pair := range [][2]string{
 					{s.tr("波特率", "Baud rate"), s.tr("打开", "Open")},
 					{s.tr("自动滚动", "Auto scroll"), s.tr("清除接收窗口", "Clear receive log")},
@@ -349,26 +394,24 @@ func TestCompactControlsStayInsidePanels(t *testing.T) {
 				if input.H < 40 || input.H > 60 || send.X < input.X+input.W || clear.X < input.X+input.W || clear.Y < send.Y+send.H || clear.Y+clear.H > input.Y+input.H {
 					t.Errorf("three-row input or action column is clipped: input=%+v send=%+v clear=%+v", input, send, clear)
 				}
-				interval, _ := tt.Find(s.tr("定时发送间隔 (ms)", "Repeat interval (ms)"))
-				for _, label := range []string{s.tr("HEX 发送", "HEX send"), s.tr("定时发送", "Repeat"), s.tr("多条发送面板", "Preset panel")} {
-					control, _ := tt.Find(label)
-					distance := control.Y + control.H/2 - interval.Y - interval.H/2
-					if distance < -1 || distance > 1 || control.Y+control.H > input.Y {
-						t.Errorf("send header control %q wrapped or overlaps input: control=%+v interval=%+v input=%+v", label, control, interval, input)
-					}
+				interval, intervalFound := tt.Find(s.tr("定时发送间隔 (ms)", "Repeat interval (ms)"))
+				hex, hexFound := tt.Find(s.tr("HEX 发送", "HEX send"))
+				crlf, crlfFound := tt.Find("CRLF")
+				repeat, repeatFound := tt.Find(s.tr("定时发送", "Repeat"))
+				presets, presetsFound := tt.Find(s.tr("多条发送面板", "Preset panel"))
+				if !intervalFound || !hexFound || !crlfFound || !repeatFound || !presetsFound {
+					t.Fatal("send header controls are missing")
 				}
-				hex, hexFound := tt.AccessByRole(gui.RoleCheckBox, s.tr("HEX 发送", "HEX send"))
-				repeat, repeatFound := tt.AccessByRole(gui.RoleCheckBox, s.tr("定时发送", "Repeat"))
-				if !hexFound || !repeatFound {
-					t.Fatal("send format controls are missing")
+				hexCenterY := hex.Y + hex.H/2
+				crlfCenterY := crlf.Y + crlf.H/2
+				repeatCenterY := repeat.Y + repeat.H/2
+				presetsCenterY := presets.Y + presets.H/2
+				intervalCenterY := interval.Y + interval.H/2
+				if hexCenterY < crlfCenterY-1 || hexCenterY > crlfCenterY+1 || hexCenterY < repeatCenterY-1 || hexCenterY > repeatCenterY+1 || hexCenterY < presetsCenterY-1 || hexCenterY > presetsCenterY+1 || hexCenterY < intervalCenterY-1 || hexCenterY > intervalCenterY+1 {
+					t.Errorf("HEX, CRLF, Repeat, interval, and Presets do not share one header row: HEX=%+v CRLF=%+v Repeat=%+v interval=%+v Presets=%+v", hex, crlf, repeat, interval, presets)
 				}
-				groupGap := repeat.Bounds.X - hex.Bounds.X - hex.Bounds.W
-				if groupGap < 1 || groupGap > 11 {
-					t.Errorf("send group gap exceeds its elastic range: gap=%v", groupGap)
-				}
-				presets, _ := tt.Find(s.tr("多条发送面板", "Preset panel"))
-				if groupGap < 9 && presets.X-interval.X-interval.W > 24 {
-					t.Errorf("send gap shrank despite available space before Presets: gap=%v interval=%+v presets=%+v", groupGap, interval, presets)
+				if crlf.X <= hex.X || repeat.X <= crlf.X || presets.X <= repeat.X || interval.X <= repeat.X+repeat.W || interval.X+interval.W > presets.X || interval.Y+interval.H > input.Y+1 {
+					t.Errorf("send header controls are out of order or overlap the editor: HEX=%+v CRLF=%+v Repeat=%+v interval=%+v Presets=%+v input=%+v", hex, crlf, repeat, interval, presets, input)
 				}
 				rightOffset := presets.X + presets.W - clear.X - clear.W
 				if rightOffset < -1 || rightOffset > 1 {
@@ -436,24 +479,106 @@ func TestReceiveControlsUseTwoRowsAndActionsShareLine(t *testing.T) {
 
 	hex, hexFound := tt.Find("HEX display")
 	timestamp, timestampFound := tt.Find("Timestamp")
-	crlf, crlfFound := tt.Find("CRLF")
+	showSent, showSentFound := tt.Find("Show sent")
 	autoScroll, autoScrollFound := tt.Find("Auto scroll")
 	clear, clearFound := tt.Find("Clear receive log")
 	options, optionsFound := tt.Find("Options")
-	if !hexFound || !timestampFound || !crlfFound || !autoScrollFound || !clearFound || !optionsFound {
-		t.Fatalf("receive controls are missing: HEX=%+v timestamp=%+v CRLF=%+v auto-scroll=%+v clear=%+v options=%+v", hex, timestamp, crlf, autoScroll, clear, options)
+	if !hexFound || !timestampFound || !showSentFound || !autoScrollFound || !clearFound || !optionsFound {
+		t.Fatalf("receive controls are missing: HEX=%+v timestamp=%+v Show-sent=%+v auto-scroll=%+v clear=%+v options=%+v", hex, timestamp, showSent, autoScroll, clear, options)
 	}
 	hexCenterY := hex.Y + hex.H/2
 	timestampCenterY := timestamp.Y + timestamp.H/2
-	crlfCenterY := crlf.Y + crlf.H/2
+	showSentCenterY := showSent.Y + showSent.H/2
 	autoScrollCenterY := autoScroll.Y + autoScroll.H/2
 	clearCenterY := clear.Y + clear.H/2
 	optionsCenterY := options.Y + options.H/2
-	if hexCenterY < timestampCenterY-1 || hexCenterY > timestampCenterY+1 || crlfCenterY < autoScrollCenterY-1 || crlfCenterY > autoScrollCenterY+1 || crlfCenterY <= hexCenterY+1 {
-		t.Errorf("four checkboxes are not arranged as two rows: HEX=%+v timestamp=%+v CRLF=%+v auto-scroll=%+v", hex, timestamp, crlf, autoScroll)
+	if hexCenterY < timestampCenterY-1 || hexCenterY > timestampCenterY+1 || showSentCenterY < autoScrollCenterY-1 || showSentCenterY > autoScrollCenterY+1 || showSentCenterY <= hexCenterY+1 {
+		t.Errorf("receive checkboxes are not arranged as two rows: HEX=%+v timestamp=%+v Show-sent=%+v auto-scroll=%+v", hex, timestamp, showSent, autoScroll)
 	}
-	if clearCenterY < optionsCenterY-1 || clearCenterY > optionsCenterY+1 || clearCenterY <= crlfCenterY+1 || clear.X >= options.X {
-		t.Errorf("clear and options buttons do not share the row below the checkboxes: clear=%+v options=%+v CRLF=%+v", clear, options, crlf)
+	if clearCenterY < optionsCenterY-1 || clearCenterY > optionsCenterY+1 || clearCenterY <= showSentCenterY+1 || clear.X >= options.X {
+		t.Errorf("clear and options buttons do not share the row below the checkboxes: clear=%+v options=%+v Show-sent=%+v", clear, options, showSent)
+	}
+	if err := tt.Click("Show sent"); err != nil {
+		t.Fatal(err)
+	}
+	if !app.Settings.ShowSent {
+		t.Fatal("Show sent did not enable outgoing records")
+	}
+}
+
+func TestSendControlsShareOneHeaderRow(t *testing.T) {
+	for _, language := range []string{"en", "zh-CN"} {
+		t.Run(language, func(t *testing.T) {
+			app := &internal.App{Settings: config.Settings{Language: language}}
+			s := newController(app)
+			s.configureLog()
+			tt := gui.NewTester(s.view, minWindowWidth, 600)
+
+			hex, hexFound := tt.Find(s.tr("HEX 发送", "HEX send"))
+			crlf, crlfFound := tt.Find("CRLF")
+			repeat, repeatFound := tt.Find(s.tr("定时", "Repeat"))
+			presets, presetsFound := tt.Find(s.tr("多条发送面板", "Preset panel"))
+			presetButton, presetButtonFound := tt.AccessByRole(gui.RoleButton, s.tr("多条发送面板", "Preset panel"))
+			if !hexFound || !crlfFound || !repeatFound || !presetsFound || !presetButtonFound {
+				t.Fatalf("send controls are missing: HEX=%+v CRLF=%+v Repeat=%+v Presets=%+v Toggle=%+v", hex, crlf, repeat, presets, presetButton)
+			}
+			if presetButton.Bounds.W != presetToggleWidth {
+				t.Errorf("collapsed preset toggle width=%v, want %v", presetButton.Bounds.W, presetToggleWidth)
+			}
+			if _, found := tt.Find("+"); !found {
+				t.Error("collapsed preset toggle does not show +")
+			}
+			expandTooltip := s.tr("展开多条发送", "Expand preset panel")
+			tt.Move(presetButton.Bounds.X+presetButton.Bounds.W/2, presetButton.Bounds.Y+presetButton.Bounds.H/2)
+			tt.Advance(time.Second)
+			if !tt.HasText(expandTooltip) {
+				t.Fatalf("hovering collapsed preset toggle did not show tooltip %q: %q", expandTooltip, tt.Texts())
+			}
+			expandedApp := &internal.App{Settings: config.Settings{Language: language, ShowPresets: true}}
+			expandedController := newController(expandedApp)
+			expandedController.configureLog()
+			expandedTester := gui.NewTester(expandedController.view, minWindowWidth, 600)
+			expandedToggle, expandedToggleFound := expandedTester.AccessByRole(gui.RoleButton, expandedController.tr("多条发送面板", "Preset panel"))
+			if _, found := expandedTester.Find("-"); !found || !expandedToggleFound {
+				t.Fatal("expanded preset toggle or its button is missing")
+			}
+			if expandedToggle.Bounds.W != presetToggleWidth {
+				t.Errorf("expanded preset toggle width=%v, want %v", expandedToggle.Bounds.W, presetToggleWidth)
+			}
+			collapseTooltip := expandedController.tr("收起多条发送", "Collapse preset panel")
+			expandedTester.Move(expandedToggle.Bounds.X+expandedToggle.Bounds.W/2, expandedToggle.Bounds.Y+expandedToggle.Bounds.H/2)
+			expandedTester.Advance(time.Second)
+			if !expandedTester.HasText(collapseTooltip) {
+				t.Fatalf("hovering expanded preset toggle did not show tooltip %q: %q", collapseTooltip, expandedTester.Texts())
+			}
+			hexControl, hexControlFound := tt.AccessByRole(gui.RoleCheckBox, s.tr("HEX 发送", "HEX send"))
+			crlfControl, crlfControlFound := tt.AccessByRole(gui.RoleCheckBox, "CRLF")
+			repeatControl, repeatControlFound := tt.AccessByRole(gui.RoleCheckBox, s.tr("定时发送", "Repeat"))
+			if !hexControlFound || !crlfControlFound || !repeatControlFound {
+				t.Fatal("HEX, CRLF, and Repeat checkboxes are missing")
+			}
+			hexCRLFGap := crlfControl.Bounds.X - hexControl.Bounds.X - hexControl.Bounds.W
+			if hexCRLFGap != controlGap {
+				t.Errorf("HEX/CRLF gap=%v, want %v", hexCRLFGap, controlGap)
+			}
+			crlfRepeatGap := repeatControl.Bounds.X - crlfControl.Bounds.X - crlfControl.Bounds.W
+			if crlfRepeatGap != controlGap {
+				t.Errorf("CRLF/Repeat gap=%v, want %v", crlfRepeatGap, controlGap)
+			}
+			hexCenterY := hex.Y + hex.H/2
+			crlfCenterY := crlf.Y + crlf.H/2
+			repeatCenterY := repeat.Y + repeat.H/2
+			presetsCenterY := presets.Y + presets.H/2
+			if hexCenterY < crlfCenterY-1 || hexCenterY > crlfCenterY+1 || hexCenterY < repeatCenterY-1 || hexCenterY > repeatCenterY+1 || hexCenterY < presetsCenterY-1 || hexCenterY > presetsCenterY+1 || crlf.X <= hex.X || repeat.X <= crlf.X {
+				t.Errorf("send controls do not share one row in HEX/CRLF/Repeat/Presets order: HEX=%+v CRLF=%+v Repeat=%+v Presets=%+v", hex, crlf, repeat, presets)
+			}
+			if err := tt.Click("CRLF"); err != nil {
+				t.Fatal(err)
+			}
+			if !app.Settings.CRLF {
+				t.Fatal("CRLF did not enable after clicking its send control")
+			}
+		})
 	}
 }
 

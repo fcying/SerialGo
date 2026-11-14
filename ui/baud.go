@@ -6,14 +6,6 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-const (
-	baudPickerArrowSize   float32 = 6
-	baudPickerGap         float32 = 1
-	baudPickerPaddingX    float32 = 2
-	baudPickerBorderWidth float32 = 1
-	baudPickerChromeWidth         = 2 * (baudPickerArrowSize + baudPickerGap + baudPickerPaddingX + baudPickerBorderWidth)
-)
-
 type baudPickerState struct {
 	value, choice, language string
 	rates                   []string
@@ -29,6 +21,19 @@ func (s *controller) mainBaudPickerWidth(c *ui.Context) float32 {
 	if state.value != value {
 		state.value, state.choice = value, value
 	}
+	return s.baudPickerWidth(c, state)
+}
+
+func (s *controller) portBaudPickerWidth(c *ui.Context) float32 {
+	state := &s.baudPickers[1]
+	value := s.portDraft.Baud
+	if state.value != value {
+		state.value, state.choice = value, value
+	}
+	return s.baudPickerWidth(c, state)
+}
+
+func (s *controller) baudPickerWidth(c *ui.Context, state *baudPickerState) float32 {
 	if state.triggerWidth == 0 || state.triggerWidthChoice != state.choice {
 		standardWidth, _ := c.MeasureText(0, ui.Span{Text: "1000000"})
 		selectedWidth, _ := c.MeasureText(0, ui.Span{Text: state.choice})
@@ -59,16 +64,14 @@ func (s *controller) baudPicker(c *ui.Context, forPort bool, height float32) ui.
 		state.rates = slices.Clone(rates)
 		state.language = s.settings.Language
 	}
-	if !forPort {
-		s.mainBaudPickerWidth(c)
-	}
+	triggerWidth := s.baudPickerWidth(c, state)
 	theme := c.Theme()
 	sel := ui.SelectBaseOpen(c, &state.choice, &state.open)
 	if s.app.Connected() || s.app.PortBusy {
 		sel.SetOpen(false)
 	}
-	trigger := sel.Trigger.Width(0).MinWidth(0).Grow(1).Height(height).
-		Padding(controlPadY, baudPickerPaddingX).Gap(baudPickerGap).Radius(theme.Radius).Border(baudPickerBorderWidth, theme.Border).
+	trigger := sel.Trigger.Width(triggerWidth).MinWidth(triggerWidth).Grow(0).Shrink(0).Height(height).
+		Padding(controlPadY, serialSelectorArrowPaddingX, controlPadY, 0).Gap(microGap).Radius(theme.Radius).Border(baudPickerBorderWidth, theme.Border).
 		Background(theme.Surface).TextColor(theme.Text).AlignItems(ui.Center).
 		Label(s.tr("波特率", "Baud rate")).Disabled(s.app.Connected() || s.app.PortBusy).OnChange(func() {
 		if state.choice == customLabel {
@@ -86,16 +89,13 @@ func (s *controller) baudPicker(c *ui.Context, forPort bool, height float32) ui.
 		}
 		state.value, state.choice = *value, *value
 	})
-	if !forPort {
-		trigger.Width(state.triggerWidth).MinWidth(state.triggerWidth).Grow(0).Shrink(0)
-	}
 	if trigger.Pressed() {
 		trigger.Background(theme.SurfacePressed)
 	} else if trigger.Hovered() {
 		trigger.Background(theme.SurfaceHover)
 	}
 	trigger.Children(func() {
-		ui.Text(c.Key("selected"), state.choice).Width(0).MinWidth(0).Grow(1).SingleLine().TextAlign(ui.Center)
+		ui.Text(c.Key("selected"), state.choice).Width(0).MinWidth(0).Grow(1).Padding(0, serialSelectorPaddingX).SingleLine().TextAlign(ui.Center)
 		ui.Box(c.Key("arrow")).Size(baudPickerArrowSize, baudPickerArrowSize).Shrink(0).Draw(func(p *ui.Painter, r ui.Rect) {
 			var path ui.Path
 			path.MoveTo(r.X+r.W*0.1, r.Y+r.H*0.3).LineTo(r.X+r.W*0.5, r.Y+r.H*0.7).LineTo(r.X+r.W*0.9, r.Y+r.H*0.3)
@@ -105,7 +105,7 @@ func (s *controller) baudPicker(c *ui.Context, forPort bool, height float32) ui.
 	sel.Popup(func(panel ui.Element) {
 		panel.Padding(3).Radius(theme.Radius).Background(theme.Background).Border(1, theme.Border).Children(func() {
 			ui.Scroll(c.Key("baud-options")).FillWidth().MaxHeight(240).Children(func() {
-				ui.Column(c.Key("choices")).FillWidth().Gap(2).Children(func() {
+				ui.Column(c.Key("choices")).FillWidth().Gap(compactGap).Children(func() {
 					for _, option := range state.options {
 						item := sel.Item(option).Padding(4, 6).Radius(theme.Radius)
 						if item.Highlighted() {
@@ -161,13 +161,13 @@ func (s *controller) applyCustomBaud() {
 
 func (s *controller) customBaudDialog(c *ui.Context) {
 	ui.Modal(c.Key("custom-baud-dialog"), &s.customBaudOpen, func() {
-		ui.Column(c.Key("custom-baud")).Width(310).Gap(10).Children(func() {
+		ui.Column(c.Key("custom-baud")).Width(310).Gap(sectionGap).Children(func() {
 			ui.Text(c.Key("title"), s.tr("自定义波特率", "Custom baud rate")).FontSize(16).FontWeight(600)
 			ui.TextInput(c.Key("value"), &s.customBaudText).FillWidth().Height(28).AutoFocus().Label(s.tr("波特率数值", "Baud rate value"))
 			if s.customBaudError.en != "" || s.customBaudError.zh != "" {
 				ui.Text(c.Key("error"), s.tr(s.customBaudError.zh, s.customBaudError.en)).FillWidth().TextColor(c.Theme().Danger)
 			}
-			ui.Row(c.Key("actions")).FillWidth().Gap(8).Justify(ui.End).Children(func() {
+			ui.Row(c.Key("actions")).FillWidth().Gap(wideGap).Justify(ui.End).Children(func() {
 				ui.Button(c.Key("ok"), s.tr("确定", "OK")).Width(76).Height(28).OnClick(s.applyCustomBaud)
 				ui.Button(c.Key("cancel"), s.tr("取消", "Cancel")).Width(76).Height(28).OnClick(func() { s.customBaudOpen = false })
 			})
@@ -209,13 +209,13 @@ func (s *controller) applyBaudDelete() {
 
 func (s *controller) baudDeleteDialog(c *ui.Context) {
 	ui.Modal(c.Key("baud-delete-dialog"), &s.baudDeleteOpen, func() {
-		ui.Column(c.Key("baud-delete")).Width(310).Gap(10).Children(func() {
+		ui.Column(c.Key("baud-delete")).Width(310).Gap(sectionGap).Children(func() {
 			ui.Text(c.Key("title"), s.tr("删除波特率", "Delete baud rate")).FontSize(16).FontWeight(600)
 			ui.Text(c.Key("question"), s.tr("确认删除波特率 ", "Delete baud rate ")+s.baudDeleteValue+"?").FillWidth()
 			if s.baudDeleteError.en != "" || s.baudDeleteError.zh != "" {
 				ui.Text(c.Key("error"), s.tr(s.baudDeleteError.zh, s.baudDeleteError.en)).FillWidth().TextColor(c.Theme().Danger)
 			}
-			ui.Row(c.Key("actions")).FillWidth().Gap(8).Justify(ui.End).Children(func() {
+			ui.Row(c.Key("actions")).FillWidth().Gap(wideGap).Justify(ui.End).Children(func() {
 				ui.Button(c.Key("delete"), s.tr("删除", "Delete")).Width(76).Height(28).OnClick(s.applyBaudDelete)
 				ui.Button(c.Key("cancel"), s.tr("取消", "Cancel")).Width(76).Height(28).AutoFocus().OnClick(func() { s.baudDeleteOpen = false })
 			})

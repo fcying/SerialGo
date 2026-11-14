@@ -23,7 +23,8 @@ type controller struct {
 	portSettingsError                                                 localizedText
 	baudPickers                                                       [2]baudPickerState
 	connectionContentWidth, connectionBaudWidth                       float32
-	connectionLanguage                                                string
+	receiveOptionsContentWidth                                        float32
+	connectionLanguage, receiveOptionsLanguage                        string
 	customBaudOpen, customBaudForPort                                 bool
 	customBaudText                                                    string
 	customBaudError                                                   localizedText
@@ -48,7 +49,7 @@ type controller struct {
 func newController(app *internal.App) *controller {
 	return &controller{
 		app: app, settings: &app.Settings, portDraft: app.Settings.Port,
-		presetSplit: 64, autoScroll: true,
+		presetSplit: presetReceiveShare, autoScroll: true,
 	}
 }
 
@@ -61,7 +62,7 @@ func Run(app *internal.App, title string) error {
 	mygo.App.SetMenu(nil)
 	mygo.App.WhenReady(func() {
 		s.window = mygo.NewWindow(mygo.WindowOptions{
-			Title: title, Width: 800, Height: 600, MinWidth: 800, MinHeight: 420,
+			Title: title, Width: minWindowWidth, Height: 600, MinWidth: minWindowWidth, MinHeight: 420,
 			Content: ui.View(s.view),
 		})
 		app.Startup(s)

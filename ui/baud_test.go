@@ -2,12 +2,12 @@ package ui
 
 import (
 	gui "github.com/egoist/mygo/ui"
-	"path/filepath"
-	"reflect"
-	"slices"
 	"github.com/fcying/SerialGo/communication/serialport"
 	"github.com/fcying/SerialGo/config"
 	"github.com/fcying/SerialGo/internal"
+	"path/filepath"
+	"reflect"
+	"slices"
 	"testing"
 )
 
@@ -160,7 +160,7 @@ func TestCustomBaudCancelAndEscapeThroughUI(t *testing.T) {
 					s.configureLog()
 					tt := gui.NewTester(s.view, 800, 600)
 					if forPort {
-						if err := tt.Click(s.tr("串口配置", "Port configuration")); err != nil {
+						if err := tt.Click(s.tr("串口设置", "Port settings")); err != nil {
 							t.Fatal(err)
 						}
 					}
@@ -198,7 +198,7 @@ func TestPropertyCustomBaudCommitsOnlyAtOuterConfirmation(t *testing.T) {
 			original := baudSettingsSnapshot(s)
 			s.configureLog()
 			tt := gui.NewTester(s.view, 800, 600)
-			if err := tt.Click(s.tr("串口配置", "Port configuration")); err != nil {
+			if err := tt.Click(s.tr("串口设置", "Port settings")); err != nil {
 				t.Fatal(err)
 			}
 			for _, value := range []string{"038400", "750000"} {
@@ -364,7 +364,7 @@ func TestNumericBaudOptionsRemainNormallySelectable(t *testing.T) {
 			s.configureLog()
 			tt := gui.NewTester(s.view, 800, 600)
 			if forPort {
-				if err := tt.Click(s.tr("串口配置", "Port configuration")); err != nil {
+				if err := tt.Click(s.tr("串口设置", "Port settings")); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -480,7 +480,7 @@ func TestBaudDeleteCancelAndEscapeDoNotSelectOrSave(t *testing.T) {
 					s.configureLog()
 					tt := gui.NewTester(s.view, 800, 600)
 					if forPort {
-						if err := tt.Click(s.tr("串口配置", "Port configuration")); err != nil {
+						if err := tt.Click(s.tr("串口设置", "Port settings")); err != nil {
 							t.Fatal(err)
 						}
 					}
@@ -508,7 +508,7 @@ func TestPropertyBaudDeletionCommitsOnlyAtOuterConfirmation(t *testing.T) {
 			original := baudSettingsSnapshot(s)
 			s.configureLog()
 			tt := gui.NewTester(s.view, 800, 600)
-			if err := tt.Click(s.tr("串口配置", "Port configuration")); err != nil {
+			if err := tt.Click(s.tr("串口设置", "Port settings")); err != nil {
 				t.Fatal(err)
 			}
 			openBaudDeleteThroughUI(t, tt, s, "115200", true)
@@ -542,7 +542,7 @@ func TestPropertyBaudDeletionCommitsOnlyAtOuterConfirmation(t *testing.T) {
 				if !reflect.DeepEqual(*s.settings, original) || s.app.SettingsDirty {
 					t.Fatal("outer cancellation committed the deletion")
 				}
-				if err := tt.Click(s.tr("串口配置", "Port configuration")); err != nil {
+				if err := tt.Click(s.tr("串口设置", "Port settings")); err != nil {
 					t.Fatal(err)
 				}
 				if s.portDraft != original.Port || !slices.Equal(s.portBaudRatesDraft, original.BaudRates) {
@@ -554,41 +554,118 @@ func TestPropertyBaudDeletionCommitsOnlyAtOuterConfirmation(t *testing.T) {
 	}
 }
 
+func TestBaudPickerWidthFitsDisplayedRate(t *testing.T) {
+	for _, value := range []string{"9600", "115200", "1000000"} {
+		for _, forPort := range []bool{false, true} {
+			selector := "main"
+			if forPort {
+				selector = "port settings"
+			}
+			t.Run(value+"/"+selector, func(t *testing.T) {
+				app := &internal.App{Settings: config.Settings{
+					Language: "en", Port: serialport.Settings{Baud: value}, BaudRates: []string{value},
+				}}
+				s := newController(app)
+				s.portDraft = app.Settings.Port
+				s.portBaudRatesDraft = slices.Clone(app.Settings.BaudRates)
+				var expectedWidth float32
+				tt := gui.NewTester(func(c *gui.Context) {
+					c.SetTheme(lightTheme)
+					gui.Row(c).Padding(10).Children(func() { s.baudPicker(c, forPort, controlHeight) })
+					standardWidth, _ := c.MeasureText(0, gui.Span{Text: "1000000"})
+					selectedWidth, _ := c.MeasureText(0, gui.Span{Text: value})
+					expectedWidth = max(standardWidth, selectedWidth) + baudPickerChromeWidth
+				}, 180, 60)
+				picker, found := tt.AccessByRole(gui.RolePopUpButton, "Baud rate")
+				if !found {
+					t.Fatal("baud selector is missing")
+				}
+				if picker.Bounds.W < expectedWidth-0.01 || picker.Bounds.W > expectedWidth+0.01 {
+					t.Errorf("%s baud selector width=%v, want %v", selector, picker.Bounds.W, expectedWidth)
+				}
+			})
+		}
+	}
+}
+
 func TestBaudDigitsCenteredInTextArea(t *testing.T) {
 	for _, value := range []string{"9600", "115200", "1000000"} {
-		t.Run(value, func(t *testing.T) {
-			s := newController(&internal.App{Settings: config.Settings{
-				Language: "en", Port: serialport.Settings{Baud: value}, BaudRates: []string{value},
-			}})
-			tt := gui.NewTester(func(c *gui.Context) {
-				c.SetTheme(lightTheme)
-				gui.Row(c).Padding(10).Children(func() { s.baudPicker(c, false, controlHeight) })
-			}, 180, 60)
-			tt.SetScale(2)
-			picker, found := tt.AccessByRole(gui.RolePopUpButton, "Baud rate")
-			if !found {
-				t.Fatal("baud selector is missing")
+		for _, forPort := range []bool{false, true} {
+			selector := "main"
+			if forPort {
+				selector = "port settings"
 			}
-			left := picker.Bounds.X + baudPickerBorderWidth + baudPickerPaddingX
-			right := picker.Bounds.X + picker.Bounds.W - baudPickerBorderWidth - baudPickerPaddingX - baudPickerArrowSize - baudPickerGap
-			img := tt.Image()
-			minX, maxX := img.Bounds().Max.X, -1
-			for y := int((picker.Bounds.Y + 4) * 2); y < int((picker.Bounds.Y + picker.Bounds.H - 4) * 2); y++ {
-				for x := int(left * 2); x < int(right * 2); x++ {
-					pixel := img.RGBAAt(x, y)
-					if pixel.R < 100 && pixel.G < 100 && pixel.B < 100 {
-						minX, maxX = min(minX, x), max(maxX, x)
+			t.Run(value+"/"+selector, func(t *testing.T) {
+				app := &internal.App{Settings: config.Settings{
+					Language: "en", Port: serialport.Settings{Baud: value}, BaudRates: []string{value},
+				}}
+				s := newController(app)
+				s.portDraft = app.Settings.Port
+				s.portBaudRatesDraft = slices.Clone(app.Settings.BaudRates)
+				tt := gui.NewTester(func(c *gui.Context) {
+					c.SetTheme(lightTheme)
+					gui.Column(c).Padding(10).Gap(controlGap).Children(func() {
+						gui.Text(c, "render probe")
+						gui.Row(c).Children(func() { s.baudPicker(c, forPort, controlHeight) })
+					})
+				}, 180, 100)
+				tt.SetScale(2)
+				picker, found := tt.AccessByRole(gui.RolePopUpButton, "Baud rate")
+				if !found {
+					t.Fatal("baud selector is missing")
+				}
+				probe, probeFound := tt.Find("render probe")
+				if !probeFound {
+					t.Fatal("text render probe is missing")
+				}
+				skipIfTextPixelsUnavailable(t, tt, probe)
+				left := picker.Bounds.X + baudPickerBorderWidth + serialSelectorPaddingX
+				right := picker.Bounds.X + picker.Bounds.W - baudPickerBorderWidth - serialSelectorPaddingX - serialSelectorArrowPaddingX - baudPickerArrowSize - microGap
+				img := tt.Image()
+				minX, maxX := img.Bounds().Max.X, -1
+				yStart := int((picker.Bounds.Y + 4) * 2)
+				yEnd := int((picker.Bounds.Y + picker.Bounds.H - 4) * 2)
+				xStart := int(left * 2)
+				xEnd := int(right * 2)
+				for yOffset := range yEnd - yStart {
+					y := yStart + yOffset
+					for xOffset := range xEnd - xStart {
+						x := xStart + xOffset
+						pixel := img.RGBAAt(x, y)
+						if pixel.R < 100 && pixel.G < 100 && pixel.B < 100 {
+							minX, maxX = min(minX, x), max(maxX, x)
+						}
 					}
 				}
-			}
-			if maxX < minX {
-				t.Fatal("rendered baud digits are missing")
-			}
-			inkCenter := float32(minX+maxX+1) / 4
-			textAreaCenter := (left + right) / 2
-			if inkCenter < textAreaCenter-1 || inkCenter > textAreaCenter+1 {
-				t.Errorf("rendered digits are not centered in the text area: inkCenter=%.2f textAreaCenter=%.2f", inkCenter, textAreaCenter)
-			}
-		})
+				if maxX < minX {
+					t.Fatal("rendered baud digits are missing")
+				}
+				inkCenter := float32(minX+maxX+1) / 4
+				textAreaCenter := (left + right) / 2
+				if inkCenter < textAreaCenter-1 || inkCenter > textAreaCenter+1 {
+					t.Errorf("rendered digits are not centered in the text area: inkCenter=%.2f textAreaCenter=%.2f", inkCenter, textAreaCenter)
+				}
+			})
+		}
 	}
+}
+
+func skipIfTextPixelsUnavailable(t *testing.T, tt *gui.Tester, probe gui.Rect) {
+	t.Helper()
+	img := tt.Image()
+	xStart := int(probe.X * 2)
+	xEnd := int((probe.X + probe.W) * 2)
+	yStart := int(probe.Y * 2)
+	yEnd := int((probe.Y + probe.H) * 2)
+	for yOffset := range yEnd - yStart {
+		y := yStart + yOffset
+		for xOffset := range xEnd - xStart {
+			x := xStart + xOffset
+			pixel := img.RGBAAt(x, y)
+			if pixel.R < 100 && pixel.G < 100 && pixel.B < 100 {
+				return
+			}
+		}
+	}
+	t.Skip("text rendering is unavailable in the test environment")
 }
