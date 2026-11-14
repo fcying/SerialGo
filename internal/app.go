@@ -60,6 +60,7 @@ type App struct {
 	saver             *settingsSaver
 	settingsSaveError bool
 	cancelSend        context.CancelFunc
+	sendingFilePath   string
 	loadErrorReported bool
 	settingsWarning   Text
 }
@@ -181,7 +182,9 @@ func (s *App) SendValue() *string {
 	return &s.Settings.SendText
 }
 
-func (s *App) CanSendFile() bool { return s.CanSend() && s.FilePath != "" }
+func (s *App) CanSendFile() bool {
+	return s.CanSend() && !s.FileBusy && s.sendingFilePath == "" && s.FilePath != ""
+}
 
 func (s *App) SetPorts(ports []serialport.Info) {
 	previous := s.Settings.Port.Name
@@ -290,13 +293,16 @@ func (s *App) drain(p *Session) {
 
 func (s *App) CanSend() bool { return s.session != nil && s.cancelSend == nil }
 
-func (s *App) startSending(label Text, send func(context.Context, *Session) error) {
-	if !s.CanSend() {
+func (s *App) startSending(label Text, filePath string, send func(context.Context, *Session) error) {
+	if !s.CanSend() || (filePath != "" && (s.FileBusy || s.sendingFilePath != "")) {
 		return
 	}
 	p := s.session
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancelSend = cancel
+	if filePath != "" {
+		s.sendingFilePath = filePath
+	}
 	s.Note(label.ZH+"中", label.EN+" in progress")
 	s.SaveUsedSettings()
 	s.jobs.Add(1)
@@ -305,6 +311,9 @@ func (s *App) startSending(label Text, send func(context.Context, *Session) erro
 		err := send(ctx, p)
 		cancel()
 		s.dispatch(func() {
+			if filePath != "" && s.sendingFilePath == filePath {
+				s.sendingFilePath = ""
+			}
 			if s.session != p {
 				return
 			}
@@ -353,7 +362,7 @@ func (s *App) SendText(input string) {
 			return
 		}
 	}
-	s.startSending(Text{ZH: "发送", EN: "Send"}, func(ctx context.Context, port *Session) error {
+	s.startSending(Text{ZH: "发送", EN: "Send"}, "", func(ctx context.Context, port *Session) error {
 		for {
 			err := port.Send(ctx, data)
 			if err != nil || delay == 0 {
@@ -400,7 +409,7 @@ func (s *App) SendPresets(index int) {
 		s.Note("请先勾选要发送的条目", "Select the presets to send first")
 		return
 	}
-	s.startSending(Text{ZH: "多条发送", EN: "Preset send"}, func(ctx context.Context, port *Session) error {
+	s.startSending(Text{ZH: "多条发送", EN: "Preset send"}, "", func(ctx context.Context, port *Session) error {
 		for {
 			for i, item := range items {
 				err := port.Send(ctx, item.data)
@@ -428,7 +437,10 @@ func (s *App) SendFile() {
 		s.Fail("发送文件失败", "File send failed", err)
 		return
 	}
-	s.startSending(Text{ZH: "发送文件", EN: "File send"}, func(ctx context.Context, p *Session) error {
+	if !s.CanSendFile() {
+		return
+	}
+	s.startSending(Text{ZH: "发送文件", EN: "File send"}, path, func(ctx context.Context, p *Session) error {
 		return p.SendFile(ctx, path, delay)
 	})
 }
@@ -559,14 +571,16 @@ func (s *App) SaveLog(path, text string) {
 		return
 	}
 	capturePath := s.CapturePath
+	sendPath := s.sendingFilePath
 	snapshot := s.usedSettingsSnapshot()
 	s.FileBusy = true
 	s.jobs.Add(1)
 	go func() {
 		defer s.jobs.Done()
 		sameCapture := capturePath != "" && sameFilePath(path, capturePath)
+		sameSendSource := sendPath != "" && sameFilePath(path, sendPath)
 		var err error
-		if !sameCapture {
+		if !sameCapture && !sameSendSource {
 			var file *os.File
 			file, err = os.Create(path)
 			if err == nil {
@@ -576,6 +590,10 @@ func (s *App) SaveLog(path, text string) {
 		}
 		s.dispatch(func() {
 			s.FileBusy = false
+			if sameSendSource {
+				s.Note("请勿覆盖正在发送的文件", "Do not overwrite the file currently being sent")
+				return
+			}
 			if sameCapture {
 				s.Note("请勿覆盖正在接收的文件", "Do not overwrite the active receive file")
 				return
@@ -611,6 +629,7 @@ func (s *App) startCapture(path string, connection *Session) {
 		return
 	}
 	snapshot := s.usedSettingsSnapshot()
+	sendPath := s.sendingFilePath
 	s.FileBusy = true
 	// Reserve the path while its file is being opened, so display saving
 	// cannot truncate the capture before the completion callback runs.
@@ -618,16 +637,26 @@ func (s *App) startCapture(path string, connection *Session) {
 	s.jobs.Add(1)
 	go func() {
 		defer s.jobs.Done()
-		file, err := os.Create(path)
-		if err == nil {
-			err = connection.SetCapture(file)
-			if err != nil {
-				err = errors.Join(err, file.Close())
+		sameSendSource := sendPath != "" && sameFilePath(path, sendPath)
+		var file *os.File
+		var err error
+		if !sameSendSource {
+			file, err = os.Create(path)
+			if err == nil {
+				err = connection.SetCapture(file)
+				if err != nil {
+					err = errors.Join(err, file.Close())
+				}
 			}
 		}
 		s.dispatch(func() {
 			s.FileBusy = false
 			if s.session != connection {
+				return
+			}
+			if sameSendSource {
+				s.CapturePath = ""
+				s.Note("请勿覆盖正在发送的文件", "Do not overwrite the file currently being sent")
 				return
 			}
 			if err != nil {

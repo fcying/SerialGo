@@ -272,7 +272,7 @@ func (s *controller) sendPanel(c *ui.Context) {
 			ui.Checkbox(c.Key("tx-hex"), &p.SendHex, "HEX").Shrink(0).Label(s.tr("HEX 发送", "HEX send")).OnChange(s.app.SettingsChanged)
 			ui.Checkbox(c.Key("crlf"), &p.CRLF, "CRLF").Shrink(0).
 				Label("CRLF").Tooltip(s.tr("发送内容末尾追加回车换行", "Append CRLF to sent text")).OnChange(s.app.SettingsChanged)
-			ui.Row(c.Key("repeat-options")).Grow(1).Shrink(0).Gap(controlGap).AlignItems(ui.Center).Children(func() {
+			ui.Row(c.Key("repeat-options")).Grow(1).Shrink(1).MinWidth(0).Gap(controlGap).AlignItems(ui.Center).Children(func() {
 				ui.Checkbox(c.Key("repeat"), &s.app.Repeat, s.tr("定时", "Repeat")).Label(s.tr("定时发送", "Repeat"))
 				ui.TextInput(c.Key("interval"), &p.Interval).Width(intervalWidth).Height(controlHeight).Padding(controlPadY, 4).TextAlign(ui.Center).
 					Label(s.tr("定时发送间隔 (ms)", "Repeat interval (ms)")).Disabled(!s.app.Repeat).OnChange(s.app.SettingsChanged)
