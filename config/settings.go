@@ -17,8 +17,10 @@ import (
 )
 
 const (
-	PresetCount        = 99
-	defaultPresetCount = 5
+	PresetCount         = 99
+	defaultPresetCount  = 5
+	defaultWindowWidth  = 800
+	defaultWindowHeight = 600
 )
 
 var defaultSettings, defaultSettingsErr = parseDefaultSettings(assets.DefaultConfig)
@@ -26,6 +28,15 @@ var defaultSettings, defaultSettingsErr = parseDefaultSettings(assets.DefaultCon
 type Preset struct {
 	Label, Data, Interval string
 	Hex, CRLF, Enabled    bool
+}
+
+type WindowSettings struct {
+	X, Y                    int
+	Width, Height           int
+	PixelX, PixelY          int
+	PixelWidth, PixelHeight int
+	Maximized               bool
+	PositionSet             bool
 }
 
 // DisplayBufferPreset uses decimal K/M labels.
@@ -103,6 +114,7 @@ func validReceiveFontSettings(settings Settings) bool {
 
 type Settings struct {
 	Port                                serialport.Settings
+	Window                              WindowSettings
 	BaudRates                           []string
 	SendText, SendHexText               string
 	Language                            string
@@ -200,6 +212,12 @@ func decode(path string, s *Settings) error {
 	metadata, err := toml.DecodeFile(path, &stored)
 	if err != nil {
 		return err
+	}
+	if !metadata.IsDefined("Window", "PositionSet") {
+		s.Window.PositionSet = s.Window.X != 0 || s.Window.Y != 0 ||
+			s.Window.PixelX != 0 || s.Window.PixelY != 0 ||
+			s.Window.PixelWidth != 0 || s.Window.PixelHeight != 0 ||
+			s.Window.Width != defaultWindowWidth || s.Window.Height != defaultWindowHeight
 	}
 	if len(stored.Presets) > PresetCount {
 		return i18n.NewError(

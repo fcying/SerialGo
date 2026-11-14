@@ -10,6 +10,7 @@ import (
 	"github.com/fcying/SerialGo/config"
 	"github.com/fcying/SerialGo/internal"
 
+	mygo "github.com/egoist/mygo"
 	gui "github.com/egoist/mygo/ui"
 )
 
@@ -719,5 +720,64 @@ func TestTimestampedFileName(t *testing.T) {
 				t.Fatalf("timestamped filename = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestWindowOptionsUseStoredGeometry(t *testing.T) {
+	want := config.WindowSettings{X: 720, Y: 169, Width: 1000, Height: 700, Maximized: true, PositionSet: true}
+	got := windowOptions(want)
+	if got.X != want.X || got.Y != want.Y || got.Width != want.Width || got.Height != want.Height || got.Maximized != want.Maximized || got.StateKey != mainWindowStateKey {
+		t.Fatalf("window options = %+v, want stored geometry %+v with state key %q", got, want, mainWindowStateKey)
+	}
+	if got.MinWidth != minWindowWidth || got.MinHeight != minWindowHeight {
+		t.Fatalf("window minimum size = %dx%d, want %dx%d", got.MinWidth, got.MinHeight, minWindowWidth, minWindowHeight)
+	}
+}
+
+func TestWindowOptionsEnforceMinimumSize(t *testing.T) {
+	got := windowOptions(config.WindowSettings{X: 20, Y: 30, Width: 600, Height: 300, PositionSet: true})
+	if got.X != 20 || got.Y != 30 || got.Width != minWindowWidth || got.Height != minWindowHeight {
+		t.Fatalf("window options did not preserve position and clamp size: %+v", got)
+	}
+}
+
+func TestWindowOptionsKeepExplicitOriginForStateRestore(t *testing.T) {
+	got := windowOptions(config.WindowSettings{Width: 800, Height: 600, PositionSet: true})
+	if got.X != 0 || got.Y != 0 || got.StateKey != mainWindowStateKey {
+		t.Fatalf("explicit origin options = %+v, want origin with state key %q", got, mainWindowStateKey)
+	}
+}
+
+func TestMaximizedWindowKeepsNormalBounds(t *testing.T) {
+	geometry := config.WindowSettings{X: 720, Y: 169, Width: 1000, Height: 700, PositionSet: true}
+	updateWindowGeometry(&geometry, mygo.Rectangle{X: 0, Y: 0, Width: 1920, Height: 1080}, true)
+	want := config.WindowSettings{X: 720, Y: 169, Width: 1000, Height: 700, Maximized: true, PositionSet: true}
+	if geometry != want {
+		t.Fatalf("maximized geometry = %+v, want preserved normal bounds %+v", geometry, want)
+	}
+	updateWindowGeometry(&geometry, mygo.Rectangle{X: 100, Y: 80, Width: 900, Height: 650}, false)
+	want = config.WindowSettings{X: 100, Y: 80, Width: 900, Height: 650, PositionSet: true}
+	if geometry != want {
+		t.Fatalf("restored geometry = %+v, want %+v", geometry, want)
+	}
+}
+
+func TestPersistWindowGeometryMarksOnlyChanges(t *testing.T) {
+	initial := config.WindowSettings{X: 20, Y: 30, Width: 900, Height: 600, PositionSet: true}
+	app := &internal.App{Settings: config.Settings{Window: initial}}
+	s := newController(app)
+	s.persistWindowGeometry()
+	if app.SettingsDirty || app.SettingsRevision != 0 {
+		t.Fatal("unchanged geometry marked settings dirty")
+	}
+	updated := config.WindowSettings{X: 40, Y: 50, Width: 1000, Height: 700, Maximized: true, PositionSet: true}
+	s.windowGeometry = updated
+	s.persistWindowGeometry()
+	if app.Settings.Window != updated || !app.SettingsDirty || app.SettingsRevision != 1 {
+		t.Fatalf("updated geometry was not marked for shutdown save: settings=%+v dirty=%v revision=%d", app.Settings.Window, app.SettingsDirty, app.SettingsRevision)
+	}
+	s.persistWindowGeometry()
+	if app.SettingsRevision != 1 {
+		t.Fatal("unchanged geometry created another settings revision")
 	}
 }

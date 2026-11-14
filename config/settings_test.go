@@ -536,3 +536,100 @@ func TestMissingAndInvalidDisplayBufferLimitsUseTemplateWithoutWriting(t *testin
 		t.Fatalf("saving invalid limit did not normalize it: limit=%d err=%v", got.DisplayBufferLimit, err)
 	}
 }
+
+func TestWindowSettingsDefaultAndRoundTrip(t *testing.T) {
+	wantDefault := WindowSettings{Width: 800, Height: 600}
+	if got := defaults().Window; got != wantDefault {
+		t.Fatalf("default window settings = %+v, want %+v", got, wantDefault)
+	}
+	settings := defaults()
+	settings.Window = WindowSettings{X: 720, Y: 169, Width: 1000, Height: 700, PixelX: 1080, PixelY: 254, PixelWidth: 1500, PixelHeight: 1050, Maximized: true, PositionSet: true}
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := Save(path, settings); err != nil {
+		t.Fatal(err)
+	}
+	var stored struct {
+		Window WindowSettings
+	}
+	if _, err := toml.DecodeFile(path, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Window != settings.Window {
+		t.Fatalf("stored [Window] = %+v, want %+v", stored.Window, settings.Window)
+	}
+	got, _, err := load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Window != settings.Window {
+		t.Fatalf("window settings after reload = %+v, want %+v", got.Window, settings.Window)
+	}
+}
+
+func TestLegacyConfigUsesWindowDefaultsWithoutRewrite(t *testing.T) {
+	source := "SendText = \"legacy payload\"\n"
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte(source), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, gotPath, err := load(path)
+	if err != nil || gotPath != path {
+		t.Fatalf("loading legacy config: path=%q err=%v", gotPath, err)
+	}
+	if got.Window != defaults().Window {
+		t.Fatalf("legacy config did not receive default window settings: %+v", got.Window)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil || string(contents) != source {
+		t.Fatalf("loading legacy config rewrote it: contents=%q err=%v", contents, err)
+	}
+}
+
+func TestLegacyWindowSettingsInferSavedPosition(t *testing.T) {
+	source := "[Window]\nX = 720\nY = 169\nWidth = 1000\nHeight = 700\nMaximized = false\n"
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte(source), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Window.PositionSet {
+		t.Fatal("legacy window coordinates were not recognized as an explicit position")
+	}
+}
+
+func TestCenteredWindowPositionFlagRoundTrip(t *testing.T) {
+	settings := defaults()
+	settings.Window = WindowSettings{Width: 1000, Height: 700}
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := Save(path, settings); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Window != settings.Window {
+		t.Fatalf("centered window settings = %+v, want %+v", got.Window, settings.Window)
+	}
+}
+
+func TestLegacyWindowSettingsInferSavedPixelPosition(t *testing.T) {
+	source := "[Window]\nX = 0\nY = 0\nWidth = 800\nHeight = 600\nPixelX = 0\nPixelY = 0\nPixelWidth = 1200\nPixelHeight = 900\n"
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte(source), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Window.PositionSet {
+		t.Fatal("legacy native pixel bounds were not recognized as a saved window position")
+	}
+	if got.Window.PixelWidth != 1200 || got.Window.PixelHeight != 900 {
+		t.Fatalf("legacy pixel bounds = %dx%d, want 1200x900", got.Window.PixelWidth, got.Window.PixelHeight)
+	}
+}

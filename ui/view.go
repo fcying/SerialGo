@@ -25,6 +25,7 @@ const (
 	// One send-header row, the editor/actions, spacing, padding, and borders.
 	minSendWorkspaceHeight = 90
 	minWindowWidth         = 800
+	minWindowHeight        = 420
 )
 
 func (s *controller) view(c *ui.Context) {

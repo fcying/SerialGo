@@ -15,6 +15,9 @@ type controller struct {
 	app                                                               *internal.App
 	settings                                                          *config.Settings
 	window                                                            *mygo.Window
+	windowGeometry                                                    config.WindowSettings
+	windowState                                                       mygo.WindowState
+	hasWindowState                                                    bool
 	log                                                               receiveLog
 	portMenuOpen, portMenuRefreshed                                   bool
 	portSettingsOpen, optionsOpen                                     bool
@@ -49,7 +52,8 @@ type controller struct {
 func newController(app *internal.App) *controller {
 	return &controller{
 		app: app, settings: &app.Settings, portDraft: app.Settings.Port,
-		presetSplit: presetReceiveShare, autoScroll: true,
+		windowGeometry: normalizeWindowGeometry(app.Settings.Window),
+		presetSplit:    presetReceiveShare, autoScroll: true,
 	}
 }
 
@@ -59,12 +63,14 @@ func Run(app *internal.App, title string) error {
 	}
 	s := newController(app)
 	s.configureLog()
+	mygo.App.SetWindowStateStore(s)
 	mygo.App.SetMenu(nil)
 	mygo.App.WhenReady(func() {
-		s.window = mygo.NewWindow(mygo.WindowOptions{
-			Title: title, Width: minWindowWidth, Height: 600, MinWidth: minWindowWidth, MinHeight: 420,
-			Content: ui.View(s.view),
-		})
+		opts := windowOptions(s.windowGeometry)
+		opts.Title = title
+		opts.Content = ui.View(s.view)
+		s.window = mygo.NewWindow(opts)
+		s.bindWindowGeometry()
 		app.Startup(s)
 		app.RefreshPorts()
 		if err := s.setWindowIcon(); err != nil {
@@ -72,11 +78,69 @@ func Run(app *internal.App, title string) error {
 		}
 	})
 	runErr := mygo.App.Run()
+	if s.window != nil {
+		s.syncWindowState()
+		s.persistWindowGeometry()
+	}
 	shutdownErr := app.Shutdown()
 	if runErr != nil {
 		return runErr
 	}
 	return shutdownErr
+}
+func normalizeWindowGeometry(geometry config.WindowSettings) config.WindowSettings {
+	if !geometry.PositionSet {
+		geometry.X, geometry.Y = 0, 0
+	}
+	geometry.Width = max(geometry.Width, minWindowWidth)
+	geometry.Height = max(geometry.Height, minWindowHeight)
+	return geometry
+}
+
+func windowOptions(geometry config.WindowSettings) mygo.WindowOptions {
+	geometry = normalizeWindowGeometry(geometry)
+	x, y := 0, 0
+	if geometry.PositionSet {
+		x, y = geometry.X, geometry.Y
+	}
+	return mygo.WindowOptions{
+		X: x, Y: y, Width: geometry.Width, Height: geometry.Height,
+		MinWidth: minWindowWidth, MinHeight: minWindowHeight,
+		Maximized: geometry.Maximized, StateKey: mainWindowStateKey,
+	}
+}
+
+func updateWindowGeometry(geometry *config.WindowSettings, bounds mygo.Rectangle, maximized bool) {
+	geometry.Maximized = maximized
+	if maximized {
+		return
+	}
+	geometry.X, geometry.Y = bounds.X, bounds.Y
+	geometry.Width, geometry.Height = bounds.Width, bounds.Height
+	geometry.PositionSet = true
+}
+
+func (s *controller) bindWindowGeometry() {
+	s.window.OnMove(s.captureWindowGeometry)
+	s.window.OnResize(s.captureWindowGeometry)
+	s.window.OnMaximize(s.captureWindowGeometry)
+	s.window.OnUnmaximize(s.captureWindowGeometry)
+	s.window.OnRestore(s.captureWindowGeometry)
+}
+
+func (s *controller) captureWindowGeometry() {
+	if s.window.IsMinimized() {
+		return
+	}
+	updateWindowGeometry(&s.windowGeometry, s.window.Bounds(), s.window.IsMaximized())
+}
+
+func (s *controller) persistWindowGeometry() {
+	if s.settings.Window == s.windowGeometry {
+		return
+	}
+	s.settings.Window = s.windowGeometry
+	s.app.SettingsChanged()
 }
 
 func (s *controller) Dispatch(fn func())                   { s.window.Update(fn) }

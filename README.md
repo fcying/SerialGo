@@ -17,7 +17,7 @@ A native serial-port debugging assistant for Windows and Linux, with text/HEX tr
 3. Enter text or HEX bytes in the send area and click **Send**. Choose the text encoding in **Options** when needed.
 4. View incoming data in the upper pane. Click **Save data** to export displayed text, or **Record data** to start saving raw received bytes while connected.
 
-The lower cards contain connection controls, receive controls, file operations, and the send editor, from left to right. Drag the horizontal divider to enlarge the lower workspace; double-click to restore the compact default. Its position is not saved.
+The lower cards contain connection controls, receive controls, file operations, and the send editor, from left to right. The main window restores its normal position, size, and maximized state from the executable-adjacent `[Window]` table in `config.toml`. The saved rectangle must overlap a display's work area by at least 100x50 logical pixels; otherwise the window is centered at its saved size. Windows stores native-pixel bounds to avoid mixed-DPI drift; legacy settings without pixel bounds are centered when connected displays use different scales. A fresh configuration starts centered at 800x600. The divider position is not saved.
 The minimum window width is 800 logical pixels so the send controls stay on one row.
 
 ## Connecting and baud rates
@@ -79,7 +79,7 @@ Options also provides On top, text encoding, display history, timestamp packet g
 - Only `config.toml` beside the actual executable is used, after resolving executable symlinks. Working and user configuration directories are not searched; save failures never trigger a fallback directory.
 - Missing configuration is created immediately. Existing files, including unreadable or invalid files, are not overwritten on load. Creation and save failures are reported; keep the executable directory writable.
 - The repository [`config.toml`](config.toml) is a default reference, not a runtime dependency. Existing executable-local values are preserved; omitted scalar fields use defaults. Missing or explicitly empty preset lists stay empty rather than restoring the initial entries.
-- Settings save on actual use, including successful connection, accepted sending, file export/capture, confirmed properties, preset addition/deletion, and immediately applied display, language, or preset-panel changes. Editing does not write per keystroke. Normal exit saves remaining drafts; forced termination may lose them. Unchanged uses and exits do not rewrite the file.
+- Settings save on actual use, including successful connection, accepted sending, file export/capture, confirmed properties, preset addition/deletion, and immediately applied display, language, or preset-panel changes. Editing does not write per keystroke. Normal exit saves remaining drafts and window geometry; forced termination may lose recent changes. Unchanged uses and exits do not rewrite the file.
 - Save errors remain visible and retry on the next use. Invalid stored encoding or packet-gap values use UTF-8 and `20 ms` with a startup warning, without rewriting the file on load. Invalid display limits use the default.
 - Older configurations without `BaudRates` migrate legacy baud values; an explicit array, including `[]`, takes precedence. Obsolete send-checksum and independent `Packet` settings are ignored and omitted on the next normal save, not rewritten merely on load. `Timestamp` and `PacketGap` remain supported.
 
