@@ -1,0 +1,145 @@
+name: release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+      target: ${{ steps.release.outputs.target }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Determine release version
+        id: release
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          app_version=$(sed -nE 's/^[[:space:]]*appVersion[[:space:]]*=[[:space:]]*"([^"]+)"$/\1/p' main.go)
+          if [[ ! "$app_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            printf 'main.go appVersion must be a single MAJOR.MINOR.PATCH value; got %q\n' "$app_version" >&2
+            exit 1
+          fi
+
+          target="$GITHUB_SHA"
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            target="$PR_HEAD_SHA"
+          fi
+          version=dev-latest
+          prerelease=true
+          if [[ "$GITHUB_REF" == refs/heads/main ]] && ! git show-ref --verify --quiet "refs/tags/v$app_version"; then
+            version="v$app_version"
+            prerelease=false
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.target }}
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - uses: extractions/setup-just@v4
+        with:
+          just-version: '1.58.0'
+
+      - name: Build and package Windows and Linux amd64 binaries
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          just windows
+          just linux
+          stage=$(mktemp -d)
+          trap 'rm -rf "$stage"' EXIT
+          mkdir -p "$stage/windows" "$stage/linux" dist
+          install -m 755 build/windows-amd64/SerialGo.exe "$stage/windows/SerialGo.exe"
+          install -m 755 build/linux-amd64/SerialGo "$stage/linux/SerialGo"
+          install -m 644 LICENSE "$stage/windows/LICENSE"
+          install -m 644 LICENSE "$stage/linux/LICENSE"
+          (
+            cd "$stage/windows"
+            python3 -m zipfile -c "$GITHUB_WORKSPACE/dist/SerialGo-${VERSION}-windows-amd64.zip" SerialGo.exe LICENSE
+          )
+          tar -czf "dist/SerialGo-${VERSION}-linux-amd64.tar.gz" -C "$stage/linux" SerialGo LICENSE
+          test -s "dist/SerialGo-${VERSION}-windows-amd64.zip"
+          test -s "dist/SerialGo-${VERSION}-linux-amd64.tar.gz"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-binaries
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [prepare, build]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: release-publish
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.target }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: release-binaries
+          path: dist
+
+      - name: Publish GitHub Release
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          TARGET: ${{ needs.prepare.outputs.target }}
+        run: |
+          set -euo pipefail
+          if [[ "$PRERELEASE" == true ]]; then
+            while IFS= read -r release_id; do
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$release_id"
+            done < <(gh api --paginate --jq '.[] | select(.draft and .name == "dev-latest") | .id' "repos/$GITHUB_REPOSITORY/releases?per_page=100")
+            if gh release view "$VERSION" >/dev/null 2>&1; then
+              gh release delete "$VERSION" --yes
+            fi
+            git tag --force "$VERSION" "$TARGET"
+            git push origin "refs/tags/$VERSION" --force
+            gh release create "$VERSION" dist/* --target "$TARGET" --generate-notes --title "$VERSION" --prerelease
+          else
+            gh release create "$VERSION" dist/* --target "$TARGET" --generate-notes --title "$VERSION"
+          fi
