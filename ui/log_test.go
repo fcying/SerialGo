@@ -317,8 +317,23 @@ func TestReceiveLogAutoScrollWaitsForSelectionToClear(t *testing.T) {
 		t.Fatalf("new data changed the selected text: got %q, want %q", got, selectedText)
 	}
 
-	tt.ClickAt(box.X+200, box.Y+60)
+	// Receive another batch between mouse down and up, while the caret
+	// has moved to the click position but the gesture is still active.
+	x, y := box.X+200, box.Y+60
+	tt.Press(x, y)
+	s.log.append([]internal.Event{{Data: []byte(strings.Repeat("during click\n", 40))}})
+	tt.Frame()
+	if !s.log.scrollToEnd || s.log.scroll.Y >= s.log.scroll.MaxY {
+		t.Fatal("auto scroll resumed before the click was released")
+	}
+	tt.Release(x, y)
+	tt.Frame()
 	if !s.autoScroll || s.log.autoScrollDisabled || s.log.scrollToEnd || s.log.scroll.Y != s.log.scroll.MaxY {
 		t.Fatalf("auto scroll did not resume after clearing selection: enabled=%v disabled=%v pending=%v Y=%v MaxY=%v", s.autoScroll, s.log.autoScrollDisabled, s.log.scrollToEnd, s.log.scroll.Y, s.log.scroll.MaxY)
+	}
+	tt.SetClipboard("no selection")
+	tt.Key(gui.Ctrl, gui.KeyC)
+	if got := tt.Clipboard(); got != "no selection" {
+		t.Fatalf("single click left text selected: %q", got)
 	}
 }

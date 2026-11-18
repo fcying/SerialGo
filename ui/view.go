@@ -87,6 +87,12 @@ func (s *controller) receivePane(c *ui.Context) {
 		TextColor(ui.Hex(config.NormalizeReceiveFontColor(p.ReceiveFontColor))).
 		TrackScroll(&s.log.scroll).Label(s.tr("接收窗口", "Receive log"))
 	if s.log.scrollToEnd {
+		// A press clears the selection before release finishes the gesture.
+		// Following now would change which text is under the pointer.
+		button, pressed := area.PressedButton()
+		if pressed && button == 0 {
+			return
+		}
 		selectionStart, selectionEnd := area.TextSelection()
 		if selectionStart != selectionEnd {
 			// Keep the pending follow request until the selection is cleared.
