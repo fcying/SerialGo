@@ -23,7 +23,7 @@ English | [简体中文](ARCHITECTURE.zh-CN.md)
 | `config/` | Settings schema, normalization, executable-local paths, and persistence format |
 | `assets/`, `cmd/appicon/` | Embedded defaults and icons, and build-time icon generation |
 
-Business code must not import MyGo or another UI framework. Dependencies are pinned in `go.mod`; the native UI uses [MyGo v0.9.0](https://github.com/egoist/mygo/releases/tag/v0.9.0), without WebView, Node.js, or TypeScript bindings.
+Business code must not import MyGo or another UI framework. Dependencies are pinned in `go.mod`; the native UI uses [MyGo](https://github.com/egoist/mygo), without WebView, Node.js, or TypeScript bindings.
 
 ## Settings and persistence
 

@@ -23,7 +23,7 @@
 | `config/` | 配置结构, 规范化, EXE 同目录路径和持久化格式 |
 | `assets/`, `cmd/appicon/` | 内嵌默认配置与图标, 构建期图标生成 |
 
-业务代码不导入 MyGo 或其他 UI 框架. 依赖版本固定在 `go.mod` 中; 原生界面使用 [MyGo v0.9.0](https://github.com/egoist/mygo/releases/tag/v0.9.0), 不依赖 WebView, Node.js 或 TypeScript 绑定.
+业务代码不导入 MyGo 或其他 UI 框架. 依赖版本固定在 `go.mod` 中; 原生界面使用 [MyGo](https://github.com/egoist/mygo), 不依赖 WebView, Node.js 或 TypeScript 绑定.
 
 ## 配置与持久化
 
