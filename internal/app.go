@@ -168,9 +168,10 @@ func (s *App) showSettingsWarning() {
 	s.settingsWarning = Text{}
 }
 
-func (s *App) ClearCounts() {
+// ClearReceiveLog resets the counters and discards pending display records.
+func (s *App) ClearReceiveLog() {
 	if s.session != nil {
-		s.session.clearDisplayCounters()
+		s.session.clearDisplay()
 	}
 	s.Tx, s.Rx = 0, 0
 }
