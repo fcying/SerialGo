@@ -148,6 +148,11 @@ func (s *controller) AppendEvents(events []internal.Event) { s.log.append(events
 func (s *controller) statusText() string                   { return s.tr(s.app.Status.ZH, s.app.Status.EN) }
 func (s *controller) applyAlwaysOnTop()                    { s.window.SetAlwaysOnTop(s.alwaysOnTop) }
 
+func (s *controller) clearReceiveLog() {
+	s.app.ClearReceiveLog()
+	s.log.clear()
+}
+
 func (s *controller) autoScrollChanged() {
 	s.log.autoScrollDisabled = !s.autoScroll
 	if s.autoScroll {

@@ -146,8 +146,12 @@ func (s *Session) hasDisplay() bool {
 	return s.displayCount != 0 || s.displayRx != 0 || s.displayTx != 0
 }
 
-func (s *Session) clearDisplayCounters() {
+func (s *Session) clearDisplay() {
 	s.displayMu.Lock()
+	for s.displayCount > 0 {
+		s.dropOldestDisplayLocked()
+	}
+	s.displayHead = 0
 	s.displayRx, s.displayTx = 0, 0
 	s.displayMu.Unlock()
 }

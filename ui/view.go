@@ -258,7 +258,8 @@ func (s *controller) receiveOptionsPanel(c *ui.Context, width float32) {
 		})
 		ui.Row(c.Key("receive-actions")).FillWidth().Gap(controlGap).Children(func() {
 			ui.Button(c.Key("clear-receive"), s.tr("清空", "Clear")).Width(0).MinWidth(0).Grow(1).Height(controlHeight).PaddingY(controlPadY).
-				Label(s.tr("清除接收窗口", "Clear receive log")).OnClick(s.log.clear)
+				Label(s.tr("清除接收窗口", "Clear receive log")).
+				Tooltip(s.tr("清空接收日志并将收发计数清零", "Clear the receive log and reset the send/receive counters")).OnClick(s.clearReceiveLog)
 			ui.Button(c.Key("options"), s.tr("选项", "Options")).Width(0).MinWidth(0).Grow(1).Height(controlHeight).PaddingY(controlPadY).OnClick(s.openOptions)
 		})
 	})
@@ -365,10 +366,7 @@ func (s *controller) statusBar(c *ui.Context) {
 		statusCell(c, "tx-count", fmt.Sprintf("S: %d", s.app.Tx))
 		ui.Text(c.Key("tx-rx-separator"), "|").TextColor(c.Theme().TextMuted).Shrink(0)
 		statusCell(c, "rx-count", fmt.Sprintf("R: %d", s.app.Rx))
-		ui.Text(c.Key("rx-reset-separator"), "|").TextColor(c.Theme().TextMuted).Shrink(0)
-		ui.Button(c.Key("reset-counts"), s.tr("清零", "Reset")).Height(20).PaddingY(1).PaddingX(8).Margin(0, 8, 0, 8).
-			Label(s.tr("收发计数清零", "Reset counters")).Tooltip(s.tr("收发计数清零", "Reset transmit/receive counters")).OnClick(s.app.ClearCounts)
-		ui.Text(c.Key("reset-config-separator"), "|").TextColor(c.Theme().TextMuted).Shrink(0)
+		ui.Text(c.Key("rx-config-separator"), "|").TextColor(c.Theme().TextMuted).Shrink(0)
 		ui.Text(c.Key("serial-config"), serialConfig).Shrink(0).Padding(0, 8).
 			SingleLine().Tooltip(serialConfig)
 		ui.Text(c.Key("config-status-separator"), "|").TextColor(c.Theme().TextMuted).Shrink(0)

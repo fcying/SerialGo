@@ -265,17 +265,18 @@ func TestAppDrainsSnapshotAndOwnsCountsAndCaptureFailure(t *testing.T) {
 	if s.Tx != 2 || s.Rx != uint64(displayBufferSize+len("latest")) || len(v.records) != 1 || string(v.records[0].Data) != "latest" || s.CapturePath != "" || !s.StatusError {
 		t.Fatal("display overflow lost counters, retained stale data, or hid an error")
 	}
-	s.ClearCounts()
-	p.emit(Event{Data: []byte("pending")})
-	s.ClearCounts()
+	p.emit(Event{Data: []byte("pending RX")})
+	p.emit(Event{Data: []byte("pending TX"), Sent: true})
+	s.ClearReceiveLog()
 	s.drain(p)
-	if s.Tx != 0 || s.Rx != 0 {
-		t.Fatal("pending pre-reset display bytes were counted after reset")
+	if s.Tx != 0 || s.Rx != 0 || len(v.records) != 1 {
+		t.Fatal("pending records or counters reappeared after clearing the log")
 	}
-	p.emit(Event{Data: []byte("new")})
+	p.emit(Event{Data: []byte("new RX")})
+	p.emit(Event{Data: []byte("new TX"), Sent: true})
 	s.drain(p)
-	if s.Tx != 0 || s.Rx != 3 {
-		t.Fatal("post-reset receive bytes were not counted")
+	if s.Tx != 6 || s.Rx != 6 || len(v.records) != 3 || string(v.records[1].Data) != "new RX" || string(v.records[2].Data) != "new TX" {
+		t.Fatal("post-clear records or counters were lost")
 	}
 }
 

@@ -45,8 +45,6 @@ func TestStatusBarKeepsLongTextOnOneLine(t *testing.T) {
 						"S: 18446744073709551615",
 						language.serialConfig,
 						language.statusLabel,
-						s.tr("清零", "Reset"),
-						s.tr("收发计数清零", "Reset counters"),
 					} {
 						bounds, found := tt.Find(text)
 						if !found {
@@ -58,21 +56,18 @@ func TestStatusBarKeepsLongTextOnOneLine(t *testing.T) {
 							t.Errorf("status field %q extends outside its footer line: field=%+v line=%+v", text, bounds, line)
 						}
 					}
-					if language.code == "zh-CN" {
-						if _, found := tt.Find("清计数"); found {
-							t.Error("old reset caption remains visible")
-						}
+					if _, found := tt.AccessByRole(gui.RoleButton, s.tr("收发计数清零", "Reset counters")); found {
+						t.Error("standalone reset button remains in the footer")
 					}
 					if _, found := tt.Find(language.redundantStatus); found {
 						t.Errorf("status bar should not repeat the port name and connection state: %q", language.redundantStatus)
 					}
-					reset, _ := tt.Find(s.tr("收发计数清零", "Reset counters"))
 					tx, _ := tt.Find("S: 18446744073709551615")
 					rx, _ := tt.Find("R: 0")
-					if tx.X+tx.W > rx.X || rx.X+rx.W > reset.X {
-						t.Errorf("counters should precede Reset in S, R order: tx=%+v rx=%+v reset=%+v", tx, rx, reset)
-					}
 					serialConfig, _ := tt.Find(language.serialConfig)
+					if tx.X+tx.W > rx.X || rx.X+rx.W > serialConfig.X {
+						t.Errorf("counters should precede serial settings in S, R order: tx=%+v rx=%+v config=%+v", tx, rx, serialConfig)
+					}
 					status, _ := tt.Find(language.statusLabel)
 					if serialConfig.W > 160 || serialConfig.X+serialConfig.W > status.X {
 						t.Errorf("serial summary wastes footer space or overlaps status: config=%+v status=%+v", serialConfig, status)
@@ -103,12 +98,6 @@ func TestStatusBarKeepsLongTextOnOneLine(t *testing.T) {
 						if caption.Y < field.Y-1 || caption.Y+caption.H > field.Y+field.H+1 {
 							t.Errorf("caption %q wrapped away from its field: caption=%+v field=%+v", pair[0], caption, field)
 						}
-					}
-					if err := tt.Click(s.tr("收发计数清零", "Reset counters")); err != nil {
-						t.Fatal(err)
-					}
-					if s.app.Tx != 0 || s.app.Rx != 0 {
-						t.Fatal("relocated Reset button did not clear counters")
 					}
 					if err := tt.Click(s.tr("选项", "Options")); err != nil {
 						t.Fatal(err)
@@ -504,6 +493,16 @@ func TestReceiveControlsUseTwoRowsAndActionsShareLine(t *testing.T) {
 	}
 	if !app.Settings.ShowSent {
 		t.Fatal("Show sent did not enable outgoing records")
+	}
+	s.AppendEvents([]internal.Event{{Data: []byte("incoming")}, {Data: []byte("outgoing"), Sent: true}})
+	app.Tx, app.Rx = 8, 8
+	tt.Frame()
+	err := tt.Click("Clear receive log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.log.text.Len() != 0 || app.Tx != 0 || app.Rx != 0 {
+		t.Fatalf("Clear left receive text or counters: log=%q S=%d R=%d", s.log.text.String(), app.Tx, app.Rx)
 	}
 }
 
