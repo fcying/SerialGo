@@ -1,14 +1,15 @@
 package ui
 
 import (
-	"fmt"
+	"bytes"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/fcying/SerialGo/config"
 	"github.com/fcying/SerialGo/internal"
 
-	"github.com/egoist/mygo/ui"
+	"github.com/egoist/mygo/ui/editor"
 	"golang.org/x/text/transform"
 )
 
@@ -19,96 +20,106 @@ type logOptions struct {
 	encoding                 string
 	gap                      time.Duration
 	limit                    int
+	hexBytesPerLine          int
 }
 
 type receiveLog struct {
-	options                                         logOptions
-	events                                          []internal.Event
-	bytes                                           int
-	text                                            ui.TextBuffer
-	scroll                                          ui.ScrollState
-	decoder                                         transform.Transformer
-	pending                                         []byte
-	last                                            internal.Event
-	started, newline, cr                            bool
-	scrollToEnd, autoScrollDisabled, preserveScroll bool
-	scrollAnchor                                    int
-	viewportHeight                                  float32
+	logRenderer
+	history                         receiveHistory
+	bytes                           int
+	text                            editor.Buffer
+	view                            editor.State
+	theme                           editor.Theme
+	scrollToEnd, autoScrollDisabled bool
+}
+
+type logRenderer struct {
+	options              logOptions
+	decoder              transform.Transformer
+	pending              []byte
+	lastAt               time.Time
+	hexOffsets           hexOffsets
+	lastSent             bool
+	started, newline, cr bool
+}
+
+func newLogRenderer(options logOptions, head hexOffsets) logRenderer {
+	r := logRenderer{options: options, decoder: internal.Decoder(options.encoding), newline: true}
+	if options.hex {
+		r.hexOffsets = head
+	}
+	return r
+}
+
+// With no builder, replay counts the bytes to remove without materializing them.
+type logOutput struct {
+	text *strings.Builder
+	size int
+}
+
+func (out *logOutput) writeByte(b byte) {
+	if out.text != nil {
+		out.text.WriteByte(b)
+	} else {
+		out.size++
+	}
+}
+
+func (out *logOutput) writeString(s string) {
+	if out.text != nil {
+		out.text.WriteString(s)
+	} else {
+		out.size += len(s)
+	}
+}
+
+func (out *logOutput) writeRune(r rune) {
+	if out.text != nil {
+		out.text.WriteRune(r)
+	} else {
+		out.size += utf8.RuneLen(r)
+	}
 }
 
 func (l *receiveLog) clear() {
-	l.events = nil
+	l.history = receiveHistory{}
 	l.bytes = 0
 	l.rebuild()
 }
 
 func (l *receiveLog) configure(options logOptions) {
 	options.limit = config.NormalizeDisplayBufferLimit(options.limit)
+	if options.hex {
+		options.hexBytesPerLine = config.NormalizeReceiveHexBytesPerLine(options.hexBytesPerLine)
+	} else {
+		options.hexBytesPerLine = 0
+	}
 	if l.options != options || l.decoder == nil {
 		l.options = options
-		l.trim()
+		l.trim(nil)
 		l.rebuild()
 	}
 }
 
 func (l *receiveLog) rebuild() {
-	if l.autoScrollDisabled {
-		l.captureScrollAnchor()
+	l.view.Buffer = &l.text
+	l.logRenderer = newLogRenderer(l.options, l.history.headHexOffsets)
+	var text strings.Builder
+	out := logOutput{text: &text}
+	for _, block := range l.history.blocks {
+		for len(block.data) != 0 {
+			l.render(&out, block.pop())
+		}
 	}
-	l.decoder = internal.Decoder(l.options.encoding)
-	l.pending = l.pending[:0]
-	l.started, l.newline, l.cr = false, true, false
-	l.last = internal.Event{}
-	var out strings.Builder
-	for _, event := range l.events {
-		l.render(&out, event)
-	}
-	l.text.Set(out.String())
+	l.text.Reset(text.String())
 	l.scrollToEnd = !l.autoScrollDisabled
 }
 
-func (l *receiveLog) captureScrollAnchor() {
-	if l.preserveScroll {
-		return
+func (l *receiveLog) trim(evict func(internal.Event)) {
+	if l.bytes > l.options.limit {
+		// Evict whole events with headroom to batch prefix updates.
+		l.bytes = l.history.trim(l.bytes, l.options.limit-16_384, evict)
 	}
-	length := l.text.Len()
-	if length == 0 {
-		l.scrollAnchor = 0
-	} else {
-		totalHeight := l.scroll.MaxY + l.viewportHeight
-		if totalHeight <= 0 {
-			l.scrollAnchor = 0
-		} else {
-			center := min(max(l.scroll.Y+l.viewportHeight/2, 0), totalHeight)
-			l.scrollAnchor = int(float32(length) * center / totalHeight)
-			l.scrollAnchor = min(max(l.scrollAnchor, 0), length)
-		}
-	}
-	l.preserveScroll = true
-}
-
-// trim evicts complete oldest events but always keeps the newest one, even
-// when a single event exceeds the selected byte limit. Empty events are not
-// retained, so metadata is bounded by the payload budget without an independent
-// record count that would truncate large buffers receiving small packets.
-func (l *receiveLog) trim() bool {
-	if l.bytes <= l.options.limit {
-		return false
-	}
-	// Leave room for incoming data instead of rebuilding a full buffer per byte.
-	target := l.options.limit - 16_384
-	i := 0
-	for l.bytes > target && i < len(l.events)-1 {
-		l.bytes -= len(l.events[i].Data)
-		i++
-	}
-	if i == 0 {
-		return false
-	}
-	remaining := copy(l.events, l.events[i:])
-	clear(l.events[remaining:])
-	l.events = l.events[:remaining]
-	return true
 }
 
 func (l *receiveLog) append(events []internal.Event) {
@@ -118,69 +129,151 @@ func (l *receiveLog) append(events []internal.Event) {
 	if l.decoder == nil {
 		l.configure(l.options)
 	}
+	var text strings.Builder
+	out := logOutput{text: &text}
 	for _, event := range events {
 		if len(event.Data) == 0 {
 			continue
 		}
-		l.events = append(l.events, event)
+		l.history.append(event)
 		l.bytes += len(event.Data)
+		l.render(&out, event)
 	}
-	if l.trim() {
-		l.rebuild()
-		return
+	if l.bytes > l.options.limit {
+		l.evictDisplayPrefix(text.String())
+	} else if text.Len() != 0 {
+		end := l.text.Len()
+		l.text.EditRemote(editor.Edit{Start: end, End: end, Text: text.String()})
+		l.scrollToEnd = !l.autoScrollDisabled
 	}
-	var out strings.Builder
-	for _, event := range events {
-		if len(event.Data) != 0 {
-			l.render(&out, event)
-		}
-	}
-	if out.Len() == 0 {
-		return
-	}
-	if l.autoScrollDisabled {
-		l.captureScrollAnchor()
-	}
-	end := l.text.Len()
-	l.text.Replace(end, end, out.String())
-	l.scrollToEnd = !l.autoScrollDisabled
 }
 
-func (l *receiveLog) render(out *strings.Builder, event internal.Event) {
+// Rebuild only the prefix whose formatting depends on the evicted bytes.
+// The text decoders are stateless. HEX offsets carry across eviction so
+// packet state can converge without reflowing the retained byte rows.
+func (l *receiveLog) evictDisplayPrefix(tail string) {
+	old := newLogRenderer(l.options, l.history.headHexOffsets)
+	var removed logOutput
+	before := l.bytes
+	l.trim(func(event internal.Event) { old.render(&removed, event) })
+	end := l.text.Len()
+	if before == l.bytes {
+		if tail != "" {
+			l.text.EditRemote(editor.Edit{Start: end, End: end, Text: tail})
+			l.scrollToEnd = !l.autoScrollDisabled
+		}
+		return
+	}
+	evicted := removed.size
+	var repaired strings.Builder
+	fresh := newLogRenderer(l.options, l.history.headHexOffsets)
+	out := logOutput{text: &repaired}
+	converged := false
+	for _, block := range l.history.blocks {
+		for len(block.data) != 0 {
+			if old.sameState(&fresh) {
+				converged = true
+				break
+			}
+			event := block.pop()
+			old.render(&removed, event)
+			fresh.render(&out, event)
+		}
+		if converged {
+			break
+		}
+	}
+	if !converged {
+		l.logRenderer = fresh
+	}
+	if removed.size > end {
+		// Part of this batch was discarded or reformatted before it reached the view.
+		repaired.WriteString(tail[removed.size-end:])
+		l.text.EditRemote(editor.Edit{End: end, Text: repaired.String()})
+	} else {
+		stop := removed.size
+		prefix := repaired.String()
+		// Leave identical retained bytes outside the edit so selections and
+		// scroll anchors in the first surviving event also stay attached.
+		if n := min(stop-evicted, len(prefix)); n > 0 {
+			unchanged := commonLogSuffix(l.text.Slice(stop-n, stop), prefix[len(prefix)-n:])
+			stop -= unchanged
+			prefix = prefix[:len(prefix)-unchanged]
+		}
+		l.text.EditRemote(editor.Edit{End: stop, Text: prefix}, editor.Edit{Start: end, End: end, Text: tail})
+	}
+	if removed.size != 0 || repaired.Len() != 0 || tail != "" {
+		l.scrollToEnd = !l.autoScrollDisabled
+	}
+}
+
+func commonLogSuffix(a, b string) int {
+	i := len(a)
+	for i > 0 && a[i-1] == b[i-1] {
+		i--
+	}
+	for i < len(a) && !utf8.RuneStart(a[i]) {
+		i++
+	}
+	return len(a) - i
+}
+
+func (l *logRenderer) sameState(other *logRenderer) bool {
+	return l.started == other.started && l.newline == other.newline && l.cr == other.cr &&
+		l.lastSent == other.lastSent && l.lastAt == other.lastAt && l.hexOffsets == other.hexOffsets && bytes.Equal(l.pending, other.pending)
+}
+
+func (l *logRenderer) render(out *logOutput, event internal.Event) {
+	var offset uint64
+	if l.options.hex {
+		offset = l.hexOffsets.advance(event)
+	}
 	if event.Sent && !l.options.showSent {
 		return
 	}
-	newPacket := !l.started || event.Sent != l.last.Sent || l.options.gap > 0 && event.At.Sub(l.last.At) >= l.options.gap
+	newPacket := !l.started || event.Sent != l.lastSent || l.options.gap > 0 && event.At.Sub(l.lastAt) >= l.options.gap
 	if newPacket {
 		if len(l.pending) != 0 {
 			l.decode(out, nil, true)
 		}
 		l.decoder.Reset()
 		if l.started && !l.newline {
-			out.WriteByte('\n')
+			out.writeByte('\n')
 		}
 		l.cr = false
 		l.newline = true
 		if l.options.timestamp {
-			fmt.Fprintf(out, "[%s] ", event.At.Format("15:04:05.000"))
+			out.writeByte('[')
+			var stamp [12]byte
+			out.writeString(string(event.At.AppendFormat(stamp[:0], "15:04:05.000")))
+			out.writeString("] ")
 			l.newline = false
 		}
 		if l.options.showSent {
 			if event.Sent {
-				out.WriteString("TX > ")
+				out.writeString("TX > ")
 			} else {
-				out.WriteString("RX < ")
+				out.writeString("RX < ")
 			}
 			l.newline = false
 		}
 	}
 	l.started = true
-	l.last = event
+	l.lastAt, l.lastSent = event.At, event.Sent
 	if l.options.hex {
-		for _, b := range event.Data {
-			out.WriteByte(hexDigits[b>>4])
-			out.WriteByte(hexDigits[b&15])
-			out.WriteByte(' ')
+		width := l.options.hexBytesPerLine
+		remaining := width - int(offset%uint64(width))
+		if remaining == width && !newPacket {
+			out.writeByte('\n')
+		}
+		for i, b := range event.Data {
+			if i == remaining {
+				out.writeByte('\n')
+				remaining += width
+			}
+			out.writeByte(hexDigits[b>>4])
+			out.writeByte(hexDigits[b&15])
+			out.writeByte(' ')
 		}
 		l.newline = false
 		return
@@ -188,7 +281,7 @@ func (l *receiveLog) render(out *strings.Builder, event internal.Event) {
 	l.decode(out, event.Data, false)
 }
 
-func (l *receiveLog) decode(out *strings.Builder, data []byte, atEOF bool) {
+func (l *logRenderer) decode(out *logOutput, data []byte, atEOF bool) {
 	input := data
 	if len(l.pending) > 0 {
 		input = append(l.pending, data...)
@@ -199,18 +292,18 @@ func (l *receiveLog) decode(out *strings.Builder, data []byte, atEOF bool) {
 		for _, r := range string(buf[:n]) {
 			switch r {
 			case '\r':
-				out.WriteByte('\n')
+				out.writeByte('\n')
 				l.cr, l.newline = true, true
 			case '\n':
 				if !l.cr {
-					out.WriteByte('\n')
+					out.writeByte('\n')
 				}
 				l.cr, l.newline = false, true
 			default:
 				if r < ' ' && r != '\t' || r == 0x7f {
 					r = '·'
 				}
-				out.WriteRune(r)
+				out.writeRune(r)
 				l.cr, l.newline = false, false
 			}
 		}

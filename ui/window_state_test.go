@@ -83,3 +83,44 @@ func TestWindowStateStoreKeepsUnsetPositionCentered(t *testing.T) {
 		t.Fatalf("unchanged centered window was persisted as an explicit position: settings=%+v dirty=%v revision=%d", app.Settings.Window, app.SettingsDirty, app.SettingsRevision)
 	}
 }
+
+func TestCurveWindowStatePersistsIndependentlyOfMainWindow(t *testing.T) {
+	path := t.TempDir() + "/config.toml"
+	s, notified := settingsSaveFixture(t, path)
+	main := config.WindowSettings{X: 50, Y: 40, Width: 825, Height: 620, PositionSet: true}
+	s.settings.Window = main
+	plot := mygo.WindowState{
+		X: 0, Y: 0, Width: 970, Height: 650,
+		PixelX: 0, PixelY: 0, PixelWidth: 1455, PixelHeight: 975,
+		Maximized: true,
+	}
+	states := map[string]mygo.WindowState{
+		mainWindowStateKey:  {X: 150, Y: 90, Width: 900, Height: 700},
+		curveWindowStateKey: plot,
+	}
+	err := s.SaveWindowStates(states)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completeSettingsSave(t, s, notified)
+	stored := readSavedSettings(t, path)
+	if stored.Window != main || !stored.CurveWindow.PositionSet || s.app.SettingsDirty {
+		t.Fatalf("plot close did not save its own geometry independently: main=%+v plot=%+v dirty=%v", stored.Window, stored.CurveWindow, s.app.SettingsDirty)
+	}
+	reopened := newController(&internal.App{Settings: stored})
+	restored, err := reopened.LoadWindowStates()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored[curveWindowStateKey] != plot {
+		t.Fatalf("restored plot geometry = %+v, want %+v", restored[curveWindowStateKey], plot)
+	}
+	revision := s.app.SettingsRevision
+	err = s.SaveWindowStates(states)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.app.SettingsRevision != revision {
+		t.Fatal("unchanged plot geometry scheduled another settings save")
+	}
+}

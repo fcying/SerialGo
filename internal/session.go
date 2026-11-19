@@ -32,6 +32,7 @@ type Event struct {
 	Sent       bool
 	Err        error
 	ReadFailed bool
+	capture    *captureWriter
 }
 
 type captureWriter struct {
@@ -48,18 +49,26 @@ type captureWriter struct {
 	reported  bool
 }
 
+type sessionPort interface {
+	Read([]byte) (int, error)
+	Write([]byte) (int, error)
+	SetLines(bool, bool) error
+	Close() error
+}
+
 type Session struct {
-	port          *serialport.Port
+	port          sessionPort
 	ctx           context.Context
 	cancel        context.CancelFunc
 	events        chan Event
 	writeChunk    int
 	readDone      chan struct{}
+	sendMu        sync.Mutex
 	captureMu     sync.Mutex
 	captureOps    sync.Mutex
 	capture       *captureWriter
 	captureWorker *captureWriter
-	captureError  error
+	captureErrors map[*captureWriter]error
 	displayMu     sync.Mutex
 	displayEvents [displayEventLimit]Event
 	displayHead   int
@@ -67,11 +76,19 @@ type Session struct {
 	displayBytes  int
 	displayRx     uint64
 	displayTx     uint64
+	curve         *curveWorker
 }
 
 func NewSession(port *serialport.Port, baud int) *Session {
+	return newSession(port, baud, nil)
+}
+
+func newSession(port sessionPort, baud int, receiver *curveReceiver) *Session {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Session{port: port, ctx: ctx, cancel: cancel, events: make(chan Event, 256), readDone: make(chan struct{})}
+	if receiver != nil {
+		s.curve = newCurveWorker(receiver)
+	}
 	// A Windows driver can wait for every byte to leave the UART. Keep each
 	// write comfortably within the backend's deadline, even at low baud.
 	s.writeChunk = min(4096, max(1, baud/100))
@@ -158,19 +175,28 @@ func (s *Session) clearDisplay() {
 
 func (s *Session) receive() {
 	defer close(s.readDone)
+	if s.curve != nil {
+		defer close(s.curve.queue)
+	}
 	buf := make([]byte, receiveBufferSize)
 	for s.ctx.Err() == nil {
 		n, err := s.port.Read(buf)
 		if n > 0 {
-			at := time.Now()
-			data := append([]byte(nil), buf[:n]...)
-			s.enqueueCapture(data)
-			s.emit(Event{At: at, Data: data})
+			s.receiveChunk(buf[:n], time.Now())
 		}
 		if err != nil {
 			s.emit(Event{Err: i18n.WrapError("接收失败", "Receive failed", err), ReadFailed: true})
 			return
 		}
+	}
+}
+
+func (s *Session) receiveChunk(chunk []byte, at time.Time) {
+	data := append([]byte(nil), chunk...)
+	s.enqueueCapture(data)
+	s.emit(Event{At: at, Data: data})
+	if s.curve != nil {
+		s.curve.enqueue(data, at)
 	}
 }
 
@@ -308,11 +334,14 @@ func (s *Session) finishCapture(capture *captureWriter, writer *bufio.Writer, wr
 	capture.result = result
 	if reportedErr != nil {
 		capture.reported = true
-		s.captureError = errors.Join(s.captureError, reportedErr)
+		if s.captureErrors == nil {
+			s.captureErrors = make(map[*captureWriter]error)
+		}
+		s.captureErrors[capture] = reportedErr
 	}
 	s.captureMu.Unlock()
 	if reportedErr != nil {
-		s.emit(Event{Err: reportedErr})
+		s.emit(Event{Err: reportedErr, capture: capture})
 	}
 }
 
@@ -388,9 +417,9 @@ func (s *Session) stopCaptureLocked() error {
 	return result
 }
 
-func (s *Session) acknowledgeCaptureError() {
+func (s *Session) acknowledgeCaptureError(capture *captureWriter) {
 	s.captureMu.Lock()
-	s.captureError = nil
+	delete(s.captureErrors, capture)
 	s.captureMu.Unlock()
 }
 
@@ -398,16 +427,28 @@ func (s *Session) Close() error {
 	s.cancel()
 	err := s.port.Close()
 	<-s.readDone
+	// Port.Close may return before Write has returned and emitted its byte count.
+	// Cancellation prevents later sends from producing any new records.
+	s.sendMu.Lock()
+	s.sendMu.Unlock()
 	err = errors.Join(err, s.SetCapture(nil))
+	if s.curve != nil {
+		<-s.curve.done
+	}
 	s.captureMu.Lock()
-	captureErr := s.captureError
-	s.captureError = nil
+	var captureErr error
+	for _, result := range s.captureErrors {
+		captureErr = errors.Join(captureErr, result)
+	}
+	s.captureErrors = nil
 	s.captureMu.Unlock()
 	return errors.Join(err, captureErr)
 }
 
 // Send is called by one job at a time; partial writes count as sent bytes.
 func (s *Session) Send(ctx context.Context, data []byte) error {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
 	for len(data) != 0 {
 		if err := ctx.Err(); err != nil {
 			return err

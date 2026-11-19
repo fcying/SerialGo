@@ -309,10 +309,10 @@ func TestCompactControlsStayInsidePanels(t *testing.T) {
 					t.Errorf("baud selector is not fitted to the seven-digit value: bounds=%+v expectedWidth=%.1f", baudPicker.Bounds, expectedPickerWidth)
 				}
 				settingsButton, settingsFound := tt.AccessByRole(gui.RoleButton, s.tr("串口设置", "Port settings"))
-				indicator, indicatorFound := tt.Find(s.tr("串口已关闭", "Serial port closed"))
+				tools, toolsFound := tt.AccessByRole(gui.RoleMenuButton, s.tr("工具", "Tools"))
 				open, openFound := tt.AccessByRole(gui.RoleButton, s.tr("打开", "Open"))
-				if !settingsFound || !indicatorFound || !openFound {
-					t.Fatal("connection action row is missing Settings, status light, or Open")
+				if !settingsFound || !toolsFound || !openFound {
+					t.Fatal("connection card is missing Settings, Tools, or Open")
 				}
 				portRight := portPicker.Bounds.X + portPicker.Bounds.W
 				settingsRight := settingsButton.Bounds.X + settingsButton.Bounds.W
@@ -326,11 +326,12 @@ func TestCompactControlsStayInsidePanels(t *testing.T) {
 					settingsButton.Bounds.X+settingsButton.Bounds.W > connectionPanel.X+connectionPanel.W {
 					t.Errorf("Settings must fit after the baud selector on the same row: baud=%+v settings=%+v panel=%+v", baudPicker.Bounds, settingsButton.Bounds, connectionPanel)
 				}
-				indicatorCenter := indicator.Y + indicator.H/2
-				openCenter := open.Bounds.Y + open.Bounds.H/2
-				if indicatorCenter < openCenter-1 || indicatorCenter > openCenter+1 ||
-					indicator.X+indicator.W > open.Bounds.X || open.Bounds.X+open.Bounds.W > connectionPanel.X+connectionPanel.W {
-					t.Errorf("status light must sit immediately before Open: indicator=%+v open=%+v panel=%+v", indicator, open.Bounds, connectionPanel)
+				if tools.Bounds.W != controlHeight || tools.Bounds.H != controlHeight || tools.Bounds.Y != open.Bounds.Y ||
+					tools.Bounds.X+tools.Bounds.W+controlGap != open.Bounds.X {
+					t.Errorf("Tools must be square and immediately left of Open: tools=%+v open=%+v", tools.Bounds, open.Bounds)
+				}
+				if tools.Bounds.X != portPicker.Bounds.X || open.Bounds.X+open.Bounds.W != settingsRight {
+					t.Errorf("Tools and Open must span the connection card content: tools=%+v open=%+v port=%+v", tools.Bounds, open.Bounds, portPicker.Bounds)
 				}
 				if open.Bounds.Y <= baudPicker.Bounds.Y {
 					t.Errorf("Open row must follow the baud selector row: baud=%+v open=%+v", baudPicker.Bounds, open.Bounds)

@@ -209,3 +209,23 @@ func (s *App) SetLanguage(language string) bool {
 	s.SaveUsedSettings()
 	return true
 }
+
+// SetCurveSidebarWidth records a preference without scheduling a settings write.
+func (s *App) SetCurveSidebarWidth(width float32) bool {
+	width = config.NormalizeCurveSidebarWidth(width)
+	if width == config.NormalizeCurveSidebarWidth(s.Settings.CurveSidebarWidth) {
+		return false
+	}
+	s.Settings.CurveSidebarWidth = width
+	s.SettingsChanged()
+	return true
+}
+
+func (s *App) SetCurveWindowGeometry(geometry config.WindowSettings) {
+	if s.Settings.CurveWindow == geometry {
+		return
+	}
+	s.Settings.CurveWindow = geometry
+	s.SettingsChanged()
+	s.SaveUsedSettings()
+}

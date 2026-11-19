@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -235,7 +236,7 @@ func TestSessionCaptureQueueDoesNotBlockAndReportsOverflow(t *testing.T) {
 	if !bytes.Equal(got, want) || !closed {
 		t.Fatalf("overflow did not drain queued bytes and close capture: bytes=%d closed=%v", len(got), closed)
 	}
-	s.acknowledgeCaptureError()
+	s.acknowledgeCaptureError(event.capture)
 }
 
 func TestCaptureQueueTracksBytesAcrossWraparound(t *testing.T) {
@@ -371,5 +372,107 @@ func TestDisplayQueueOverflowDoesNotAffectCapture(t *testing.T) {
 	events, rx, tx := s.drainDisplay()
 	if len(events) != displayBufferSize/receiveBufferSize || rx != uint64(chunks*receiveBufferSize) || tx != 0 {
 		t.Fatalf("UI queue retained %d events and counted RX=%d TX=%d", len(events), rx, tx)
+	}
+}
+
+// barrierSessionPort can complete Close while its final Read and Write are still
+// outstanding. No real serial device or timing-dependent producer is involved.
+type barrierSessionPort struct {
+	readStarted  chan struct{}
+	writeStarted chan struct{}
+	closeStarted chan struct{}
+	releaseRead  chan struct{}
+	releaseWrite chan struct{}
+	readData     []byte
+	writeErr     error
+	closeErr     error
+	closeOnce    sync.Once
+}
+
+func newBarrierSessionPort() *barrierSessionPort {
+	return &barrierSessionPort{
+		readStarted: make(chan struct{}), writeStarted: make(chan struct{}), closeStarted: make(chan struct{}),
+		releaseRead: make(chan struct{}), releaseWrite: make(chan struct{}), readData: []byte("final RX"),
+	}
+}
+
+func (p *barrierSessionPort) Read(data []byte) (int, error) {
+	close(p.readStarted)
+	<-p.releaseRead
+	return copy(data, p.readData), io.EOF
+}
+
+func (p *barrierSessionPort) Write(data []byte) (int, error) {
+	close(p.writeStarted)
+	<-p.releaseWrite
+	return len(data), p.writeErr
+}
+
+func (p *barrierSessionPort) SetLines(bool, bool) error { return nil }
+
+func (p *barrierSessionPort) Close() error {
+	p.closeOnce.Do(func() { close(p.closeStarted) })
+	return p.closeErr
+}
+
+func releaseSessionBarrier(barrier chan struct{}) {
+	select {
+	case <-barrier:
+	default:
+		close(barrier)
+	}
+}
+
+func awaitSessionBarrier(t *testing.T, barrier <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-barrier:
+	case <-time.After(captureTestTimeout):
+		t.Fatal("session worker did not reach its barrier")
+	}
+}
+
+func TestSessionCloseWaitsForFinalReadAndWriteRecords(t *testing.T) {
+	port := newBarrierSessionPort()
+	p := newSession(port, 115200, nil)
+	defer func() {
+		releaseSessionBarrier(port.releaseRead)
+		releaseSessionBarrier(port.releaseWrite)
+		_ = p.Close()
+	}()
+	awaitSessionBarrier(t, port.readStarted)
+	sent := make(chan error, 1)
+	go func() { sent <- p.Send(context.Background(), []byte("final TX")) }()
+	awaitSessionBarrier(t, port.writeStarted)
+	closed := make(chan error, 1)
+	go func() { closed <- p.Close() }()
+	awaitSessionBarrier(t, port.closeStarted)
+	releaseSessionBarrier(port.releaseRead)
+	awaitSessionBarrier(t, p.readDone)
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned before Write emitted its final record: %v", err)
+	default:
+	}
+	releaseSessionBarrier(port.releaseWrite)
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(captureTestTimeout):
+		t.Fatal("Close did not join the final writer")
+	}
+	select {
+	case err := <-sent:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(captureTestTimeout):
+		t.Fatal("Send did not finish")
+	}
+	records, rx, tx := p.drainDisplay()
+	if len(records) != 2 || rx != uint64(len("final RX")) || tx != uint64(len("final TX")) {
+		t.Fatalf("Close left incomplete terminal records: records=%d rx=%d tx=%d", len(records), rx, tx)
 	}
 }

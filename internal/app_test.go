@@ -784,3 +784,351 @@ func TestShutdownWaitsForLogSaveWithDiscardedCompletion(t *testing.T) {
 		t.Fatalf("shutdown abandoned pending file write: %q %v", data, err)
 	}
 }
+
+func TestDisconnectDeliversFinalReadWriteAndSendingJobRecords(t *testing.T) {
+	port := newBarrierSessionPort()
+	p := newSession(port, 115200, nil)
+	v := &appTestView{callbacks: make(chan func(), 8)}
+	s := &App{view: v, session: p, stopPump: make(chan struct{}), closed: make(chan struct{})}
+	sendReturned := make(chan struct{})
+	releaseTerminal := make(chan struct{})
+	defer func() {
+		releaseSessionBarrier(port.releaseRead)
+		releaseSessionBarrier(port.releaseWrite)
+		releaseSessionBarrier(releaseTerminal)
+		_ = s.Shutdown()
+	}()
+	awaitSessionBarrier(t, port.readStarted)
+	s.startSending(Text{ZH: "发送", EN: "Send"}, "", func(ctx context.Context, session *Session) error {
+		err := session.Send(ctx, []byte("final TX"))
+		close(sendReturned)
+		<-releaseTerminal
+		// A sending job can still produce data after its final Send returned.
+		session.emit(Event{Data: []byte("terminal TX"), Sent: true})
+		return err
+	})
+	awaitSessionBarrier(t, port.writeStarted)
+	s.TogglePort()
+	awaitSessionBarrier(t, port.closeStarted)
+	if s.Connected() || !s.PortBusy || len(v.records) != 0 {
+		t.Fatal("disconnect did not detach the old session before its final producers")
+	}
+	releaseSessionBarrier(port.releaseRead)
+	releaseSessionBarrier(port.releaseWrite)
+	awaitSessionBarrier(t, sendReturned)
+	select {
+	case <-v.callbacks:
+		t.Fatal("disconnect posted completion before the sending job reached terminal state")
+	default:
+	}
+	releaseSessionBarrier(releaseTerminal)
+	s.jobs.Wait()
+	for len(v.callbacks) > 0 {
+		awaitAppCallback(t, v)
+	}
+	if s.Rx != uint64(len("final RX")) || s.Tx != uint64(len("final TX")+len("terminal TX")) || len(v.records) != 3 {
+		t.Fatalf("final records were lost: rx=%d tx=%d records=%d", s.Rx, s.Tx, len(v.records))
+	}
+	if s.PortBusy || s.Sending() || s.Connected() || s.StatusError || p.hasDisplay() {
+		t.Fatal("terminal delivery retained busy state, redrained errors, or left queued data")
+	}
+	if err := s.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type blockingCaptureCloseFile struct {
+	*os.File
+	closeStarted chan struct{}
+	releaseClose chan struct{}
+}
+
+func (f *blockingCaptureCloseFile) Close() error {
+	close(f.closeStarted)
+	<-f.releaseClose
+	return f.File.Close()
+}
+
+func TestDisconnectProtectsCaptureAndHardLinkUntilFileCloseCompletes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "capture.bin")
+	alias := filepath.Join(filepath.Dir(path), "capture-link.bin")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(file, "original"); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := os.Link(path, alias); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	blocked := &blockingCaptureCloseFile{File: file, closeStarted: make(chan struct{}), releaseClose: make(chan struct{})}
+	p := NewSession(&serialport.Port{}, 115200)
+	v := &appTestView{callbacks: make(chan func(), 8)}
+	s := &App{view: v, session: p, stopPump: make(chan struct{}), closed: make(chan struct{}), CapturePath: path}
+	defer func() {
+		releaseSessionBarrier(blocked.releaseClose)
+		_ = s.Shutdown()
+	}()
+	if err := p.setCapture(blocked); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	p.enqueueCapture([]byte("pending"))
+	s.disconnect()
+	awaitSessionBarrier(t, blocked.closeStarted)
+	if s.CapturePath != "" || s.FileBusy || !s.PortBusy {
+		t.Fatal("capture close did not expose the expected detached UI state")
+	}
+	for _, target := range []string{path, alias} {
+		s.SaveLog(target, "must not overwrite")
+		if !s.FileBusy {
+			t.Fatal("export was disabled instead of checking its destination")
+		}
+		awaitAppCallback(t, v)
+		if s.FileBusy || s.Status.EN != "Do not overwrite the active receive file" {
+			t.Fatalf("closing capture was not protected: %q", s.Status.EN)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil || string(data) != "originalpending" {
+			t.Fatalf("export truncated the closing capture: %q %v", data, err)
+		}
+	}
+	releaseSessionBarrier(blocked.releaseClose)
+	awaitAppCallback(t, v)
+	if s.PortBusy {
+		t.Fatal("completed disconnect kept the port busy")
+	}
+	// Protection ends with the actual close, even if its UI status was superseded.
+	s.SaveLog(alias, "after close")
+	awaitAppCallback(t, v)
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "after close" {
+		t.Fatalf("completed close retained a stale export reservation: %q %v", data, err)
+	}
+}
+
+func TestCaptureTerminalErrorsSurviveDiscardedFrontendCallbacks(t *testing.T) {
+	for _, disconnect := range []bool{false, true} {
+		for _, report := range []bool{false, true} {
+			name := "stop"
+			if disconnect {
+				name = "disconnect"
+			}
+			if report {
+				name += "-reported"
+			} else {
+				name += "-discarded"
+			}
+			t.Run(name, func(t *testing.T) {
+				writeErr := errors.New("terminal flush failure")
+				file := &captureTestFile{writeErr: writeErr, writeStarted: make(chan struct{}, 1), blockWrite: make(chan struct{})}
+				p := NewSession(&serialport.Port{}, 115200)
+				v := &appTestView{callbacks: make(chan func(), 8)}
+				s := &App{view: v, session: p, stopPump: make(chan struct{}), closed: make(chan struct{}), CapturePath: "capture.bin"}
+				defer func() {
+					releaseSessionBarrier(file.blockWrite)
+					_ = s.Shutdown()
+				}()
+				if err := p.setCapture(file); err != nil {
+					t.Fatal(err)
+				}
+				p.captureMu.Lock()
+				capture := p.captureWorker
+				p.captureMu.Unlock()
+				p.enqueueCapture([]byte("buffered"))
+				if disconnect {
+					s.disconnect()
+				} else {
+					s.StopCapture()
+				}
+				awaitSessionBarrier(t, capture.stop)
+				awaitSessionBarrier(t, file.writeStarted)
+				releaseSessionBarrier(file.blockWrite)
+				if report {
+					awaitAppCallback(t, v)
+					if !s.StatusError || !strings.Contains(s.Status.EN, writeErr.Error()) {
+						t.Fatalf("terminal failure was not reported: %q", s.Status.EN)
+					}
+				}
+				err := s.Shutdown()
+				if report && err != nil {
+					t.Fatalf("Shutdown repeated an acknowledged UI error: %v", err)
+				}
+				if !report && !errors.Is(err, writeErr) {
+					t.Fatalf("Shutdown lost the discarded terminal error: %v", err)
+				}
+				_, closed := file.snapshot()
+				if !closed {
+					t.Fatal("Shutdown left the terminal capture file open")
+				}
+			})
+		}
+	}
+}
+
+func TestDisconnectCompletionDoesNotApplyOldErrorsToNewConnection(t *testing.T) {
+	closeErr := errors.New("old close failure")
+	port := newBarrierSessionPort()
+	port.closeErr = closeErr
+	p := newSession(port, 115200, nil)
+	v := &appTestView{callbacks: make(chan func(), 8)}
+	s := &App{view: v, session: p, stopPump: make(chan struct{}), closed: make(chan struct{})}
+	defer func() {
+		releaseSessionBarrier(port.releaseRead)
+		releaseSessionBarrier(port.releaseWrite)
+		_ = s.Shutdown()
+	}()
+	awaitSessionBarrier(t, port.readStarted)
+	s.disconnect()
+	awaitSessionBarrier(t, port.closeStarted)
+	releaseSessionBarrier(port.releaseRead)
+	s.jobs.Wait()
+	// Simulate a newer connection accepting ownership before an old callback.
+	current := NewSession(&serialport.Port{}, 115200)
+	s.session, s.stopPump = current, make(chan struct{})
+	s.PortBusy = true
+	s.CapturePath = "new capture.bin"
+	s.Status = Text{EN: "new connection"}
+	awaitAppCallback(t, v)
+	if s.session != current || !s.PortBusy || s.CapturePath != "new capture.bin" || s.Status.EN != "new connection" || s.StatusError {
+		t.Fatal("old disconnect completion mutated the new connection")
+	}
+	if s.Rx != uint64(len("final RX")) || len(v.records) != 1 {
+		t.Fatal("isolating old session errors also discarded its final receive record")
+	}
+	if err := s.Shutdown(); !errors.Is(err, closeErr) {
+		t.Fatalf("unreported stale-session close error was lost: %v", err)
+	}
+}
+
+func TestStaleCaptureFailureKeepsReplacementDestinationProtected(t *testing.T) {
+	p := &Session{ctx: context.Background(), events: make(chan Event, 4)}
+	failed := &captureTestFile{writeErr: errors.New("previous capture failed")}
+	if err := p.setCapture(failed); err != nil {
+		t.Fatal(err)
+	}
+	p.enqueueCapture(make([]byte, captureBufferSize))
+	var old Event
+	select {
+	case old = <-p.Events():
+	case <-time.After(captureTestTimeout):
+		t.Fatal("previous capture did not report its failure")
+	}
+	if err := p.SetCapture(nil); err != nil {
+		t.Fatal(err)
+	}
+	v := &appTestView{callbacks: make(chan func(), 8)}
+	s := &App{view: v, session: p}
+	path := filepath.Join(t.TempDir(), "replacement.bin")
+	defer func() {
+		s.jobs.Wait()
+		_ = p.SetCapture(nil)
+	}()
+	s.CaptureTarget()(path)
+	awaitAppCallback(t, v)
+	p.events <- old
+	s.drain(p)
+	if s.CapturePath != path || !slices.Contains(s.capturePaths(), path) {
+		t.Fatal("an old failure cleared the replacement capture reservation")
+	}
+	s.SaveLog(path, "must not overwrite")
+	awaitAppCallback(t, v)
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) != 0 || s.Status.EN != "Do not overwrite the active receive file" {
+		t.Fatalf("replacement capture was not protected: %q %v", data, err)
+	}
+}
+
+func TestCaptureAcknowledgementKeepsOtherUnreportedFailures(t *testing.T) {
+	port := newBarrierSessionPort()
+	p := newSession(port, 115200, nil)
+	defer func() {
+		releaseSessionBarrier(port.releaseRead)
+		releaseSessionBarrier(port.releaseWrite)
+		_ = p.Close()
+	}()
+	awaitSessionBarrier(t, port.readStarted)
+	firstErr := errors.New("first capture failure")
+	secondErr := errors.New("second capture failure")
+	var failures []Event
+	for _, writeErr := range []error{firstErr, secondErr} {
+		if err := p.setCapture(&captureTestFile{writeErr: writeErr}); err != nil {
+			t.Fatal(err)
+		}
+		p.enqueueCapture(make([]byte, captureBufferSize))
+		select {
+		case event := <-p.Events():
+			if !errors.Is(event.Err, writeErr) {
+				t.Fatalf("capture failure = %v, want %v", event.Err, writeErr)
+			}
+			failures = append(failures, event)
+		case <-time.After(captureTestTimeout):
+			t.Fatal("capture worker did not report its failure")
+		}
+	}
+	p.acknowledgeCaptureError(failures[0].capture)
+	releaseSessionBarrier(port.releaseRead)
+	err := p.Close()
+	if errors.Is(err, firstErr) || !errors.Is(err, secondErr) {
+		t.Fatalf("Close did not retain exactly the unacknowledged capture error: %v", err)
+	}
+}
+
+func TestClearReceiveLogDiscardsDetachedSessionDataBeforeFinalDelivery(t *testing.T) {
+	for _, settled := range []bool{false, true} {
+		name := "close-blocked"
+		if settled {
+			name = "completion-queued"
+		}
+		t.Run(name, func(t *testing.T) {
+			port := newBarrierSessionPort()
+			p := newSession(port, 115200, nil)
+			v := &appTestView{callbacks: make(chan func(), 8)}
+			s := &App{view: v, session: p, stopPump: make(chan struct{}), closed: make(chan struct{}), Rx: 123, Tx: 456}
+			defer func() {
+				releaseSessionBarrier(port.releaseRead)
+				releaseSessionBarrier(port.releaseWrite)
+				_ = s.Shutdown()
+			}()
+			awaitSessionBarrier(t, port.readStarted)
+			p.emit(Event{Data: []byte("queued RX")})
+			p.emit(Event{Data: []byte("queued TX"), Sent: true})
+			s.disconnect()
+			awaitSessionBarrier(t, port.closeStarted)
+			// Include data queued after detach but before the user's clear.
+			p.emit(Event{Data: []byte("detached TX"), Sent: true})
+			if settled {
+				releaseSessionBarrier(port.releaseRead)
+				s.jobs.Wait()
+			}
+			if s.Connected() || !s.PortBusy {
+				t.Fatal("test did not clear during the detached session's lifetime")
+			}
+			s.ClearReceiveLog()
+			if s.Rx != 0 || s.Tx != 0 || p.hasDisplay() {
+				t.Fatal("clear retained detached session records or byte counts")
+			}
+			var wantRx, wantTx uint64
+			wantRecords := 0
+			if !settled {
+				// Just like an active connection, new data after clear survives.
+				p.emit(Event{Data: []byte("after-clear TX"), Sent: true})
+				releaseSessionBarrier(port.releaseRead)
+				s.jobs.Wait()
+				wantRx = uint64(len("final RX"))
+				wantTx = uint64(len("after-clear TX"))
+				wantRecords = 2
+			}
+			awaitAppCallback(t, v)
+			if s.Rx != wantRx || s.Tx != wantTx || len(v.records) != wantRecords {
+				t.Fatalf("final delivery resurrected cleared data: rx=%d tx=%d records=%d", s.Rx, s.Tx, len(v.records))
+			}
+			if s.PortBusy || len(s.closingSessions) != 0 || p.hasDisplay() {
+				t.Fatal("final delivery retained the detached session")
+			}
+		})
+	}
+}

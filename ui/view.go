@@ -2,11 +2,11 @@ package ui
 
 import (
 	"fmt"
-	"math"
 
 	"github.com/fcying/SerialGo/config"
 
 	"github.com/egoist/mygo/ui"
+	"github.com/egoist/mygo/ui/editor"
 )
 
 var (
@@ -38,7 +38,6 @@ func (s *controller) view(c *ui.Context) {
 		s.receiveSplit = defaultShare
 	}
 	share := min(max(s.receiveSplit, minReceiveHeight/available*100), defaultShare)
-	s.log.viewportHeight = available * share / 100
 	connectionWidth := s.connectionRowContentWidth(c) + panelChromeWidth
 	receiveOptionsWidth := s.receiveOptionsPanelWidth(c)
 	fileWidth := float32(184)
@@ -79,35 +78,74 @@ func (s *controller) view(c *ui.Context) {
 	s.presetDeleteDialog(c)
 }
 
+func (l *receiveLog) hasSelection() bool {
+	for _, selection := range l.view.Selections() {
+		if selection.Anchor != selection.Head {
+			return true
+		}
+	}
+	return false
+}
+
+func (l *receiveLog) receiveInput(event ui.InputEvent) bool {
+	copyCommand := event.Kind == ui.InputCommand && event.Text == "copy"
+	copyKey := event.Kind == ui.InputKeyDown && (event.Mods == ui.Cmd && event.Key == ui.KeyC ||
+		event.Mods == ui.Ctrl && event.Key == ui.KeyInsert)
+	// Unlike a code editor, the log must not copy the caret's whole line.
+	return (copyCommand || copyKey) && !l.hasSelection()
+}
+
 func (s *controller) receivePane(c *ui.Context) {
 	p := s.settings
-	area := ui.TextAreaBuffer(c.Key("receive"), &s.log.text).Fill().MinHeight(80).Grow(1).ReadOnly(true).
-		Background(textAreaBackground).Font(config.NormalizeReceiveFont(p.ReceiveFont)).
-		FontSize(float32(config.NormalizeReceiveFontSize(p.ReceiveFontSize)) * 4 / 3).
-		TextColor(ui.Hex(config.NormalizeReceiveFontColor(p.ReceiveFontColor))).
-		TrackScroll(&s.log.scroll).Label(s.tr("接收窗口", "Receive log"))
-	if s.log.scrollToEnd {
-		// A press clears the selection before release finishes the gesture.
-		// Following now would change which text is under the pointer.
-		button, pressed := area.PressedButton()
-		if pressed && button == 0 {
-			return
-		}
-		selectionStart, selectionEnd := area.TextSelection()
-		if selectionStart != selectionEnd {
-			// Keep the pending follow request until the selection is cleared.
-			return
-		}
-		// Buffer updates reveal the old caret unless it follows the new tail.
-		end := s.log.text.Len()
-		area.SetTextSelection(end, end)
-		s.log.scroll.Y = math.MaxFloat32
-		s.log.scrollToEnd = false
-		s.log.preserveScroll = false
-	} else if s.log.preserveScroll {
-		area.SetTextSelection(s.log.scrollAnchor, s.log.scrollAnchor)
-		s.log.preserveScroll = false
+	l := &s.log
+	l.view.Buffer = &l.text
+	l.view.ReadOnly = true
+	l.view.SoftWrap = !p.ReceiveHex
+	l.view.LineNumbers = editor.LineNumbersOff
+	l.view.Whitespace = editor.WhitespaceNone
+	l.view.NoIndentGuides = true
+	l.view.NoFolding = true
+	l.view.NoActiveLine = true
+	l.view.NoScrollPastEnd = true
+	l.view.ScrollMargin = -1
+	l.view.LineHeight = 1
+	l.view.Font = ui.Font{
+		Family: config.NormalizeReceiveFont(p.ReceiveFont),
+		Size:   float32(config.NormalizeReceiveFontSize(p.ReceiveFontSize)) * 4 / 3,
 	}
+	l.theme.Background = textAreaBackground
+	l.theme.Text = ui.Hex(config.NormalizeReceiveFontColor(p.ReceiveFontColor))
+	l.theme.Cursor = textAreaBackground
+	l.view.Theme = &l.theme
+	l.view.OnInput = l.receiveInput
+	l.view.Label = s.tr("接收窗口", "Receive log")
+	area := editor.View(c.Key("receive"), &l.view).Fill().MinHeight(80).Grow(1)
+	area.ContextMenu(func(m *ui.Menu) {
+		hasSelection := l.hasSelection()
+		copyChosen := m.Item(s.tr("复制", "Copy")).Shortcut(ui.Cmd, ui.KeyC).Disabled(!hasSelection).Chosen()
+		if copyChosen && hasSelection {
+			l.view.Run(editor.Copy)
+		}
+		selectAll := m.Item(s.tr("全选", "Select all")).Shortcut(ui.Cmd, ui.KeyA).Chosen()
+		if selectAll {
+			l.view.Run(editor.SelectAll)
+		}
+	})
+	if !l.scrollToEnd {
+		return
+	}
+	// Follow only after the selection and any active gesture are cleared.
+	// Remote buffer edits preserve the viewport independently of the caret.
+	button, pressed := area.PressedButton()
+	if pressed && button == 0 {
+		return
+	}
+	if l.hasSelection() {
+		return
+	}
+	end := l.text.Len()
+	l.view.Select(end, end)
+	l.scrollToEnd = false
 }
 
 func (s *controller) filePanel(c *ui.Context, width float32) {
@@ -167,14 +205,15 @@ func (s *controller) optionsDialog(c *ui.Context) {
 			ui.Text(c.Key("display-heading"), s.tr("数据显示", "Data display")).FontWeight(600)
 			ui.Row(c.Key("encoding-options")).Gap(tightGap).AlignItems(ui.Center).Children(func() {
 				ui.Text(c.Key("encoding-label"), s.tr("编码", "Encoding"))
-				ui.Select(c.Key("encoding"), &p.Encoding, encodings).Width(88).Height(controlHeight).PaddingY(controlPadY).
-					Label(s.tr("文本编码", "Text encoding")).OnChange(s.applyDisplaySettings)
+				label := s.tr("文本编码", "Text encoding")
+				compactDisplaySelect(c.Key("encoding"), &p.Encoding, encodings, label, label, s.applyDisplaySettings)
 			})
 			displayBufferOptions(c.Key("buffer-limit-options"), p, s.applyDisplaySettings)
+			s.receiveHexLineWidthOptions(c.Key("hex-line-width-options"))
 			s.receiveFontButton(c)
 			ui.Row(c.Key("packet-options")).Gap(groupGap).AlignItems(ui.Center).Children(func() {
 				ui.Text(c.Key("packet-label"), s.tr("时间戳分包超时", "Timestamp packet gap"))
-				ui.TextInput(c.Key("packet-gap"), &s.packetGapDraft).Width(55).Height(controlHeight).PaddingY(controlPadY).
+				ui.TextInput(c.Key("packet-gap"), &s.packetGapDraft).Width(55).Height(controlHeight).PaddingY(controlPadY).TextAlign(ui.Center).
 					Label(s.tr("时间戳分包超时 (ms)", "Timestamp packet gap (ms)")).OnChange(s.packetGapChanged)
 				ui.Text(c.Key("gap-ms"), "ms")
 			})
@@ -212,12 +251,6 @@ func (s *controller) receiveOptionsPanelWidth(c *ui.Context) float32 {
 func (s *controller) serialPanel(c *ui.Context, width float32) {
 	p := &s.settings.Port
 	open := s.app.Connected()
-	color := ui.Hex("#D32F2F")
-	state := s.tr("串口已关闭", "Serial port closed")
-	if open {
-		color = ui.Hex("#2E7D32")
-		state = s.tr("串口已打开", "Serial port open")
-	}
 	portRowWidth := s.connectionRowContentWidth(c)
 	ui.Column(c.Key("serial-panel")).Width(width).Basis(width).Shrink(0).FillHeight().Gap(controlGap).Padding(4, panelPaddingX).Radius(4).Background(panelBackground).Border(panelBorderWidth, c.Theme().Border).
 		Label(s.tr("连接控制", "Connection panel")).Children(func() {
@@ -230,12 +263,12 @@ func (s *controller) serialPanel(c *ui.Context, width float32) {
 				Label(s.tr("串口设置", "Port settings")).Tooltip(s.tr("配置数据位, 校验位, 停止位及 RTS/DTR", "Configure data bits, parity, stop bits, and RTS/DTR")).OnClick(s.openPortSettings)
 		})
 		ui.Row(c.Key("serial-actions")).FillWidth().Gap(controlGap).Children(func() {
-			ui.Box(c.Key("port-indicator")).Size(8, 8).Shrink(0).Radius(4).Background(color).Label(state).Tooltip(state)
+			s.toolsMenu(c.Key("tools"))
 			label := s.tr("打开", "Open")
 			if open {
 				label = s.tr("关闭", "Close")
 			}
-			ui.PrimaryButton(c.Key("open-port"), label).Width(0).Grow(1).MinWidth(60).Height(controlHeight).PaddingY(controlPadY).
+			ui.PrimaryButton(c.Key("open-port"), label).Width(0).MinWidth(0).Grow(1).Height(controlHeight).PaddingY(controlPadY).
 				Disabled(s.app.PortBusy || !open && (p.Name == "" || p.Baud == "")).OnClick(s.app.TogglePort)
 		})
 	})
