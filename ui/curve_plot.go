@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"time"
 
@@ -41,15 +42,96 @@ func clipCurveSegment(a, b internal.CurvePoint, x0, x1 float64) (internal.CurveP
 }
 
 type curveVisibleSegments struct {
-	points    []internal.CurvePoint
-	x0, x1    float64
-	nextIndex int
+	points         []internal.CurvePoint
+	blocks         []internal.CurveBlock
+	runs           []int
+	x0, x1         float64
+	nextIndex, end int
+}
+
+func newCurveVisibleSegments(series internal.CurveSeries, x0, x1 float64) curveVisibleSegments {
+	segments := curveVisibleSegments{points: series.Points, runs: series.TimeRuns, blocks: series.Blocks, x0: x0, x1: x1}
+	if len(segments.runs) == 0 {
+		segments.end = len(segments.points)
+	}
+	return segments
+}
+
+func curveTimeRunEnd(runs []int, pointCount int) int {
+	if len(runs) > 1 {
+		return runs[1]
+	}
+	return pointCount
+}
+
+func curveTimeWindow(points []internal.CurvePoint, x0, x1 float64) (first, end int) {
+	first = sort.Search(len(points), func(i int) bool { return points[i].X >= x0 })
+	end = first + sort.Search(len(points)-first, func(i int) bool { return points[first+i].X > x1 })
+	return first, end
+}
+
+func (segments *curveVisibleSegments) nextRun() bool {
+	for len(segments.runs) != 0 {
+		lo, hi := segments.runs[0], curveTimeRunEnd(segments.runs, len(segments.points))
+		segments.runs = segments.runs[1:]
+		points := segments.points[lo:hi]
+		if points[0].X > segments.x1 || points[len(points)-1].X < segments.x0 {
+			continue
+		}
+		first, end := curveTimeWindow(points, segments.x0, segments.x1)
+		segments.nextIndex = lo + first
+		// The existing segment logic reads the predecessor. Visit one point
+		// to the right as well, including a segment spanning the entire window.
+		segments.end = min(lo+end+1, hi)
+		return true
+	}
+	return false
+}
+
+// nextBlock consumes the largest complete summary starting at the point just
+// handled by next. A nil column allows any width (for exact bounds); rendering
+// requires both endpoints to project to the same column. The summary's Xs are
+// nondecreasing, so these endpoints also bound every point it would skip.
+func (segments *curveVisibleSegments) nextBlock(column func(float64) int) (internal.CurveBlock, bool) {
+	start := segments.nextIndex - 1
+	blocks := segments.blocks
+	if len(blocks) != 0 && blocks[0].Start < start {
+		// Jump over off-window blocks and descendants of a consumed summary.
+		i := sort.Search(len(blocks), func(i int) bool { return blocks[i].Start >= start })
+		blocks = blocks[i:]
+		segments.blocks = blocks
+	}
+	if len(blocks) == 0 || blocks[0].Start != start || segments.points[start].X < segments.x0 {
+		return internal.CurveBlock{}, false
+	}
+	var firstColumn int
+	if column != nil {
+		firstColumn = column(segments.points[start].X)
+	}
+	for i, b := range blocks {
+		if b.Start != start {
+			break
+		}
+		segments.blocks = blocks[i+1:]
+		if b.End > segments.end || segments.points[b.End-1].X > segments.x1 {
+			continue
+		}
+		if column != nil && firstColumn != column(segments.points[b.End-1].X) {
+			continue
+		}
+		segments.nextIndex = b.End
+		return b, true
+	}
+	return internal.CurveBlock{}, false
 }
 
 // next emits clipped segments or isolated real samples without copying the series.
 // Breaks, invalid samples and backwards clocks all start a new path.
 func (segments *curveVisibleSegments) next() (internal.CurvePoint, internal.CurvePoint, bool) {
-	for segments.nextIndex < len(segments.points) {
+	for {
+		if segments.nextIndex == segments.end && !segments.nextRun() {
+			return internal.CurvePoint{}, internal.CurvePoint{}, false
+		}
 		index := segments.nextIndex
 		segments.nextIndex++
 		point := segments.points[index]
@@ -70,7 +152,6 @@ func (segments *curveVisibleSegments) next() (internal.CurvePoint, internal.Curv
 			return point, point, true
 		}
 	}
-	return internal.CurvePoint{}, internal.CurvePoint{}, false
 }
 
 func curvePointTime(seconds float64) time.Time {
@@ -112,6 +193,14 @@ func curveHoverTime(seconds float64, deviceTime bool) string {
 func (v *curveViewState) bounds() (curveBounds, bool) {
 	bounds := curveBounds{x0: math.Inf(1), x1: math.Inf(-1), y0: math.Inf(1), y1: math.Inf(-1)}
 	for _, series := range v.snapshot.Series {
+		if len(series.TimeRuns) != 0 {
+			for i, first := range series.TimeRuns {
+				end := curveTimeRunEnd(series.TimeRuns[i:], len(series.Points))
+				bounds.x0 = min(bounds.x0, series.Points[first].X)
+				bounds.x1 = max(bounds.x1, series.Points[end-1].X)
+			}
+			continue
+		}
 		for _, point := range series.Points {
 			if !finiteCurvePoint(point) {
 				continue
@@ -136,13 +225,18 @@ func (v *curveViewState) bounds() (curveBounds, bool) {
 		bounds.x1 = bounds.x0 + 1
 	}
 	for _, series := range v.snapshot.Series {
-		segments := curveVisibleSegments{points: series.Points, x0: bounds.x0, x1: bounds.x1}
+		segments := newCurveVisibleSegments(series, bounds.x0, bounds.x1)
 		for {
 			start, end, visible := segments.next()
 			if !visible {
 				break
 			}
 			bounds.y0, bounds.y1 = min(bounds.y0, start.Y, end.Y), max(bounds.y1, start.Y, end.Y)
+			block, ok := segments.nextBlock(nil)
+			if ok {
+				bounds.y0 = min(bounds.y0, series.Points[block.Min].Y)
+				bounds.y1 = max(bounds.y1, series.Points[block.Max].Y)
+			}
 		}
 	}
 	if math.IsInf(bounds.y0, 1) {

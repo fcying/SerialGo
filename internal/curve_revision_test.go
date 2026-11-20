@@ -24,6 +24,8 @@ func cloneCurveRevisionSeries(series []CurveSeries) []CurveSeries {
 	cloned := slices.Clone(series)
 	for i := range cloned {
 		cloned[i].Points = slices.Clone(cloned[i].Points)
+		cloned[i].TimeRuns = slices.Clone(cloned[i].TimeRuns)
+		cloned[i].Blocks = slices.Clone(cloned[i].Blocks)
 	}
 	return cloned
 }
@@ -170,6 +172,8 @@ func TestCurveRevisionClearAndResetRefreshPlotAndStatistics(t *testing.T) {
 			wantSeries := cloneCurveRevisionSeries(snapshot.Series)
 			for i := range wantSeries {
 				wantSeries[i].Points = wantSeries[i].Points[:0]
+				wantSeries[i].TimeRuns = wantSeries[i].TimeRuns[:0]
+				wantSeries[i].Blocks = wantSeries[i].Blocks[:0]
 			}
 			revision, statsRevision := snapshot.Revision, snapshot.StatsRevision
 			deviceTime := true
@@ -208,6 +212,8 @@ func TestCurveRevisionClearAndResetRefreshPlotAndStatistics(t *testing.T) {
 			}
 			wantSeries[0].Points = []CurvePoint{{X: x, Y: 40}}
 			wantSeries[1].Points = []CurvePoint{{X: x, Y: 400}}
+			wantSeries[0].TimeRuns = []int{0}
+			wantSeries[1].TimeRuns = []int{0}
 			if snapshot.Revision == revision || snapshot.StatsRevision == statsRevision || snapshot.Lines != 1 || snapshot.Matched != 1 || snapshot.Invalid != 0 || snapshot.Oversize != 0 {
 				t.Fatalf("first record after reset did not update data and fresh statistics: %+v", snapshot)
 			}

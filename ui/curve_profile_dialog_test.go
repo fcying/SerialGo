@@ -18,25 +18,43 @@ func setCurveProfileDialogInput(t *testing.T, tt *gui.Tester, label, value strin
 	if !found || field.Disabled || field.Offscreen {
 		t.Fatalf("configuration field %q is unavailable", label)
 	}
-	tt.ClickAt(field.Bounds.X+field.Bounds.W/2, field.Bounds.Y+field.Bounds.H/2)
+	if !field.Focused {
+		tt.ClickAt(field.Bounds.X+field.Bounds.W/2, field.Bounds.Y+field.Bounds.H/2)
+	}
 	tt.Key(gui.Ctrl, gui.KeyA)
 	tt.Key(0, gui.KeyBackspace)
 	tt.Type(value)
+	field, found = tt.AccessByRole(gui.RoleTextField, label)
+	if !found || field.Value != value {
+		t.Fatalf("configuration field %q contains %q, want %q", label, field.Value, value)
+	}
+}
+
+func typeCurvePointLimitInput(t *testing.T, tt *gui.Tester, value string) string {
+	t.Helper()
+	setCurveProfileDialogInput(t, tt, "Samples per curve", "")
+	tt.Type(value)
+	field, found := tt.AccessByRole(gui.RoleTextField, "Samples per curve")
+	if !found {
+		t.Fatal("curve sample limit input is unavailable")
+	}
+	return field.Value
 }
 
 func TestCurveProfileDialogFitsSmallScaledWindows(t *testing.T) {
+	const height = 260 // Leave room for native window decorations at the minimum size.
 	for _, language := range []string{"en", "zh-CN"} {
 		for _, scale := range []float32{1, 1.25, 1.5} {
-			for _, width := range []int{300, 320} {
+			for _, width := range []int{280, 300} {
 				t.Run(fmt.Sprintf("%s_scale_%g_width_%d", language, scale, width), func(t *testing.T) {
 					s := newController(&internal.App{Settings: config.Settings{Language: language}})
 					s.curve = newCurveViewState(s.settings)
 					s.curve.profileEditor = newCurveProfileEdit(s.curve.draft)
-					tt := gui.NewTester(s.curveProfileEditorView, width, 200)
+					tt := gui.NewTester(s.curveProfileEditorView, width, height)
 					tt.SetScale(scale)
-					for _, label := range []string{s.tr("方案名称", "Profile name"), s.tr("时间正则 (可选)", "Time regex (optional)"), s.tr("时间倍率", "Time scale")} {
+					for _, label := range []string{s.tr("方案名称", "Profile name"), s.tr("时间正则 (可选)", "Time regex (optional)"), s.tr("时间倍率", "Time scale"), s.tr("每条曲线采样上限", "Samples per curve")} {
 						field, found := tt.AccessByRole(gui.RoleTextField, label)
-						if !found || field.Offscreen || field.Bounds.W <= 0 || field.Bounds.H <= 0 || field.Bounds.X < 0 || field.Bounds.Y < 0 || field.Bounds.X+field.Bounds.W > float32(width) || field.Bounds.Y+field.Bounds.H > 200 {
+						if !found || field.Offscreen || field.Bounds.W <= 0 || field.Bounds.H <= 0 || field.Bounds.X < 0 || field.Bounds.Y < 0 || field.Bounds.X+field.Bounds.W > float32(width) || field.Bounds.Y+field.Bounds.H > height {
 							t.Fatalf("configuration field %q exceeds the window: %+v", label, field.Bounds)
 						}
 					}
@@ -45,13 +63,13 @@ func TestCurveProfileDialogFitsSmallScaledWindows(t *testing.T) {
 							s.curve.profileEditor.error = localizedText{zh: strings.Repeat("无效的时间正则. ", 40), en: strings.Repeat("Invalid time regex. ", 40)}
 							tt.Frame()
 							errorBounds, found := tt.Find(s.tr(s.curve.profileEditor.error.zh, s.curve.profileEditor.error.en))
-							if !found || errorBounds.H <= 0 || errorBounds.Y < 0 || errorBounds.Y+errorBounds.H > 200 {
+							if !found || errorBounds.H <= 0 || errorBounds.Y < 0 || errorBounds.Y+errorBounds.H > height {
 								t.Fatalf("configuration error is hidden in the compact window: %+v", errorBounds)
 							}
 						}
 						for _, label := range []string{s.tr("取消", "Cancel"), s.tr("确定", "OK")} {
 							button, found := tt.AccessByRole(gui.RoleButton, label)
-							if !found || button.Offscreen || button.Bounds.W <= 0 || button.Bounds.H <= 0 || button.Bounds.X < 0 || button.Bounds.Y < 0 || button.Bounds.X+button.Bounds.W > float32(width) || button.Bounds.Y+button.Bounds.H > 200 {
+							if !found || button.Offscreen || button.Bounds.W <= 0 || button.Bounds.H <= 0 || button.Bounds.X < 0 || button.Bounds.Y < 0 || button.Bounds.X+button.Bounds.W > float32(width) || button.Bounds.Y+button.Bounds.H > height {
 								t.Fatalf("configuration action %q exceeds the window (error=%v): %+v", label, withError, button.Bounds)
 							}
 						}
@@ -245,6 +263,145 @@ func TestCurveProfileDialogConfirmationSwitchesClockAndPersists(t *testing.T) {
 	stored = readSavedSettings(t, path)
 	if s.app.SettingsDirty || stored.CurveProfiles[0].TimePattern != "" {
 		t.Fatal("restored system-time configuration was not persisted")
+	}
+}
+
+func TestCurveProfilePointLimitPasteRejectsOverflow(t *testing.T) {
+	s := newController(&internal.App{Settings: config.Settings{Language: "en"}})
+	s.curve = newCurveViewState(s.settings)
+	s.curve.profileEditor = newCurveProfileEdit(s.curve.draft)
+	tt := gui.NewTester(s.curveProfileEditorView, 280, 360)
+	setCurveProfileDialogInput(t, tt, "Samples per curve", "42")
+	for _, value := range []string{"000000001", "123456789", "100000000"} {
+		tt.Key(gui.Ctrl, gui.KeyA)
+		tt.SetClipboard(value)
+		tt.Key(gui.Ctrl, gui.KeyV)
+		field, found := tt.AccessByRole(gui.RoleTextField, "Samples per curve")
+		if !found || field.Value != "42" {
+			t.Fatalf("pasting %q changed the sample limit to %q", value, field.Value)
+		}
+	}
+	// A rejected paste retains the selection for a subsequent valid replacement.
+	tt.SetClipboard("12x3456")
+	tt.Key(gui.Ctrl, gui.KeyV)
+	field, found := tt.AccessByRole(gui.RoleTextField, "Samples per curve")
+	if !found || field.Value != "123456" {
+		t.Fatalf("filtered replacement = %q, want 123456", field.Value)
+	}
+	// Even a short paste must not be truncated when appended to existing text.
+	tt.Key(0, gui.KeyEnd)
+	tt.SetClipboard("789")
+	tt.Key(gui.Ctrl, gui.KeyV)
+	field, found = tt.AccessByRole(gui.RoleTextField, "Samples per curve")
+	if !found || field.Value != "123456" {
+		t.Fatalf("overflowing insertion changed sample limit to %q", field.Value)
+	}
+	tt.SetClipboard("78")
+	tt.Key(gui.Ctrl, gui.KeyV)
+	field, found = tt.AccessByRole(gui.RoleTextField, "Samples per curve")
+	ok, okFound := tt.AccessByRole(gui.RoleButton, "OK")
+	if !found || field.Value != "12345678" || !okFound || !ok.Disabled {
+		t.Fatalf("valid-length out-of-range insertion = %q, OK disabled = %v", field.Value, ok.Disabled)
+	}
+}
+
+func TestCurveProfileDialogChangesPreviewPointLimitAndPersists(t *testing.T) {
+	path := t.TempDir() + "/config.toml"
+	s, notified := settingsSaveFixture(t, path)
+	s.settings.CurveProfiles = []config.CurveProfile{config.NewCurveProfile("firmware")}
+	s.curve = newCurveViewState(s.settings)
+	s.startCurve()
+	s.curve.previewText = "VBAT=1000\nVBAT=2000\nVBAT=3000"
+	s.previewCurve()
+	s.curve.profileEditor = newCurveProfileEdit(s.curve.draft)
+	// Keep the input fully visible with validation messages and platform font metrics.
+	const dialogHeight = 360
+	tt := gui.NewTester(s.curveProfileEditorView, 280, dialogHeight)
+	field, found := tt.AccessByRole(gui.RoleTextField, "Samples per curve")
+	if !found || field.Offscreen || field.Value != "10000" {
+		t.Fatalf("new profile did not show the editable default: %+v", field)
+	}
+	setCurveProfileDialogInput(t, tt, "Samples per curve", "")
+	message, visible := tt.Find("Enter an integer in the range shown.")
+	ok, found := tt.AccessByRole(gui.RoleButton, "OK")
+	if !visible || message.H <= 0 || !found || !ok.Disabled || s.app.SettingsDirty || s.settings.CurveProfiles[0].PointLimit != config.DefaultCurvePointLimit {
+		t.Fatal("an empty sample limit should still block confirmation")
+	}
+	for _, tc := range []struct {
+		input, want string
+	}{
+		{"12x3", "123"},
+		{"-1", "1"},
+		{"0.5", "05"},
+	} {
+		got := typeCurvePointLimitInput(t, tt, tc.input)
+		if got != tc.want {
+			t.Fatalf("sample limit %q retained %q, want filtered value %q", tc.input, got, tc.want)
+		}
+		_, visible = tt.Find("Enter an integer in the range shown.")
+		ok, found = tt.AccessByRole(gui.RoleButton, "OK")
+		if visible || !found || ok.Disabled || s.app.SettingsDirty || s.settings.CurveProfiles[0].PointLimit != config.DefaultCurvePointLimit {
+			t.Fatalf("filtered sample limit %q did not remain a valid unconfirmed edit", tc.input)
+		}
+	}
+	before := s.curve.snapshot
+	for _, value := range []string{"1000001", "99999999"} {
+		setCurveProfileDialogInput(t, tt, "Samples per curve", value)
+		message, visible = tt.Find("Enter an integer in the range shown.")
+		ok, found = tt.AccessByRole(gui.RoleButton, "OK")
+		if !visible || message.H <= 0 || !found || !ok.Disabled {
+			t.Fatalf("out-of-range sample limit %q did not block confirmation", value)
+		}
+		s.confirmCurveProfileEditor()
+		if s.curve.profileEditor == nil || s.app.SettingsDirty || s.settings.CurveProfiles[0].PointLimit != config.DefaultCurvePointLimit || !reflect.DeepEqual(before, s.curve.snapshot) {
+			t.Fatalf("out-of-range sample limit %q changed settings or retained samples", value)
+		}
+	}
+	if got := typeCurvePointLimitInput(t, tt, strings.Repeat("9", 20)); got != "99999999" {
+		t.Fatalf("long sample limit retained %q, want eight digits", got)
+	}
+	ok, found = tt.AccessByRole(gui.RoleButton, "OK")
+	if !found || !ok.Disabled {
+		t.Fatal("truncated out-of-range limit should block confirmation")
+	}
+	setCurveProfileDialogInput(t, tt, "Samples per curve", "1000000")
+	ok, found = tt.AccessByRole(gui.RoleButton, "OK")
+	if !found || ok.Disabled {
+		t.Fatal("maximum sample count should enable confirmation")
+	}
+	_, visible = tt.Find("Enter an integer in the range shown.")
+	if visible {
+		t.Fatal("correcting the sample count did not clear the error")
+	}
+	setCurveProfileDialogInput(t, tt, "Samples per curve", "2")
+	err := tt.Click("OK")
+	if err != nil {
+		t.Fatal(err)
+	}
+	points := s.curve.snapshot.Series[0].Points
+	if s.curve.profileEditor != nil || !s.curve.running || !s.curve.previewing || len(points) != 2 || points[0].Y != 2 || points[1].Y != 3 {
+		t.Fatalf("new limit did not keep the latest preview points: %+v", s.curve.snapshot)
+	}
+	completeSettingsSave(t, s, notified)
+	stored := readSavedSettings(t, path)
+	if len(stored.CurveProfiles) != 1 || stored.CurveProfiles[0].PointLimit != 2 {
+		t.Fatalf("sample count was not saved in the profile: %+v", stored.CurveProfiles)
+	}
+	s.curve.profileEditor = newCurveProfileEdit(s.curve.draft)
+	tt = gui.NewTester(s.curveProfileEditorView, 280, dialogHeight)
+	setCurveProfileDialogInput(t, tt, "Samples per curve", "0")
+	err = tt.Click("OK")
+	if err != nil {
+		t.Fatal(err)
+	}
+	points = s.curve.snapshot.Series[0].Points
+	if s.curve.profileEditor != nil || !s.curve.running || !s.curve.previewing || len(points) != 3 || points[0].Y != 1 || points[2].Y != 3 {
+		t.Fatalf("unlimited preview did not show all samples: %+v", s.curve.snapshot)
+	}
+	completeSettingsSave(t, s, notified)
+	stored = readSavedSettings(t, path)
+	if len(stored.CurveProfiles) != 1 || stored.CurveProfiles[0].PointLimit != 0 {
+		t.Fatalf("unlimited setting was not saved: %+v", stored.CurveProfiles)
 	}
 }
 

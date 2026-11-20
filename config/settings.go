@@ -159,8 +159,16 @@ type fileSettings struct {
 
 func parseDefaultSettings(source string) (Settings, error) {
 	var settings Settings
-	stored := fileSettings{Settings: &settings}
-	if _, err := toml.Decode(source, &stored); err != nil {
+	stored := struct {
+		fileSettings
+		CurveProfiles []toml.Primitive
+	}{fileSettings: fileSettings{Settings: &settings}}
+	metadata, err := toml.Decode(source, &stored)
+	if err != nil {
+		return Settings{}, fmt.Errorf("invalid embedded default configuration: %w", err)
+	}
+	settings.CurveProfiles, err = decodeCurveProfiles(metadata, stored.CurveProfiles)
+	if err != nil {
 		return Settings{}, fmt.Errorf("invalid embedded default configuration: %w", err)
 	}
 	if len(stored.Presets) != defaultPresetCount || stored.Presets[0].Interval == "" {
@@ -176,6 +184,22 @@ func parseDefaultSettings(source string) (Settings, error) {
 	settings.CurveSidebarWidth = NormalizeCurveSidebarWidth(settings.CurveSidebarWidth)
 	settings.Presets = stored.Presets
 	return settings, nil
+}
+
+// Seed each profile before decoding so an absent limit differs from an explicit zero.
+func decodeCurveProfiles(metadata toml.MetaData, raw []toml.Primitive) ([]CurveProfile, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	profiles := make([]CurveProfile, len(raw))
+	for i, entry := range raw {
+		profiles[i].PointLimit = DefaultCurvePointLimit
+		err := metadata.PrimitiveDecode(entry, &profiles[i])
+		if err != nil {
+			return nil, err
+		}
+	}
+	return profiles, nil
 }
 
 func defaults() Settings {
@@ -230,6 +254,7 @@ func decode(path string, s *Settings) error {
 	stored := struct {
 		*Settings
 		Presets           []toml.Primitive
+		CurveProfiles     []toml.Primitive
 		LegacyCustomBauds []string `toml:"CustomBauds"`
 		LegacyCustomBaud  string   `toml:"CustomBaud"`
 		// Decode wider than the UI type so invalid numeric widths can be normalized.
@@ -238,6 +263,12 @@ func decode(path string, s *Settings) error {
 	metadata, err := toml.DecodeFile(path, &stored)
 	if err != nil {
 		return err
+	}
+	if metadata.IsDefined("CurveProfiles") {
+		s.CurveProfiles, err = decodeCurveProfiles(metadata, stored.CurveProfiles)
+		if err != nil {
+			return err
+		}
 	}
 	if !metadata.IsDefined("Window", "PositionSet") {
 		s.Window.PositionSet = s.Window.X != 0 || s.Window.Y != 0 ||
