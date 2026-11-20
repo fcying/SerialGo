@@ -30,7 +30,7 @@ func TestReceiveFontDialogAppliesAndPersistsSettings(t *testing.T) {
 	if err := tt.Click("Options"); err != nil {
 		t.Fatal(err)
 	}
-	if err := tt.Click("Font..."); err != nil {
+	if err := tt.Click("Configure receive font"); err != nil {
 		t.Fatal(err)
 	}
 	if _, found := tt.Find("Serial data preview 123"); !found {
@@ -58,7 +58,7 @@ func TestReceiveFontDialogAppliesAndPersistsSettings(t *testing.T) {
 		t.Fatalf("font preferences not persisted: (%q,%d,%q)", stored.ReceiveFont, stored.ReceiveFontSize, stored.ReceiveFontColor)
 	}
 
-	if err := tt.Click("Font..."); err != nil {
+	if err := tt.Click("Configure receive font"); err != nil {
 		t.Fatal(err)
 	}
 	s.receiveFontNameDraft = "serif"

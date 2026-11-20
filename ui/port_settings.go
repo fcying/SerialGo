@@ -44,7 +44,7 @@ func (s *controller) portSettingsDialog(c *ui.Context) {
 					portSettingSelect(c, "bits", s.tr("数据位", "Data bits"), &p.DataBits, dataBits, baudWidth, open)
 					portSettingSelect(c, "stops", s.tr("停止位", "Stop bits"), &p.StopBits, stopBits, baudWidth, open)
 					portSettingSelect(c, "parity", s.tr("校验位", "Parity"), &p.Parity, parities, baudWidth, open)
-					ui.Row(c.Key("control-lines")).FillWidth().Gap(pairedControlGap).Children(func() {
+					ui.Row(c.Key("control-lines")).FillWidth().Gap(pairedControlGap).Justify(ui.Center).Children(func() {
 						ui.Checkbox(c.Key("rts"), &p.RTS, "RTS")
 						ui.Checkbox(c.Key("dtr"), &p.DTR, "DTR")
 					})

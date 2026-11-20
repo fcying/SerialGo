@@ -29,6 +29,15 @@ type View interface {
 
 type Text struct{ ZH, EN string }
 
+type captureTarget struct {
+	path   string
+	opened <-chan struct{}
+}
+
+type terminalError struct {
+	err error
+}
+
 // App owns serial operations, operation state and persisted preferences.
 // Public state and commands are accessed only on the frontend thread.
 type App struct {
@@ -51,18 +60,25 @@ type App struct {
 	view              View
 	ports             []serialport.Info
 	session           *Session
+	closingSessions   map[*Session]struct{}
 	stopPump          chan struct{}
 	closed            chan struct{}
 	closing           bool
 	jobs              sync.WaitGroup
 	pendingPortMu     sync.Mutex
 	pendingPort       *serialport.Port
+	captureMu         sync.Mutex
+	captureTargets    map[*Session]*captureTarget
+	terminalMu        sync.Mutex
+	terminalErrors    map[*terminalError]struct{}
 	saver             *settingsSaver
 	settingsSaveError bool
 	cancelSend        context.CancelFunc
+	sendDone          <-chan struct{}
 	sendingFilePath   string
 	loadErrorReported bool
 	settingsWarning   Text
+	curve             curveEngine
 }
 
 func NewApp() *App {
@@ -119,8 +135,21 @@ func (s *App) Shutdown() error {
 		s.session = nil
 		close(s.stopPump)
 		shutdownErr = errors.Join(shutdownErr, p.Close())
+		s.curveDisconnected()
 	}
 	s.jobs.Wait()
+	s.closingSessions = nil
+	// Workers retain terminal errors before posting their optional UI callbacks.
+	// Only callbacks that actually report an error acknowledge it.
+	s.terminalMu.Lock()
+	for result := range s.terminalErrors {
+		shutdownErr = errors.Join(shutdownErr, result.err)
+	}
+	s.terminalErrors = nil
+	s.terminalMu.Unlock()
+	s.captureMu.Lock()
+	s.captureTargets = nil
+	s.captureMu.Unlock()
 	s.pendingPortMu.Lock()
 	pendingPort := s.pendingPort
 	s.pendingPort = nil
@@ -129,6 +158,85 @@ func (s *App) Shutdown() error {
 		_ = pendingPort.Close()
 	}
 	return errors.Join(shutdownErr, s.FlushSettings())
+}
+
+func (s *App) retainTerminalError(err error) *terminalError {
+	if err == nil {
+		return nil
+	}
+	result := &terminalError{err: err}
+	s.terminalMu.Lock()
+	if s.terminalErrors == nil {
+		s.terminalErrors = make(map[*terminalError]struct{})
+	}
+	s.terminalErrors[result] = struct{}{}
+	s.terminalMu.Unlock()
+	return result
+}
+
+func (s *App) acknowledgeTerminalError(result *terminalError) {
+	s.terminalMu.Lock()
+	delete(s.terminalErrors, result)
+	s.terminalMu.Unlock()
+}
+
+// Capture reservations outlive CapturePath and are released only after the file
+// worker has closed. A new open gets its own token so stale completions cannot
+// release a later capture's destination.
+func (s *App) protectCapture(p *Session, path string, opened <-chan struct{}) *captureTarget {
+	s.captureMu.Lock()
+	defer s.captureMu.Unlock()
+	target := s.captureTargets[p]
+	if opened != nil || target == nil && path != "" {
+		target = &captureTarget{path: path, opened: opened}
+		if s.captureTargets == nil {
+			s.captureTargets = make(map[*Session]*captureTarget)
+		}
+		s.captureTargets[p] = target
+	}
+	return target
+}
+
+// Failure events can outlive a stopped capture and must not clear a replacement.
+func (s *App) failedCaptureIsCurrent(p *Session, worker *captureWriter) bool {
+	if worker == nil {
+		return true
+	}
+	s.captureMu.Lock()
+	target := s.captureTargets[p]
+	s.captureMu.Unlock()
+	if target != nil && target.opened != nil {
+		select {
+		case <-target.opened:
+		default:
+			return false
+		}
+	}
+	p.captureMu.Lock()
+	current := p.captureWorker == worker
+	p.captureMu.Unlock()
+	return current
+}
+
+func (s *App) releaseCapture(p *Session, target *captureTarget) {
+	s.captureMu.Lock()
+	if s.captureTargets[p] == target {
+		delete(s.captureTargets, p)
+	}
+	s.captureMu.Unlock()
+}
+
+func (s *App) capturePaths() []string {
+	s.captureMu.Lock()
+	defer s.captureMu.Unlock()
+	paths := make([]string, 0, len(s.captureTargets)+1)
+	if s.CapturePath != "" {
+		paths = append(paths, s.CapturePath)
+	}
+	for _, target := range s.captureTargets {
+		paths = append(paths, target.path)
+	}
+	return paths
 }
 
 func (s *App) Connected() bool { return s.session != nil }
@@ -172,6 +280,10 @@ func (s *App) showSettingsWarning() {
 func (s *App) ClearReceiveLog() {
 	if s.session != nil {
 		s.session.clearDisplay()
+	}
+	// Detached sessions keep their pending data until the final frontend drain.
+	for p := range s.closingSessions {
+		p.clearDisplay()
 	}
 	s.Tx, s.Rx = 0, 0
 }
@@ -261,11 +373,11 @@ func (s *App) pump(p *Session, stop <-chan struct{}) {
 }
 
 func (s *App) drain(p *Session) {
-	records, rx, tx := p.drainDisplay()
-	s.Rx += rx
-	s.Tx += tx
+	s.deliverDisplay(p)
 	ch := p.Events()
 	var readErr, captureErr error
+	var captureWorkers []*captureWriter
+	captureStopped := false
 	// Process a snapshot so an active producer cannot monopolize the UI.
 	for range len(ch) {
 		event := <-ch
@@ -273,22 +385,38 @@ func (s *App) drain(p *Session) {
 			continue
 		}
 		if !event.ReadFailed {
-			captureErr = event.Err
+			captureErr = errors.Join(captureErr, event.Err)
+			captureWorkers = append(captureWorkers, event.capture)
+			current := s.failedCaptureIsCurrent(p, event.capture)
+			captureStopped = captureStopped || current
 		} else {
 			readErr = event.Err
 		}
 	}
-	if s.view != nil {
-		s.view.AppendEvents(records)
-	}
 	if captureErr != nil {
-		p.acknowledgeCaptureError()
-		s.CapturePath = ""
+		if captureStopped {
+			s.releaseCapture(p, s.protectCapture(p, "", nil))
+			s.CapturePath = ""
+		}
 		s.Fail("已停止接收存文件", "Receive-to-file stopped", captureErr)
+		for _, worker := range captureWorkers {
+			p.acknowledgeCaptureError(worker)
+		}
 	}
 	if readErr != nil {
 		s.disconnect()
 		s.Fail("串口已断开", "Serial port disconnected", readErr)
+	}
+}
+
+// deliverDisplay is also used after Close and the sending job have both settled.
+// It must not process old errors or initiate another disconnect.
+func (s *App) deliverDisplay(p *Session) {
+	records, rx, tx := p.drainDisplay()
+	s.Rx += rx
+	s.Tx += tx
+	if s.view != nil {
+		s.view.AppendEvents(records)
 	}
 }
 
@@ -300,6 +428,8 @@ func (s *App) startSending(label Text, filePath string, send func(context.Contex
 	}
 	p := s.session
 	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	s.sendDone = done
 	s.cancelSend = cancel
 	if filePath != "" {
 		s.sendingFilePath = filePath
@@ -311,8 +441,13 @@ func (s *App) startSending(label Text, filePath string, send func(context.Contex
 		defer s.jobs.Done()
 		err := send(ctx, p)
 		cancel()
+		close(done)
 		s.dispatch(func() {
-			if filePath != "" && s.sendingFilePath == filePath {
+			if s.sendDone != done {
+				return
+			}
+			s.sendDone = nil
+			if filePath != "" {
 				s.sendingFilePath = ""
 			}
 			if s.session != p {
@@ -523,7 +658,7 @@ func (s *App) TogglePort() {
 				return
 			}
 			baud, _ := strconv.Atoi(strings.TrimSpace(settings.Baud))
-			p := NewSession(port, baud)
+			p := newSession(port, baud, s.curveReceiver())
 			s.session, s.stopPump = p, make(chan struct{})
 			s.Note("串口已打开", "Serial port opened")
 			s.saveUsedSnapshot(snapshot)
@@ -537,10 +672,17 @@ func (s *App) disconnect() {
 	if p == nil {
 		return
 	}
+	target := s.protectCapture(p, s.CapturePath, nil)
+	sendDone := s.sendDone
+	if s.closingSessions == nil {
+		s.closingSessions = make(map[*Session]struct{})
+	}
+	s.closingSessions[p] = struct{}{}
 	s.session = nil
 	close(s.stopPump)
 	s.StopSending()
 	s.cancelSend = nil
+	s.sendDone = nil
 	s.CapturePath = ""
 	s.PortBusy = true
 	status, statusError := s.Status, s.StatusError
@@ -548,13 +690,29 @@ func (s *App) disconnect() {
 	go func() {
 		defer s.jobs.Done()
 		err := p.Close()
+		s.curveDisconnected()
+		if target != nil && target.opened != nil {
+			<-target.opened
+		}
+		if sendDone != nil {
+			<-sendDone
+		}
+		s.releaseCapture(p, target)
+		result := s.retainTerminalError(err)
 		s.dispatch(func() {
+			s.deliverDisplay(p)
+			delete(s.closingSessions, p)
+			if s.session != nil {
+				return
+			}
+			s.sendingFilePath = ""
 			s.PortBusy = false
 			if s.Status != status || s.StatusError != statusError {
 				return
 			}
 			if err != nil {
 				s.Fail("关闭串口失败", "Failed to close serial port", err)
+				s.acknowledgeTerminalError(result)
 			} else {
 				s.Note("串口已关闭", "Serial port closed")
 			}
@@ -571,14 +729,14 @@ func (s *App) SaveLog(path, text string) {
 	if s.FileBusy || s.closing {
 		return
 	}
-	capturePath := s.CapturePath
+	capturePaths := s.capturePaths()
 	sendPath := s.sendingFilePath
 	snapshot := s.usedSettingsSnapshot()
 	s.FileBusy = true
 	s.jobs.Add(1)
 	go func() {
 		defer s.jobs.Done()
-		sameCapture := capturePath != "" && sameFilePath(path, capturePath)
+		sameCapture := slices.ContainsFunc(capturePaths, func(other string) bool { return sameFilePath(path, other) })
 		sameSendSource := sendPath != "" && sameFilePath(path, sendPath)
 		var err error
 		if !sameCapture && !sameSendSource {
@@ -635,6 +793,8 @@ func (s *App) startCapture(path string, connection *Session) {
 	// Reserve the path while its file is being opened, so display saving
 	// cannot truncate the capture before the completion callback runs.
 	s.CapturePath = path
+	opened := make(chan struct{})
+	target := s.protectCapture(connection, path, opened)
 	s.jobs.Add(1)
 	go func() {
 		defer s.jobs.Done()
@@ -650,6 +810,10 @@ func (s *App) startCapture(path string, connection *Session) {
 				}
 			}
 		}
+		if sameSendSource || err != nil {
+			s.releaseCapture(connection, target)
+		}
+		close(opened)
 		s.dispatch(func() {
 			s.FileBusy = false
 			if s.session != connection {
@@ -664,6 +828,12 @@ func (s *App) startCapture(path string, connection *Session) {
 				s.CapturePath = ""
 				s.Fail("打开接收文件失败", "Failed to open receive file", err)
 			} else {
+				connection.captureMu.Lock()
+				active := connection.capture != nil
+				connection.captureMu.Unlock()
+				if !active {
+					return
+				}
 				s.Note("接收数据将写入 "+path, "Received data will be written to "+path)
 				s.saveUsedSnapshot(snapshot)
 			}
@@ -682,11 +852,14 @@ func (s *App) StopCapture() {
 		return
 	}
 	p := s.session
+	target := s.protectCapture(p, s.CapturePath, nil)
 	s.FileBusy = true
 	s.jobs.Add(1)
 	go func() {
 		defer s.jobs.Done()
 		err := p.SetCapture(nil)
+		s.releaseCapture(p, target)
+		result := s.retainTerminalError(err)
 		s.dispatch(func() {
 			s.FileBusy = false
 			if s.session != p {
@@ -695,6 +868,7 @@ func (s *App) StopCapture() {
 			s.CapturePath = ""
 			if err != nil {
 				s.Fail("关闭接收文件失败", "Failed to close receive file", err)
+				s.acknowledgeTerminalError(result)
 			} else {
 				s.Note("已停止接收存文件", "Receive-to-file stopped")
 			}

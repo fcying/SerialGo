@@ -13,11 +13,13 @@ ShowSent = false
 Timestamp = false
 ShowPresets = false
 # Display history payload bytes; presets use decimal K/M units.
-DisplayBufferLimit = 200000
+DisplayBufferLimit = 2000000
+ReceiveHexBytesPerLine = 32
 # Receive display font defaults: 宋体, 9 pt, black.
 ReceiveFont = "宋体"
 ReceiveFontSize = 9
 ReceiveFontColor = "#000000"
+CurveSidebarWidth = 260
 
 [Port]
 Name = ""
@@ -36,6 +38,13 @@ Height = 600
 Maximized = false
 PositionSet = false
 
+[CurveWindow]
+X = 0
+Y = 0
+Width = 1040
+Height = 600
+Maximized = false
+PositionSet = false
 
 [[Presets]]
 Label = "Preset 1"

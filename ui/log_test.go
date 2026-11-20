@@ -11,6 +11,10 @@ import (
 	gui "github.com/egoist/mygo/ui"
 )
 
+func receiveMaxY(l *receiveLog) float64 {
+	return max(0, l.view.LineTop(l.text.LineCount())-l.view.ViewportHeight())
+}
+
 func TestReceiveLogSplitText(t *testing.T) {
 	for _, tc := range []struct {
 		encoding string
@@ -57,35 +61,35 @@ func TestReceiveLogNewDataScrollsToBottom(t *testing.T) {
 	if !found {
 		t.Fatal("receive window is missing")
 	}
-	if s.log.scroll.MaxY <= 0 {
+	if receiveMaxY(&s.log) <= 0 {
 		t.Fatal("receive history does not overflow the window")
 	}
 	tt.ClickAt(box.X+10, box.Y+10)
 	tt.Key(gui.Ctrl, gui.KeyHome)
 	tt.Scroll(box.X+box.W/2, box.Y+box.H/2, 0, -100_000)
-	if s.log.scroll.Y >= s.log.scroll.MaxY {
+	if s.log.view.ScrollY() >= receiveMaxY(&s.log) {
 		t.Fatal("could not scroll away from the latest data")
 	}
-	previousY := s.log.scroll.Y
+	previousY := s.log.view.ScrollY()
 	s.settings.Language = "en"
 	tt.Frame()
-	if s.log.scroll.Y != previousY {
+	if s.log.view.ScrollY() != previousY {
 		t.Fatal("changing language moved the receive history")
 	}
 	s.log.append(nil)
 	tt.Frame()
-	if s.log.scroll.Y != previousY {
+	if s.log.view.ScrollY() != previousY {
 		t.Fatal("an empty receive batch moved the history")
 	}
 	for batch := range 4 {
 		data := strings.Repeat("新的接收数据, wrapped incoming line with enough text to span several visual rows. ", 80) + "\nlatest incoming line\n"
 		s.log.append([]internal.Event{{Data: []byte(data)}})
 		tt.Frame()
-		if s.log.scroll.Y != s.log.scroll.MaxY {
-			t.Fatalf("batch %d did not scroll to the bottom: Y=%g, MaxY=%g", batch, s.log.scroll.Y, s.log.scroll.MaxY)
+		if s.log.view.ScrollY() != receiveMaxY(&s.log) {
+			t.Fatalf("batch %d did not scroll to the bottom: Y=%g, MaxY=%g", batch, s.log.view.ScrollY(), receiveMaxY(&s.log))
 		}
 		tt.Frame()
-		if s.log.scroll.Y != s.log.scroll.MaxY {
+		if s.log.view.ScrollY() != receiveMaxY(&s.log) {
 			t.Fatalf("batch %d returned to the old caret on a later frame", batch)
 		}
 	}
@@ -148,12 +152,12 @@ func TestReceiveLogUsesSelectedByteCapacity(t *testing.T) {
 			first := internal.Event{Data: []byte(strings.Repeat("a", half))}
 			second := internal.Event{Data: []byte(strings.Repeat("b", half))}
 			l.append([]internal.Event{first, second})
-			if l.bytes != preset.Bytes || len(l.events) != 2 || l.text.Len() != preset.Bytes {
-				t.Fatalf("exact capacity lost data: bytes=%d events=%d text=%d", l.bytes, len(l.events), l.text.Len())
+			if l.bytes != preset.Bytes || l.text.Len() != preset.Bytes {
+				t.Fatalf("exact capacity lost data: bytes=%d text=%d", l.bytes, l.text.Len())
 			}
 			l.append([]internal.Event{{Data: []byte("c")}})
-			if l.bytes != half+1 || len(l.events) != 2 || l.text.String() != string(second.Data)+"c" {
-				t.Fatalf("overflow did not evict exactly the oldest whole event: bytes=%d events=%d", l.bytes, len(l.events))
+			if l.bytes != half+1 || l.text.String() != string(second.Data)+"c" {
+				t.Fatalf("overflow did not evict exactly the oldest whole event: bytes=%d", l.bytes)
 			}
 		})
 	}
@@ -170,12 +174,12 @@ func TestReceiveLogKeepsLargeCapacityWithSmallPackets(t *testing.T) {
 	}
 	l.append(events)
 	l.append([]internal.Event{{Data: []byte(strings.Repeat("y", limit-len(events)))}})
-	if l.bytes != limit || len(l.events) != len(events)+1 || !strings.HasPrefix(l.text.String(), strings.Repeat("x", len(events))) {
-		t.Fatalf("small packets prematurely truncated selected capacity: bytes=%d events=%d", l.bytes, len(l.events))
+	if l.bytes != limit || l.text.String() != strings.Repeat("x", len(events))+strings.Repeat("y", limit-len(events)) {
+		t.Fatalf("small packets prematurely truncated selected capacity: bytes=%d", l.bytes)
 	}
 	l.append([]internal.Event{{Data: []byte{'z'}}})
-	if l.bytes > limit || l.events[len(l.events)-1].Data[0] != 'z' {
-		t.Fatalf("overflow did not preserve the newest data within the selected limit: bytes=%d events=%d", l.bytes, len(l.events))
+	if l.bytes != 1 || l.text.String() != "z" {
+		t.Fatalf("overflow did not evict oldest whole events and keep the newest byte: bytes=%d", l.bytes)
 	}
 }
 
@@ -190,12 +194,12 @@ func TestReceiveLogLimitChangesTrimImmediately(t *testing.T) {
 	})
 	options.limit = presets[0].Bytes
 	l.configure(options)
-	if l.bytes != presets[0].Bytes || len(l.events) != 1 || l.text.String() != string(l.events[0].Data) || l.events[0].Data[0] != 'b' {
-		t.Fatalf("lower limit did not trim and rebuild immediately: bytes=%d events=%d", l.bytes, len(l.events))
+	if l.bytes != presets[0].Bytes || l.text.String() != strings.Repeat("b", presets[0].Bytes) {
+		t.Fatalf("lower limit did not trim and rebuild immediately: bytes=%d", l.bytes)
 	}
 	options.limit = presets[1].Bytes
 	l.configure(options)
-	if len(l.events) != 1 || l.bytes != presets[0].Bytes {
+	if l.bytes != presets[0].Bytes || l.text.String() != strings.Repeat("b", presets[0].Bytes) {
 		t.Fatal("raising the limit restored discarded history")
 	}
 }
@@ -206,11 +210,11 @@ func TestReceiveLogKeepsNewestOversizedEvent(t *testing.T) {
 	l.configure(logOptions{encoding: "UTF-8", limit: limit})
 	oversized := internal.Event{Data: []byte(strings.Repeat("x", limit+1))}
 	l.append([]internal.Event{{Data: []byte("old")}, oversized})
-	if len(l.events) != 1 || l.bytes != limit+1 || l.text.String() != string(oversized.Data) {
+	if l.bytes != limit+1 || l.text.String() != string(oversized.Data) {
 		t.Fatal("newest oversized event was truncated or discarded")
 	}
 	l.append([]internal.Event{{Data: []byte("new")}})
-	if len(l.events) != 1 || l.bytes != 3 || l.text.String() != "new" {
+	if l.bytes != 3 || l.text.String() != "new" {
 		t.Fatal("oversized event was not evicted after newer data arrived")
 	}
 }
@@ -221,11 +225,11 @@ func TestReceiveLogEmptyEventsDoNotConsumeHistory(t *testing.T) {
 	l.append([]internal.Event{{Data: []byte("data")}})
 	l.scrollToEnd = false
 	l.append(make([]internal.Event, 10_000))
-	if l.bytes != 4 || len(l.events) != 1 || l.text.String() != "data" || l.scrollToEnd {
+	if l.bytes != 4 || l.text.String() != "data" || l.scrollToEnd {
 		t.Fatal("empty events consumed history or changed the rendered log")
 	}
 	l.clear()
-	if l.bytes != 0 || len(l.events) != 0 || l.text.String() != "" {
+	if l.bytes != 0 || len(l.history.blocks) != 0 || l.text.String() != "" {
 		t.Fatal("clear did not release retained history")
 	}
 }
@@ -233,12 +237,11 @@ func TestReceiveLogEmptyEventsDoNotConsumeHistory(t *testing.T) {
 func TestReceiveLogAutoScrollCanPauseAndResume(t *testing.T) {
 	s := newController(&internal.App{})
 	s.settings.Language = "en"
-	s.log.viewportHeight = 160
 	s.configureLog()
 	s.log.append([]internal.Event{{Data: []byte(strings.Repeat("received line\n", 120))}})
 	tt := gui.NewTester(s.receivePane, 400, 160)
 	box, found := tt.Find("Receive log")
-	if !found || s.log.scroll.MaxY <= 0 {
+	if !found || receiveMaxY(&s.log) <= 0 {
 		t.Fatal("receive history does not overflow the window")
 	}
 	tt.ClickAt(box.X+10, box.Y+10)
@@ -247,47 +250,46 @@ func TestReceiveLogAutoScrollCanPauseAndResume(t *testing.T) {
 	s.autoScroll = false
 	s.autoScrollChanged()
 	tt.Frame()
-	previousY := s.log.scroll.Y
+	previousY := s.log.view.ScrollY()
 	previousText := s.log.text.String()
 	s.log.append([]internal.Event{{Data: []byte(strings.Repeat("new data\n", 40))}})
 	tt.Frame()
 	if s.log.text.String() == previousText || !strings.Contains(s.log.text.String(), "new data") {
 		t.Fatal("received text was not appended while auto scroll was disabled")
 	}
-	if s.log.scroll.Y < previousY-2 || s.log.scroll.Y > previousY+2 || s.log.scroll.Y >= s.log.scroll.MaxY {
-		t.Fatalf("disabled auto scroll did not preserve the viewport: before=%v after=%v max=%v", previousY, s.log.scroll.Y, s.log.scroll.MaxY)
+	if s.log.view.ScrollY() < previousY-2 || s.log.view.ScrollY() > previousY+2 || s.log.view.ScrollY() >= receiveMaxY(&s.log) {
+		t.Fatalf("disabled auto scroll did not preserve the viewport: before=%v after=%v max=%v", previousY, s.log.view.ScrollY(), receiveMaxY(&s.log))
 	}
-	s.log.scroll.Y = s.log.scroll.MaxY / 2
+	s.log.view.SetScrollY(receiveMaxY(&s.log) / 2)
 	tt.Frame()
-	middleY := s.log.scroll.Y
+	middleY := s.log.view.ScrollY()
 	beforeMixedText := s.log.text.Len()
 	s.log.append([]internal.Event{{Data: []byte(strings.Repeat("long incoming payload with variable line width ", 100) + "\n")}})
 	tt.Frame()
 	if s.log.text.Len() <= beforeMixedText || !strings.Contains(s.log.text.String(), "variable line width") {
 		t.Fatal("later receive data was not appended while auto scroll was disabled")
 	}
-	maxDrift := s.log.viewportHeight
-	if s.log.scroll.Y < middleY-maxDrift || s.log.scroll.Y > middleY+maxDrift || s.log.scroll.Y >= s.log.scroll.MaxY-s.log.viewportHeight/2 {
-		t.Fatalf("disabled auto scroll moved the middle viewport to the latest data: before=%v after=%v max=%v", middleY, s.log.scroll.Y, s.log.scroll.MaxY)
+	maxDrift := s.log.view.ViewportHeight()
+	if s.log.view.ScrollY() < middleY-maxDrift || s.log.view.ScrollY() > middleY+maxDrift || s.log.view.ScrollY() >= receiveMaxY(&s.log)-s.log.view.ViewportHeight()/2 {
+		t.Fatalf("disabled auto scroll moved the middle viewport to the latest data: before=%v after=%v max=%v", middleY, s.log.view.ScrollY(), receiveMaxY(&s.log))
 	}
 	s.autoScroll = true
 	s.autoScrollChanged()
 	tt.Frame()
-	if s.log.scroll.Y != s.log.scroll.MaxY {
-		t.Fatalf("resuming auto scroll did not reveal the latest data: Y=%g, MaxY=%g", s.log.scroll.Y, s.log.scroll.MaxY)
+	if s.log.view.ScrollY() != receiveMaxY(&s.log) {
+		t.Fatalf("resuming auto scroll did not reveal the latest data: Y=%g, MaxY=%g", s.log.view.ScrollY(), receiveMaxY(&s.log))
 	}
 }
 
 func TestReceiveLogAutoScrollWaitsForSelectionToClear(t *testing.T) {
 	s := newController(&internal.App{})
 	s.settings.Language = "en"
-	s.log.viewportHeight = 160
 	s.configureLog()
 	s.log.append([]internal.Event{{Data: []byte(strings.Repeat("received line\n", 120))}})
 
 	tt := gui.NewTester(s.receivePane, 400, 160)
 	box, found := tt.Find("Receive log")
-	if !found || s.log.scroll.MaxY <= 0 {
+	if !found || receiveMaxY(&s.log) <= 0 {
 		t.Fatal("receive history does not overflow the window")
 	}
 	leftX, rightX, y := box.X+10, box.X+80, box.Y+10
@@ -307,8 +309,8 @@ func TestReceiveLogAutoScrollWaitsForSelectionToClear(t *testing.T) {
 	if !s.autoScroll || s.log.autoScrollDisabled || !s.log.scrollToEnd {
 		t.Fatal("receiving data disabled auto scroll or lost its pending follow request")
 	}
-	if s.log.scroll.Y >= s.log.scroll.MaxY {
-		t.Fatalf("auto scroll followed the latest data during text selection: Y=%v, MaxY=%v", s.log.scroll.Y, s.log.scroll.MaxY)
+	if s.log.view.ScrollY() >= receiveMaxY(&s.log) {
+		t.Fatalf("auto scroll followed the latest data during text selection: Y=%v, MaxY=%v", s.log.view.ScrollY(), receiveMaxY(&s.log))
 	}
 
 	tt.SetClipboard("selection cleared")
@@ -323,17 +325,203 @@ func TestReceiveLogAutoScrollWaitsForSelectionToClear(t *testing.T) {
 	tt.Press(x, y)
 	s.log.append([]internal.Event{{Data: []byte(strings.Repeat("during click\n", 40))}})
 	tt.Frame()
-	if !s.log.scrollToEnd || s.log.scroll.Y >= s.log.scroll.MaxY {
+	if !s.log.scrollToEnd || s.log.view.ScrollY() >= receiveMaxY(&s.log) {
 		t.Fatal("auto scroll resumed before the click was released")
 	}
 	tt.Release(x, y)
 	tt.Frame()
-	if !s.autoScroll || s.log.autoScrollDisabled || s.log.scrollToEnd || s.log.scroll.Y != s.log.scroll.MaxY {
-		t.Fatalf("auto scroll did not resume after clearing selection: enabled=%v disabled=%v pending=%v Y=%v MaxY=%v", s.autoScroll, s.log.autoScrollDisabled, s.log.scrollToEnd, s.log.scroll.Y, s.log.scroll.MaxY)
+	if !s.autoScroll || s.log.autoScrollDisabled || s.log.scrollToEnd || s.log.view.ScrollY() != receiveMaxY(&s.log) {
+		t.Fatalf("auto scroll did not resume after clearing selection: enabled=%v disabled=%v pending=%v Y=%v MaxY=%v", s.autoScroll, s.log.autoScrollDisabled, s.log.scrollToEnd, s.log.view.ScrollY(), receiveMaxY(&s.log))
+	}
+	for _, selection := range s.log.view.Selections() {
+		if selection.Anchor != selection.Head {
+			t.Fatalf("single click did not clear the actual selection: %+v", selection)
+		}
 	}
 	tt.SetClipboard("no selection")
 	tt.Key(gui.Ctrl, gui.KeyC)
 	if got := tt.Clipboard(); got != "no selection" {
 		t.Fatalf("single click left text selected: %q", got)
+	}
+	tt.Key(gui.Ctrl, gui.KeyInsert)
+	if got := tt.Clipboard(); got != "no selection" {
+		t.Fatalf("alternate copy shortcut copied without a selection: %q", got)
+	}
+	tt.Command("copy")
+	if got := tt.Clipboard(); got != "no selection" {
+		t.Fatalf("copy command copied without a selection: %q", got)
+	}
+}
+
+func TestReceiveLogEvictionPreservesRetainedSelection(t *testing.T) {
+	s := newController(&internal.App{})
+	s.settings.Language = "en"
+	s.settings.DisplayBufferLimit = 200_000
+	s.configureLog()
+	l := &s.log
+	old := strings.Repeat("old line\n", 1889)
+	const selected = "retained selection"
+	fill := strings.Repeat("line\n", 36_500)
+	l.append([]internal.Event{{Data: []byte(old)}, {Data: []byte(selected + "\n")}, {Data: []byte(fill)}})
+	tt := gui.NewTester(s.receivePane, 400, 160)
+	l.view.Select(len(old), len(old)+len(selected))
+	tt.Frame()
+	l.append([]internal.Event{{Data: []byte(strings.Repeat("new\n", 250))}})
+	tt.Frame()
+	head := l.text.Slice(0, len(selected))
+	if l.bytes > l.options.limit || head != selected {
+		t.Fatalf("test did not evict exactly the old event: bytes=%d, head=%q", l.bytes, head)
+	}
+	selections := l.view.Selections()
+	if len(selections) != 1 || selections[0].Anchor != 0 || selections[0].Head != len(selected) {
+		t.Fatalf("eviction changed the surviving selection: %+v", selections)
+	}
+	if !l.scrollToEnd || l.view.ScrollY() >= receiveMaxY(l) {
+		t.Fatal("auto-scroll should wait for the surviving selection to clear")
+	}
+}
+
+func TestReceiveLogManualScrollWhenSelectionIsEvicted(t *testing.T) {
+	const oldLines = 1550
+	for _, tc := range []struct {
+		name         string
+		before, want int
+	}{
+		{name: "viewport evicted", before: 100, want: 0},
+		{name: "viewport retained", before: oldLines + 35, want: 35},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newController(&internal.App{})
+			s.settings.Language, s.settings.DisplayBufferLimit = "en", 200_000
+			s.configureLog()
+			s.autoScroll = false
+			s.autoScrollChanged()
+			l := &s.log
+			old := strings.Repeat("old record\n", oldLines)
+			keep := strings.Repeat("retained\n", 20_250)
+			l.append([]internal.Event{{Data: []byte(old)}, {Data: []byte(keep)}})
+			tt := gui.NewTester(s.receivePane, 400, 160)
+			start := 100 * len("old record\n")
+			l.view.Select(start, start+len("old record"))
+			tt.Frame()
+			l.view.SetScrollY(l.view.LineTop(tc.before))
+			tt.Frame()
+			if !l.hasSelection() {
+				t.Fatal("failed to select old text before eviction")
+			}
+			for range 5 {
+				l.append([]internal.Event{{Data: []byte(strings.Repeat("new payload\n", 40))}})
+				tt.Frame()
+			}
+			if l.text.Slice(0, len("retained\n")) != "retained\n" || l.hasSelection() {
+				t.Fatal("eviction should remove the old text and collapse its selection")
+			}
+			want := l.view.LineTop(tc.want)
+			if y := l.view.ScrollY(); y < want-2 || y > want+2 || l.scrollToEnd {
+				t.Fatalf("viewport jumped after eviction: Y=%g, want %g, follow=%v", y, want, l.scrollToEnd)
+			}
+		})
+	}
+}
+
+func TestReceiveLogManualScrollPreservesSelection(t *testing.T) {
+	for _, backwards := range []bool{false, true} {
+		name := "forward"
+		if backwards {
+			name = "backward"
+		}
+		t.Run(name, func(t *testing.T) {
+			s := newController(&internal.App{})
+			s.settings.Language = "en"
+			s.configureLog()
+			s.log.append([]internal.Event{{Data: []byte(strings.Repeat("received history line\n", 120))}})
+			tt := gui.NewTester(s.receivePane, 400, 160)
+			box, found := tt.Find("Receive log")
+			if !found || receiveMaxY(&s.log) <= 0 {
+				t.Fatal("receive history does not overflow the window")
+			}
+			s.autoScroll = false
+			s.autoScrollChanged()
+			s.log.view.SetScrollY(receiveMaxY(&s.log) / 3)
+			tt.Frame()
+			startX, endX, y := box.X+12, box.X+100, box.Y+35
+			if backwards {
+				startX, endX = endX, startX
+			}
+			tt.Press(startX, y)
+			tt.Move(endX, y)
+			tt.Release(endX, y)
+			tt.SetClipboard("nothing selected")
+			tt.Key(gui.Ctrl, gui.KeyC)
+			selectedText := tt.Clipboard()
+			if selectedText == "nothing selected" || selectedText == "" {
+				t.Fatal("mouse drag did not select historical receive text")
+			}
+			previousY := s.log.view.ScrollY()
+			for batch := range 4 {
+				s.log.append([]internal.Event{{Data: []byte(strings.Repeat("new incoming data\n", 40))}})
+				tt.Frame()
+				tt.Frame()
+				tt.SetClipboard("selection lost")
+				tt.Key(gui.Ctrl, gui.KeyC)
+				if got := tt.Clipboard(); got != selectedText {
+					t.Fatalf("batch %d changed the historical selection: got %q, want %q", batch, got, selectedText)
+				}
+				if s.log.view.ScrollY() < previousY-2 || s.log.view.ScrollY() > previousY+2 || s.log.view.ScrollY() >= receiveMaxY(&s.log) {
+					t.Fatalf("batch %d moved the selected history viewport: before=%v after=%v max=%v", batch, previousY, s.log.view.ScrollY(), receiveMaxY(&s.log))
+				}
+			}
+		})
+	}
+}
+
+func TestReceiveLogManualScrollPreservesDrag(t *testing.T) {
+	drag := func(receiving bool) string {
+		s := newController(&internal.App{})
+		s.settings.Language = "en"
+		s.configureLog()
+		s.log.append([]internal.Event{{Data: []byte(strings.Repeat("received history line\n", 120))}})
+		tt := gui.NewTester(s.receivePane, 400, 160)
+		box, found := tt.Find("Receive log")
+		if !found || receiveMaxY(&s.log) <= 0 {
+			t.Fatal("receive history does not overflow the window")
+		}
+		s.autoScroll = false
+		s.autoScrollChanged()
+		s.log.view.SetScrollY(receiveMaxY(&s.log) / 3)
+		tt.Frame()
+		previousY := s.log.view.ScrollY()
+		appendDuringDrag := func() {
+			if receiving {
+				s.log.append([]internal.Event{{Data: []byte(strings.Repeat("incoming during drag\n", 40))}})
+				tt.Frame()
+				tt.Frame()
+				if s.log.view.ScrollY() < previousY-2 || s.log.view.ScrollY() > previousY+2 || s.log.view.ScrollY() >= receiveMaxY(&s.log) {
+					t.Fatalf("receiving during a drag moved the viewport: before=%v after=%v max=%v", previousY, s.log.view.ScrollY(), receiveMaxY(&s.log))
+				}
+			}
+		}
+		x, y := box.X+12, box.Y+35
+		tt.Press(x, y)
+		// Cover the temporarily empty selection immediately after mouse down.
+		appendDuringDrag()
+		tt.Move(x+70, y)
+		appendDuringDrag()
+		tt.Move(x+120, y+24)
+		appendDuringDrag()
+		tt.Release(x+120, y+24)
+		appendDuringDrag()
+		tt.SetClipboard("nothing selected")
+		tt.Key(gui.Ctrl, gui.KeyC)
+		selectedText := tt.Clipboard()
+		if selectedText == "nothing selected" || selectedText == "" {
+			t.Fatal("mouse drag did not select historical receive text")
+		}
+		return selectedText
+	}
+	want := drag(false)
+	got := drag(true)
+	if got != want {
+		t.Fatalf("receiving changed the drag's anchor or selected text: got %q, want %q", got, want)
 	}
 }

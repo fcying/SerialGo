@@ -145,6 +145,7 @@ func (s *App) usedSettingsSnapshot() *settingsSnapshot {
 	settings := s.Settings
 	settings.BaudRates = slices.Clone(settings.BaudRates)
 	settings.Presets = slices.Clone(settings.Presets)
+	settings.CurveProfiles = config.CloneCurveProfiles(settings.CurveProfiles)
 	return &settingsSnapshot{revision: s.SettingsRevision, settings: settings}
 }
 
@@ -216,7 +217,11 @@ func (s *App) FlushSettings() error {
 		return nil
 	}
 	revision := s.SettingsRevision
-	err := writeSettings(s.SettingsPath, s.Settings)
+	settings := s.Settings
+	settings.BaudRates = slices.Clone(settings.BaudRates)
+	settings.Presets = slices.Clone(settings.Presets)
+	settings.CurveProfiles = config.CloneCurveProfiles(settings.CurveProfiles)
+	err := writeSettings(s.SettingsPath, settings)
 	if err != nil {
 		return err
 	}

@@ -151,6 +151,24 @@ func TestPortSettingDropdownValuesAreCentered(t *testing.T) {
 	}
 }
 
+func TestPortSettingsControlLinesAreCentered(t *testing.T) {
+	s, _ := portSettingsFixture(t)
+	s.app.PortBusy = true // Exercise the layout with the connected-state hint.
+	s.openPortSettings()
+	tt := gui.NewTester(s.portSettingsDialog, 800, 600)
+	dialog, dialogFound := tt.AccessByRole(gui.RoleDialog, "Port settings")
+	rts, rtsFound := tt.AccessByRole(gui.RoleCheckBox, "RTS")
+	dtr, dtrFound := tt.AccessByRole(gui.RoleCheckBox, "DTR")
+	if !dialogFound || !rtsFound || !dtrFound || rts.Offscreen || dtr.Offscreen {
+		t.Fatal("RTS and DTR must both be visible in Port settings")
+	}
+	groupCenter := (rts.Bounds.X + dtr.Bounds.X + dtr.Bounds.W) / 2
+	dialogCenter := dialog.Bounds.X + dialog.Bounds.W/2
+	if groupCenter < dialogCenter-1 || groupCenter > dialogCenter+1 {
+		t.Fatalf("RTS/DTR group center = %g, want %g", groupCenter, dialogCenter)
+	}
+}
+
 func TestPortSettingsDraftDoesNotChangeSettings(t *testing.T) {
 	s, notified := portSettingsFixture(t)
 	original, revision := *s.settings, s.app.SettingsRevision

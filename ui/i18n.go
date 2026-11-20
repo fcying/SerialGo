@@ -34,6 +34,25 @@ func (s *controller) tr(zh, en string) string {
 func (s *controller) setLanguage(language string) {
 	if s.app.SetLanguage(language) {
 		mygo.App.SetLocale(s.settings.Language)
+		if s.curve != nil && curveSpanSeconds(s.curve.span) == 0 {
+			s.curve.span = s.tr("全部", "All")
+		}
+		if s.curveWindow != nil {
+			s.curveWindow.SetTitle(s.serialCurveTitle())
+			s.curveWindow.Invalidate()
+			if s.curve.ruleEditor != nil && s.curve.ruleEditor.window != nil {
+				s.curve.ruleEditor.window.SetTitle(s.curveRuleEditorTitle())
+				s.curve.ruleEditor.window.Invalidate()
+			}
+			if s.curve.profileEditor != nil && s.curve.profileEditor.window != nil {
+				s.curve.profileEditor.window.SetTitle(s.tr("配置", "Configuration"))
+				s.curve.profileEditor.window.Invalidate()
+			}
+			if s.curve.testWindow != nil {
+				s.curve.testWindow.SetTitle(s.tr("测试规则", "Test rules"))
+				s.curve.testWindow.Invalidate()
+			}
+		}
 	}
 }
 

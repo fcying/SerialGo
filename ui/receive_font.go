@@ -140,7 +140,7 @@ func (s *controller) receiveFontDialog(c *ui.Context) {
 func (s *controller) receiveFontButton(c *ui.Context) {
 	ui.Row(c.Key("receive-font-options")).Gap(groupGap).AlignItems(ui.Center).Children(func() {
 		ui.Text(c.Key("font-label"), s.tr("接收窗口字体", "Receive font"))
-		ui.Button(c.Key("configure-font"), s.tr("字体...", "Font...")).Height(controlHeight).PaddingY(controlPadY).
+		ui.Button(c.Key("configure-font"), s.tr("字体", "Font")).Height(controlHeight).PaddingY(controlPadY).
 			Label(s.tr("配置接收窗口字体", "Configure receive font")).OnClick(s.openReceiveFontDialog)
 	})
 }

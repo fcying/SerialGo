@@ -45,13 +45,14 @@ type DisplayBufferPreset struct {
 	Bytes int
 }
 
-func DisplayBufferPresets() [5]DisplayBufferPreset {
-	return [5]DisplayBufferPreset{
+func DisplayBufferPresets() [6]DisplayBufferPreset {
+	return [...]DisplayBufferPreset{
 		{Label: "200K", Bytes: 200_000},
 		{Label: "500K", Bytes: 500_000},
 		{Label: "1M", Bytes: 1_000_000},
 		{Label: "2M", Bytes: 2_000_000},
 		{Label: "5M", Bytes: 5_000_000},
+		{Label: "10M", Bytes: 10_000_000},
 	}
 }
 
@@ -70,6 +71,21 @@ func NormalizeDisplayBufferLimit(bytes int) int {
 		return bytes
 	}
 	return defaultSettings.DisplayBufferLimit
+}
+
+const DefaultReceiveHexBytesPerLine = 32
+
+func ReceiveHexLineWidths() [3]int {
+	return [...]int{16, DefaultReceiveHexBytesPerLine, 64}
+}
+
+func NormalizeReceiveHexBytesPerLine(width int) int {
+	for _, option := range ReceiveHexLineWidths() {
+		if width == option {
+			return width
+		}
+	}
+	return DefaultReceiveHexBytesPerLine
 }
 
 const (
@@ -115,6 +131,7 @@ func validReceiveFontSettings(settings Settings) bool {
 type Settings struct {
 	Port                                serialport.Settings
 	Window                              WindowSettings
+	CurveWindow                         WindowSettings
 	BaudRates                           []string
 	SendText, SendHexText               string
 	Language                            string
@@ -123,10 +140,14 @@ type Settings struct {
 	SendHex, CRLF, ReceiveHex, ShowSent bool
 	Timestamp, ShowPresets              bool
 	DisplayBufferLimit                  int      // Retained event payload bytes, not rendered text bytes.
+	ReceiveHexBytesPerLine              int
 	ReceiveFont                         string   // Font family for the receive display.
 	ReceiveFontSize                     int      // Font size in points.
 	ReceiveFontColor                    string   // Foreground color as #RRGGBB.
 	Presets                             []Preset `toml:"-"`
+	CurveProfiles                       []CurveProfile
+	CurveProfile                        int
+	CurveSidebarWidth                   float32
 }
 
 type fileSettings struct {
@@ -151,6 +172,8 @@ func parseDefaultSettings(source string) (Settings, error) {
 	if !validReceiveFontSettings(settings) {
 		return Settings{}, errors.New("invalid embedded default configuration: unsupported receive font settings")
 	}
+	settings.ReceiveHexBytesPerLine = NormalizeReceiveHexBytesPerLine(settings.ReceiveHexBytesPerLine)
+	settings.CurveSidebarWidth = NormalizeCurveSidebarWidth(settings.CurveSidebarWidth)
 	settings.Presets = stored.Presets
 	return settings, nil
 }
@@ -159,6 +182,7 @@ func defaults() Settings {
 	settings := defaultSettings
 	settings.BaudRates = slices.Clone(settings.BaudRates)
 	settings.Presets = slices.Clone(settings.Presets)
+	settings.CurveProfiles = CloneCurveProfiles(settings.CurveProfiles)
 	return settings
 }
 
@@ -208,7 +232,9 @@ func decode(path string, s *Settings) error {
 		Presets           []toml.Primitive
 		LegacyCustomBauds []string `toml:"CustomBauds"`
 		LegacyCustomBaud  string   `toml:"CustomBaud"`
-	}{Settings: s}
+		// Decode wider than the UI type so invalid numeric widths can be normalized.
+		CurveSidebarWidth float64
+	}{Settings: s, CurveSidebarWidth: float64(s.CurveSidebarWidth)}
 	metadata, err := toml.DecodeFile(path, &stored)
 	if err != nil {
 		return err
@@ -248,9 +274,19 @@ func decode(path string, s *Settings) error {
 		s.Language = defaultSettings.Language
 	}
 	s.DisplayBufferLimit = NormalizeDisplayBufferLimit(s.DisplayBufferLimit)
+	s.ReceiveHexBytesPerLine = NormalizeReceiveHexBytesPerLine(s.ReceiveHexBytesPerLine)
 	s.ReceiveFont = NormalizeReceiveFont(s.ReceiveFont)
 	s.ReceiveFontSize = NormalizeReceiveFontSize(s.ReceiveFontSize)
 	s.ReceiveFontColor = NormalizeReceiveFontColor(s.ReceiveFontColor)
+	s.CurveSidebarWidth = NormalizeCurveSidebarWidth(float32(stored.CurveSidebarWidth))
+	for i := range s.CurveProfiles {
+		for j := range s.CurveProfiles[i].Channels {
+			channel := &s.CurveProfiles[i].Channels[j]
+			if channel.Color == "" {
+				channel.Color = DefaultCurveColor(j)
+			}
+		}
+	}
 	return nil
 }
 
@@ -287,9 +323,13 @@ func Save(path string, s Settings) error {
 			fmt.Sprintf("Too many presets: got %d, maximum %d", len(s.Presets), PresetCount),
 		)
 	}
+	// Curve edits and acquisition validate at their own boundaries. Persistence must
+	// retain legacy invalid profiles when unrelated settings are saved.
+	s.ReceiveHexBytesPerLine = NormalizeReceiveHexBytesPerLine(s.ReceiveHexBytesPerLine)
 	s.ReceiveFont = NormalizeReceiveFont(s.ReceiveFont)
 	s.ReceiveFontSize = NormalizeReceiveFontSize(s.ReceiveFontSize)
 	s.ReceiveFontColor = NormalizeReceiveFontColor(s.ReceiveFontColor)
+	s.CurveSidebarWidth = NormalizeCurveSidebarWidth(s.CurveSidebarWidth)
 	// An explicit empty list records manual deletion and must survive reload.
 	if s.BaudRates == nil {
 		s.BaudRates = []string{}

@@ -15,6 +15,8 @@ type controller struct {
 	app                                                               *internal.App
 	settings                                                          *config.Settings
 	window                                                            *mygo.Window
+	curveWindow                                                       *mygo.Window
+	curve                                                             *curveViewState
 	windowGeometry                                                    config.WindowSettings
 	windowState                                                       mygo.WindowState
 	hasWindowState                                                    bool
@@ -126,6 +128,12 @@ func (s *controller) bindWindowGeometry() {
 	s.window.OnMaximize(s.captureWindowGeometry)
 	s.window.OnUnmaximize(s.captureWindowGeometry)
 	s.window.OnRestore(s.captureWindowGeometry)
+	s.window.OnClose(func(*mygo.CloseEvent) {
+		// Capture the plot's final bounds before the native owner destroys it.
+		if s.curveWindow != nil {
+			s.curveWindow.Destroy()
+		}
+	})
 }
 
 func (s *controller) captureWindowGeometry() {
@@ -156,12 +164,10 @@ func (s *controller) clearReceiveLog() {
 func (s *controller) autoScrollChanged() {
 	s.log.autoScrollDisabled = !s.autoScroll
 	if s.autoScroll {
-		s.log.preserveScroll = false
 		s.log.scrollToEnd = true
 		return
 	}
 	s.log.scrollToEnd = false
-	s.log.captureScrollAnchor()
 }
 
 func (s *controller) configureLog() {
@@ -173,7 +179,7 @@ func (s *controller) configureLog() {
 			gap = 20 * time.Millisecond
 		}
 	}
-	s.log.configure(logOptions{hex: p.ReceiveHex, timestamp: p.Timestamp, showSent: p.ShowSent, encoding: p.Encoding, gap: gap, limit: p.DisplayBufferLimit})
+	s.log.configure(logOptions{hex: p.ReceiveHex, timestamp: p.Timestamp, showSent: p.ShowSent, encoding: p.Encoding, gap: gap, limit: p.DisplayBufferLimit, hexBytesPerLine: p.ReceiveHexBytesPerLine})
 }
 
 func (s *controller) displaySettingsChanged() {

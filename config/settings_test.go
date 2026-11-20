@@ -579,6 +579,10 @@ func TestLegacyConfigUsesWindowDefaultsWithoutRewrite(t *testing.T) {
 	if got.Window != defaults().Window {
 		t.Fatalf("legacy config did not receive default window settings: %+v", got.Window)
 	}
+	wantPlot := WindowSettings{Width: 1040, Height: 600}
+	if got.CurveWindow != wantPlot {
+		t.Fatalf("legacy config plot geometry = %+v, want %+v", got.CurveWindow, wantPlot)
+	}
 	contents, err := os.ReadFile(path)
 	if err != nil || string(contents) != source {
 		t.Fatalf("loading legacy config rewrote it: contents=%q err=%v", contents, err)
