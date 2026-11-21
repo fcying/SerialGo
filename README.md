@@ -70,7 +70,8 @@ Plotting accepts RX logs terminated by LF or CRLF, independently of receive HEX/
 
 - Text supports UTF-8 and GB18030. **HEX** in the send editor accepts contiguous bytes or spaces/commas between bytes, for example `01030000` or `01 03 00 00`.
 - **Parse text escapes** under **Options > Sending** is off by default. When enabled, text mode interprets `\\`, `\a`, `\b`, `\f`, `\n`, `\r`, `\t`, `\v`, `\0`, and `\xNN`; `\xNN` emits the exact byte without text re-encoding. Unknown, malformed, or incomplete escapes reject the send. HEX mode is unchanged.
-- **CRLF**, next to **HEX** in the send controls, appends `\r\n` to outgoing data, independently of serial framing. No checksum is calculated or appended automatically; include protocol-required checksum bytes yourself.
+- **CRLF**, next to **HEX** in the send controls, appends `\r\n` to outgoing data, independently of serial framing.
+- **Checksum** under **Options > Sending** supports **None** (default), **XOR8**, **SUM8**, **SUM16-LE**, **SUM16-BE**, **Modbus CRC16**, and **CRC16-CCITT-FALSE**. Optional header and tail exclusion counts are bytes and both default to `0`. The checksum is computed over the data between the excluded edges and inserted before excluded tail bytes. **CRLF** is appended last as the frame terminator and is not counted in either exclusion length. One global setting applies to main and preset sends. `SUM16` wraps at 16 bits; choose `LE` or `BE` for wire byte order.
 - Enable **Repeat** and set a millisecond interval to send the current input repeatedly.
 - **Send** starts sending the current input; **Clear send** clears it. Both text and HEX modes show **Enter data to send...** when empty. **Stop** cancels an active file-send task; hover over it to see **Stop file sending**.
 
@@ -108,7 +109,7 @@ Open **Options** in the receive controls. The language button shows **简体中�
 
 Switching language does not translate or reset serial data, user input, files, preset notes or commands, protocol values, or original operating-system/library errors. Default preset names stay `Preset 1` through `Preset 5` in both languages.
 
-Options also provides On top, text encoding, the default-off text-escape option, display history, timestamp packet gap, and receive-font settings. The receive font defaults to `宋体`, 9 pt, black, with a standard 16-color palette. Send and preset data use the system monospace font with Chinese fallback. Icons are embedded; no separate icon files are needed.
+Options also provides On top, text encoding, default-off text escape parsing, checksum algorithm and frame-byte exclusions, display history, timestamp packet gap, and receive-font settings. The receive font defaults to `宋体`, 9 pt, black, with a standard 16-color palette. Send and preset data use the system monospace font with Chinese fallback. Icons are embedded; no separate icon files are needed.
 
 ## Configuration and data safety
 

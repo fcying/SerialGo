@@ -594,6 +594,19 @@ func TestSendValidationAndCancellationRemainFrameworkIndependent(t *testing.T) {
 		t.Fatal("invalid preset escape started a send")
 	}
 	s.StatusError = false
+	s.Settings.ChecksumAlgorithm = "XOR8"
+	s.Settings.ChecksumHeaderBytes, s.Settings.ChecksumTailBytes = "1", "1"
+	s.SendText("A")
+	if !s.StatusError || s.Sending() {
+		t.Fatal("invalid checksum frame bounds started a send")
+	}
+	s.StatusError = false
+	s.Settings.Presets = []config.Preset{{Enabled: true, Data: "A"}}
+	s.SendPresets(-1)
+	if !s.StatusError || s.Sending() {
+		t.Fatal("invalid preset checksum frame bounds started a send")
+	}
+	s.StatusError = false
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancelSend = cancel
 	s.StopSending()
@@ -774,6 +787,33 @@ func TestAppSendFormatUsesHexCRLFAndConfiguredEncoding(t *testing.T) {
 	data, err = s.encodeSendData("5C7830", true, false)
 	if err != nil || string(data) != string([]byte{'\\', 'x', '0'}) {
 		t.Fatalf("HEX mode parsed text escapes = % x, %v", data, err)
+	}
+}
+
+func TestAppSendChecksumExcludesFrameEdgesBeforeCRLF(t *testing.T) {
+	s := &App{Settings: config.Settings{
+		Encoding:            "UTF-8",
+		ParseSendEscapes:    true,
+		ChecksumAlgorithm:   "XOR8",
+		ChecksumHeaderBytes: "1",
+		ChecksumTailBytes:   "1",
+	}}
+	data, err := s.encodeSendData(`A\x42Z`, false, true)
+	want := []byte{'A', 'B', 0x42, 'Z', '\r', '\n'}
+	if err != nil || string(data) != string(want) {
+		t.Fatalf("escaped send with checksum = % X, %v; want % X", data, err, want)
+	}
+}
+
+func TestAppSendChecksumBeforeCRLF(t *testing.T) {
+	s := &App{Settings: config.Settings{
+		Encoding:          "UTF-8",
+		ChecksumAlgorithm: "XOR8",
+	}}
+	data, err := s.encodeSendData("AT", false, true)
+	want := []byte{'A', 'T', 0x15, '\r', '\n'}
+	if err != nil || string(data) != string(want) {
+		t.Fatalf("send with checksum and CRLF = % X, %v; want % X", data, err, want)
 	}
 }
 

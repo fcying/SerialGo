@@ -106,6 +106,9 @@ func TestStatusBarKeepsLongTextOnOneLine(t *testing.T) {
 						"语言 / Language",
 						s.tr("文本编码", "Text encoding"),
 						s.tr("解析转义符", "Parse text escapes"),
+						s.tr("校验算法", "Checksum algorithm"),
+						s.tr("排除帧头字节数", "Excluded header byte count"),
+						s.tr("排除帧尾字节数", "Excluded tail byte count"),
 						s.tr("时间戳分包超时 (ms)", "Timestamp packet gap (ms)"),
 					} {
 						bounds, found := tt.Find(label)
@@ -148,7 +151,9 @@ func TestSendEscapeSettingTogglesInOptions(t *testing.T) {
 		},
 	} {
 		t.Run(tc.language, func(t *testing.T) {
-			s := newController(&internal.App{Settings: config.Settings{Language: tc.language}})
+			s := newController(&internal.App{Settings: config.Settings{
+				Language: tc.language, ChecksumAlgorithm: "None", ChecksumHeaderBytes: "0", ChecksumTailBytes: "0",
+			}})
 			tt := gui.NewTester(s.view, 800, 600)
 			if err := tt.Click(s.tr("选项", "Options")); err != nil {
 				t.Fatal(err)
@@ -156,6 +161,31 @@ func TestSendEscapeSettingTogglesInOptions(t *testing.T) {
 			field, found := tt.AccessByRole(gui.RoleCheckBox, tc.label)
 			if !found || field.Offscreen || s.settings.ParseSendEscapes {
 				t.Fatalf("text escape option is unavailable or enabled by default: %+v", field)
+			}
+			noneBounds, noneFound := tt.Find("None")
+			algorithmLabelBounds, algorithmLabelFound := tt.Find(s.tr("校验算法", "Checksum algorithm"))
+			header, headerFound := tt.AccessByRole(gui.RoleTextField, s.tr("排除帧头字节数", "Excluded header byte count"))
+			tail, tailFound := tt.AccessByRole(gui.RoleTextField, s.tr("排除帧尾字节数", "Excluded tail byte count"))
+			if !noneFound || noneBounds.W <= 0 || !algorithmLabelFound || algorithmLabelBounds.W <= 0 || !headerFound || header.Value != "0" || !tailFound || tail.Value != "0" {
+				t.Fatalf("checksum defaults or exclusion fields are unavailable: label=%+v header=%+v tail=%+v", algorithmLabelBounds, header, tail)
+			}
+			algorithmCenter := noneBounds.Y + noneBounds.H/2
+			algorithmLabelCenter := algorithmLabelBounds.Y + algorithmLabelBounds.H/2
+			headerCenter := header.Bounds.Y + header.Bounds.H/2
+			tailCenter := tail.Bounds.Y + tail.Bounds.H/2
+			if algorithmCenter < headerCenter-1 || algorithmCenter > headerCenter+1 ||
+				algorithmCenter < tailCenter-1 || algorithmCenter > tailCenter+1 ||
+				algorithmLabelCenter < headerCenter-1 || algorithmLabelCenter > headerCenter+1 {
+				t.Fatalf("checksum controls do not share one row: algorithm=%+v label=%+v header=%+v tail=%+v", noneBounds, algorithmLabelBounds, header.Bounds, tail.Bounds)
+			}
+			if header.Bounds.X+header.Bounds.W > tail.Bounds.X || tail.Bounds.X+tail.Bounds.W > algorithmLabelBounds.X {
+				t.Fatalf("checksum controls are not ordered header, tail, algorithm: header=%+v tail=%+v algorithm=%+v", header.Bounds, tail.Bounds, algorithmLabelBounds)
+			}
+			checksumTooltip := s.tr("设置主发送和预设发送共用的校验算法.", "Selects the checksum algorithm shared by main and preset sends.")
+			tt.Move(noneBounds.X+noneBounds.W/2, noneBounds.Y+noneBounds.H/2)
+			tt.Advance(time.Second)
+			if !tt.HasText(checksumTooltip) {
+				t.Fatalf("checksum tooltip does not describe the algorithms: %q", checksumTooltip)
 			}
 			top, topFound := tt.AccessByRole(gui.RoleCheckBox, tc.topLabel)
 			language, languageFound := tt.AccessByRole(gui.RoleButton, "语言 / Language")
@@ -180,6 +210,89 @@ func TestSendEscapeSettingTogglesInOptions(t *testing.T) {
 			}
 			if !s.settings.ParseSendEscapes || !s.app.SettingsDirty {
 				t.Fatal("changing text escape option did not update and mark the setting dirty")
+			}
+		})
+	}
+}
+
+func TestChecksumLongestAlgorithmFitsAcrossLanguagesAndScales(t *testing.T) {
+	for _, language := range []string{"en", "zh-CN"} {
+		for _, scale := range []float32{1, 1.25, 1.5, 1.6, 2} {
+			t.Run(fmt.Sprintf("%s_scale_%g", language, scale), func(t *testing.T) {
+				s := newController(&internal.App{Settings: config.Settings{
+					Language: language, ChecksumAlgorithm: "CRC16-CCITT-FALSE", ChecksumHeaderBytes: "0", ChecksumTailBytes: "0",
+				}})
+				tt := gui.NewTester(s.view, 800, 600)
+				tt.SetScale(scale)
+				if err := tt.Click(s.tr("选项", "Options")); err != nil {
+					t.Fatal(err)
+				}
+				labelBounds, labelFound := tt.Find(s.tr("校验算法", "Checksum algorithm"))
+				algorithmBounds, algorithmFound := tt.Find("CRC16-CCITT-FALSE")
+				header, headerFound := tt.AccessByRole(gui.RoleTextField, s.tr("排除帧头字节数", "Excluded header byte count"))
+				tail, tailFound := tt.AccessByRole(gui.RoleTextField, s.tr("排除帧尾字节数", "Excluded tail byte count"))
+				if !labelFound || !algorithmFound || algorithmBounds.W <= 0 || !headerFound || !tailFound {
+					t.Fatalf("long checksum option is missing at scale %g: label=%+v algorithm=%+v header=%+v tail=%+v", scale, labelBounds, algorithmBounds, header, tail)
+				}
+				labelCenter := labelBounds.Y + labelBounds.H/2
+				algorithmCenter := algorithmBounds.Y + algorithmBounds.H/2
+				headerCenter := header.Bounds.Y + header.Bounds.H/2
+				tailCenter := tail.Bounds.Y + tail.Bounds.H/2
+				if labelCenter < headerCenter-1 || labelCenter > headerCenter+1 ||
+					algorithmCenter < headerCenter-1 || algorithmCenter > headerCenter+1 ||
+					tailCenter < headerCenter-1 || tailCenter > headerCenter+1 {
+					t.Fatalf("long checksum option does not share the frame controls row at scale %g: label=%+v algorithm=%+v header=%+v tail=%+v", scale, labelBounds, algorithmBounds, header.Bounds, tail.Bounds)
+				}
+				if header.Bounds.X+header.Bounds.W > tail.Bounds.X || tail.Bounds.X+tail.Bounds.W > labelBounds.X || labelBounds.X+labelBounds.W > algorithmBounds.X || algorithmBounds.X < 0 || algorithmBounds.X+algorithmBounds.W > 800 {
+					t.Fatalf("checksum controls are clipped or out of order at scale %g: label=%+v algorithm=%+v header=%+v tail=%+v", scale, labelBounds, algorithmBounds, header.Bounds, tail.Bounds)
+				}
+			})
+		}
+	}
+}
+func TestChecksumAlgorithmOptionTooltips(t *testing.T) {
+	for _, language := range []string{"en", "zh-CN"} {
+		t.Run(language, func(t *testing.T) {
+			s := newController(&internal.App{Settings: config.Settings{
+				Language: language, ChecksumAlgorithm: "None", ChecksumHeaderBytes: "0", ChecksumTailBytes: "0",
+			}})
+			tt := gui.NewTester(s.view, 800, 600)
+			if err := tt.Click(s.tr("选项", "Options")); err != nil {
+				t.Fatal(err)
+			}
+			if err := tt.Click("None"); err != nil {
+				t.Fatal(err)
+			}
+			tooltips := sendChecksumTooltipsEnglish
+			if language == "zh-CN" {
+				tooltips = sendChecksumTooltipsChinese
+			}
+			for index := 1; index < len(sendChecksumAlgorithms); index++ {
+				option := sendChecksumAlgorithms[index]
+				bounds, found := tt.Find(option)
+				if !found {
+					t.Fatalf("checksum option %q is missing", option)
+				}
+				tt.Move(bounds.X+bounds.W/2, bounds.Y+bounds.H/2)
+				tt.Advance(time.Second)
+				if !tt.HasText(tooltips[index]) {
+					t.Fatalf("checksum option %q tooltip is missing: %q", option, tooltips[index])
+				}
+			}
+			if err := tt.Click("XOR8"); err != nil {
+				t.Fatal(err)
+			}
+			if err := tt.Click("XOR8"); err != nil {
+				t.Fatal(err)
+			}
+			noneBounds, found := tt.Find("None")
+			if !found {
+				t.Fatal("None checksum option is missing")
+			}
+			tt.Move(noneBounds.X+noneBounds.W/2, noneBounds.Y+noneBounds.H/2)
+			tt.Advance(time.Second)
+			if !tt.HasText(tooltips[0]) {
+				t.Fatalf("None checksum tooltip is missing: %q", tooltips[0])
 			}
 		})
 	}

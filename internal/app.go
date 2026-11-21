@@ -481,7 +481,22 @@ func (s *App) format(hex, crlf bool) Format {
 }
 
 func (s *App) encodeSendData(input string, hex, crlf bool) ([]byte, error) {
-	return encodeInput(input, s.format(hex, crlf), s.Settings.ParseSendEscapes)
+	format := s.format(hex, crlf)
+	data, err := encodePayload(input, format, s.Settings.ParseSendEscapes)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateSendData(data, format.CRLF); err != nil {
+		return nil, err
+	}
+	data, err = appendChecksum(data, s.Settings.ChecksumAlgorithm, s.Settings.ChecksumHeaderBytes, s.Settings.ChecksumTailBytes)
+	if err != nil {
+		return nil, err
+	}
+	if format.CRLF {
+		data = append(data, '\r', '\n')
+	}
+	return data, nil
 }
 
 func (s *App) SendText(input string) {
