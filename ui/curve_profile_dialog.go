@@ -2,6 +2,7 @@ package ui
 
 import (
 	"strconv"
+	"strings"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
@@ -9,14 +10,34 @@ import (
 	"github.com/fcying/SerialGo/internal"
 )
 
+var curvePointLimitError = localizedText{zh: "请输入范围内的整数", en: "Enter an integer in the range shown."}
+
+func parseCurvePointLimit(text string) (int, bool) {
+	limit, err := strconv.Atoi(text)
+	return limit, err == nil && limit >= 0 && limit <= config.MaxCurvePointLimit
+}
+
+func filterCurvePointLimitInput(text string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, text)
+}
+
 type curveProfileEdit struct {
-	window                       *mygo.Window
-	name, timePattern, timeScale string
-	error                        localizedText
+	window                                   *mygo.Window
+	name, timePattern, timeScale, pointLimit string
+	pointLimitPaste                          string
+	error                                    localizedText
 }
 
 func newCurveProfileEdit(draft curveProfileDraft) *curveProfileEdit {
-	return &curveProfileEdit{name: draft.name, timePattern: draft.timePattern, timeScale: draft.timeScale}
+	return &curveProfileEdit{
+		name: draft.name, timePattern: draft.timePattern, timeScale: draft.timeScale,
+		pointLimit: strconv.Itoa(draft.pointLimit),
+	}
 }
 
 func (s *controller) openCurveProfileEditor() {
@@ -31,7 +52,7 @@ func (s *controller) openCurveProfileEditor() {
 	v.profileEditor = e
 	e.window = mygo.NewWindow(mygo.WindowOptions{
 		Title: s.tr("配置", "Configuration"), Parent: s.curveWindow, Modal: true,
-		Width: 320, Height: 240, MinWidth: 320, MinHeight: 240,
+		Width: 280, Height: 320, MinWidth: 280, MinHeight: 320,
 		Content: ui.View(s.curveProfileEditorView),
 	})
 	e.window.OnClosed(func() {
@@ -70,6 +91,11 @@ func (s *controller) confirmCurveProfileEditor() {
 		e.error = localizedText{zh: "时间倍率必须是数字", en: "Time scale must be a number"}
 		return
 	}
+	limit, valid := parseCurvePointLimit(e.pointLimit)
+	if !valid {
+		return
+	}
+	profile.PointLimit = limit
 	err = config.ValidateCurveProfiles([]config.CurveProfile{profile}, 0)
 	if err == nil && e.timePattern != v.draft.timePattern {
 		err = internal.ValidateCurveProfile(profile)
@@ -78,12 +104,13 @@ func (s *controller) confirmCurveProfileEditor() {
 		e.error = dialogError(err)
 		return
 	}
-	if e.name == v.draft.name && e.timePattern == v.draft.timePattern && e.timeScale == v.draft.timeScale {
+	if e.name == v.draft.name && e.timePattern == v.draft.timePattern && e.timeScale == v.draft.timeScale && profile.PointLimit == v.draft.pointLimit {
 		s.closeCurveProfileEditor()
 		return
 	}
 	candidate := v.draft
 	candidate.name, candidate.timePattern, candidate.timeScale = e.name, e.timePattern, e.timeScale
+	candidate.pointLimit = profile.PointLimit
 	v.draft, v.dirty = candidate, true
 	applied := s.applyCurveDraft()
 	if !applied {
@@ -103,6 +130,7 @@ func (s *controller) curveProfileEditorView(c *ui.Context) {
 		return
 	}
 	timeHelp := s.tr("留空: 使用系统接收时间.\n填写: 提取第 1 个捕获组, 乘以时间倍率得到设备时间 (秒).", "Empty: Use system receive time.\nFilled: Extract capture group 1 and multiply by the time scale for device time (seconds).")
+	_, validPointLimit := parseCurvePointLimit(e.pointLimit)
 	ui.Column(c.Key("profile-editor")).Fill().Padding(12).Gap(wideGap).Background(c.Theme().Background).Children(func() {
 		ui.Scroll(c.Key("fields")).FillWidth().Grow(1).MinHeight(0).Children(func() {
 			ui.Column(c.Key("form")).FillWidth().Gap(wideGap).Children(func() {
@@ -129,16 +157,38 @@ func (s *controller) curveProfileEditorView(c *ui.Context) {
 					// Keep the accessible value available while MyGo disables the editor.
 					ui.TextInput(c.Key("input"), &e.timeScale).FillWidth().Height(controlHeight).PaddingY(controlPadY).MaxLength(32).Label(label).Value(e.timeScale).Disabled(e.timePattern == "").Description(timeHelp)
 				})
+				ui.Column(c.Key("point-limit")).FillWidth().Gap(compactGap).Children(func() {
+					label := s.tr("每条曲线采样上限", "Samples per curve")
+					maxLimit := strconv.Itoa(config.MaxCurvePointLimit)
+					rangeHint := s.tr("(1-"+maxLimit+", 0 为不限)", "(1-"+maxLimit+", 0 for unlimited)")
+					ui.Text(c.Key("caption"), label+" "+rangeHint).FontSize(11)
+					input := ui.TextInput(c.Key("input"), &e.pointLimit).FillWidth().Height(controlHeight).PaddingY(controlPadY).
+						MaxLength(len(maxLimit)+1).Label(label).Description(rangeHint).OnPaste(func(text string) bool {
+						e.pointLimitPaste = filterCurvePointLimitInput(text)
+						return true
+					}).OnChange(func() {
+						e.pointLimit = filterCurvePointLimitInput(e.pointLimit)
+					})
+					if e.pointLimitPaste != "" {
+						start, end := input.TextSelection()
+						if len(e.pointLimit)-end+start+len(e.pointLimitPaste) <= len(maxLimit)+1 {
+							input.ReplaceText(start, end, e.pointLimitPaste)
+						}
+						e.pointLimitPaste = ""
+					}
+				})
 			})
 		})
-		if e.error.en != "" || e.error.zh != "" {
+		if !validPointLimit {
+			ui.Text(c.Key("point-limit-error"), s.tr(curvePointLimitError.zh, curvePointLimitError.en)).FillWidth().TextColor(c.Theme().Danger)
+		} else if e.error.en != "" || e.error.zh != "" {
 			ui.Scroll(c.Key("error")).FillWidth().Height(40).Children(func() {
 				ui.Text(c.Key("message"), s.tr(e.error.zh, e.error.en)).FillWidth().TextColor(c.Theme().Danger)
 			})
 		}
 		ui.Row(c.Key("actions")).FillWidth().Gap(wideGap).Justify(ui.Center).Children(func() {
 			ui.Button(c.Key("cancel"), s.tr("取消", "Cancel")).Width(76).Height(28).OnClick(s.closeCurveProfileEditor)
-			ui.PrimaryButton(c.Key("ok"), s.tr("确定", "OK")).Width(76).Height(28).OnClick(s.confirmCurveProfileEditor)
+			ui.PrimaryButton(c.Key("ok"), s.tr("确定", "OK")).Width(76).Height(28).Disabled(!validPointLimit).OnClick(s.confirmCurveProfileEditor)
 		})
 	})
 	if c.Shortcut(0, ui.KeyEscape) {

@@ -3,6 +3,7 @@ package internal
 import (
 	"fmt"
 	"math"
+	"math/bits"
 	"regexp"
 	"slices"
 	"strconv"
@@ -15,7 +16,6 @@ import (
 	"github.com/fcying/SerialGo/internal/i18n"
 )
 
-const curvePointLimit = 10000
 const curveLineLimit = 4096
 const curvePreviewLimit = 64 * 1024
 
@@ -25,10 +25,28 @@ type CurvePoint struct {
 	Break bool
 }
 
+// CurveBlock summarizes a continuous, time-ordered range of snapshot points.
+// End is exclusive; Min and Max are point indices, not interpolated values.
+type CurveBlock struct {
+	Start, End, Min, Max int
+}
+
+const curveSummaryBlockSize = 256
+
+type curveBlockCache struct {
+	min, max     int // Physical indices.
+	valid, clean bool
+}
+
 type CurveSeries struct {
 	Name, Unit string
 	Color      uint32
 	Points     []CurvePoint
+	// TimeRuns lists the starts of nondecreasing spans in Points. Empty means no index.
+	TimeRuns []int
+	// Blocks contains valid summaries of aligned groups of 256, 512, 1024, …
+	// points, sorted by Start and then by decreasing End for the same Start.
+	Blocks []CurveBlock
 }
 
 // CurveSnapshot owns its copied series. Revision changes only with plot data
@@ -51,9 +69,10 @@ type curveRule struct {
 }
 
 type compiledCurve struct {
-	rules     []curveRule
-	timeRegex *regexp.Regexp
-	timeScale float64
+	rules      []curveRule
+	timeRegex  *regexp.Regexp
+	timeScale  float64
+	pointLimit int
 }
 
 // ValidateCurveProfile checks a complete edit without allocating preview state.
@@ -67,7 +86,7 @@ func compileCurve(profile config.CurveProfile) (compiledCurve, error) {
 	if err != nil {
 		return compiledCurve{}, err
 	}
-	compiled := compiledCurve{timeScale: profile.TimeScale}
+	compiled := compiledCurve{timeScale: profile.TimeScale, pointLimit: profile.PointLimit}
 	compile := func(pattern, zh, en string) (*regexp.Regexp, error) {
 		rule, err := regexp.Compile(pattern)
 		if err != nil {
@@ -107,26 +126,206 @@ func compileCurve(profile config.CurveProfile) (compiledCurve, error) {
 }
 
 type curveRing struct {
-	points      []CurvePoint
-	head, count int
-	segment     bool
+	points     []CurvePoint
+	head       int
+	segment    bool
+	timeBreaks []int               // Physical indices of backwards jumps, oldest first.
+	blocks     [][]curveBlockCache // Level 0 holds 256-point physical blocks; each higher level doubles the size.
 	// Stage each record's value until its shared timestamp is validated.
 	pendingValue float64
 	pendingValid bool
 }
 
-func (r *curveRing) add(point CurvePoint) {
-	if r.points == nil {
-		r.points = make([]CurvePoint, curvePointLimit)
-	}
+func (r *curveRing) add(point CurvePoint, limit int) {
 	point.Break = r.segment
 	r.segment = false
-	if r.count < curvePointLimit {
-		r.points[(r.head+r.count)%curvePointLimit] = point
-		r.count++
-	} else {
-		r.points[r.head] = point
-		r.head = (r.head + 1) % curvePointLimit
+	physical := len(r.points)
+	if limit > 0 && physical == limit {
+		physical = r.head
+	}
+	r.dirtyBlock(physical / curveSummaryBlockSize)
+	n := len(r.points)
+	if n != 0 {
+		last := n - 1
+		if r.head != 0 {
+			last = r.head - 1
+		}
+		if point.X < r.points[last].X {
+			start := n
+			if n == limit {
+				start = r.head
+			}
+			r.timeBreaks = append(r.timeBreaks, start)
+		}
+	}
+	if limit == 0 {
+		r.points = append(r.points, point)
+		return
+	}
+	if len(r.points) < limit {
+		if len(r.points) == cap(r.points) {
+			points := make([]CurvePoint, len(r.points), min(limit, max(16, 2*len(r.points))))
+			copy(points, r.points)
+			r.points = points
+		}
+		r.points = append(r.points, point)
+		return
+	}
+	r.points[r.head] = point
+	r.head = (r.head + 1) % limit
+	if len(r.timeBreaks) != 0 && r.timeBreaks[0] == r.head {
+		if len(r.timeBreaks) == 1 {
+			r.timeBreaks = r.timeBreaks[:0]
+		} else {
+			r.timeBreaks = r.timeBreaks[1:]
+		}
+	}
+}
+
+// copyLatest copies the newest len(dst) points in acquisition order.
+func (r *curveRing) copyLatest(dst []CurvePoint) {
+	if len(dst) == 0 {
+		return
+	}
+	start := (r.head + len(r.points) - len(dst)) % len(r.points)
+	first := copy(dst, r.points[start:])
+	copy(dst[first:], r.points[:start])
+}
+
+// Dirtying stops at the first dirty node: a clean parent can only have clean
+// children. Snapshot publication refreshes both children even if one is invalid.
+func (r *curveRing) dirtyBlock(block int) {
+	if len(r.blocks) == 0 || block == len(r.blocks[0]) {
+		for len(r.blocks) < bits.Len(uint(block+1)) {
+			r.blocks = append(r.blocks, nil)
+		}
+		for level := range r.blocks {
+			index := block >> level
+			if index == len(r.blocks[level]) {
+				r.blocks[level] = append(r.blocks[level], curveBlockCache{})
+			} else {
+				r.blocks[level][index].clean = false
+			}
+		}
+		return
+	}
+	for level := range r.blocks {
+		cache := &r.blocks[level][block>>level]
+		if !cache.clean {
+			break
+		}
+		cache.clean = false
+	}
+}
+
+func (r *curveRing) refreshBlock(first, level int) curveBlockCache {
+	cache := &r.blocks[level][first>>level]
+	if cache.clean {
+		return *cache
+	}
+	cache.clean = true
+	start := first * curveSummaryBlockSize
+	if level == 0 {
+		cache.min, cache.max, cache.valid = start, start, true
+		for i := start; i < start+curveSummaryBlockSize; i++ {
+			p := r.points[i]
+			// A break on the first point is outside this block; the caller
+			// always processes its incoming segment (or dot) separately.
+			if !finiteCurve(p.X) || !finiteCurve(p.Y) || (i > start && (p.Break || p.X < r.points[i-1].X)) {
+				cache.valid = false
+				break
+			}
+			if p.Y < r.points[cache.min].Y {
+				cache.min = i
+			}
+			if p.Y > r.points[cache.max].Y {
+				cache.max = i
+			}
+		}
+		return *cache
+	}
+	mid := first + (1 << (level - 1))
+	left, right := r.refreshBlock(first, level-1), r.refreshBlock(mid, level-1)
+	join := mid * curveSummaryBlockSize
+	cache.valid = left.valid && right.valid && !r.points[join].Break && r.points[join].X >= r.points[join-1].X
+	if cache.valid {
+		cache.min, cache.max = left.min, left.max
+		if r.points[right.min].Y < r.points[cache.min].Y {
+			cache.min = right.min
+		}
+		if r.points[right.max].Y > r.points[cache.max].Y {
+			cache.max = right.max
+		}
+	}
+	return *cache
+}
+
+func (r *curveRing) appendBlockTree(dst []CurveBlock, first, level, offset int) []CurveBlock {
+	cache := r.blocks[level][first>>level]
+	if cache.valid {
+		start := first*curveSummaryBlockSize + offset
+		dst = append(dst, CurveBlock{
+			Start: start, End: start + (curveSummaryBlockSize << level),
+			Min: cache.min + offset, Max: cache.max + offset,
+		})
+	}
+	if level > 0 {
+		dst = r.appendBlockTree(dst, first, level-1, offset)
+		dst = r.appendBlockTree(dst, first+(1<<(level-1)), level-1, offset)
+	}
+	return dst
+}
+
+// Copy complete, aligned trees in logical order. No summary spans the ring
+// head or the physical end of the backing slice, including partial end blocks.
+func (r *curveRing) copyBlocks(dst []CurveBlock) []CurveBlock {
+	dst = dst[:0]
+	addRange := func(lo, hi, offset int) {
+		first, end := (lo+curveSummaryBlockSize-1)/curveSummaryBlockSize, hi/curveSummaryBlockSize
+		for first < end {
+			// Largest aligned tree that fits in this physical range.
+			level := min(bits.Len(uint(end-first))-1, bits.TrailingZeros(uint(first)))
+			r.refreshBlock(first, level)
+			dst = r.appendBlockTree(dst, first, level, offset)
+			first += 1 << level
+		}
+	}
+	addRange(r.head, len(r.points), -r.head)
+	addRange(0, r.head, len(r.points)-r.head)
+	return dst
+}
+
+func (r *curveRing) logicalIndex(physical int) int {
+	if physical < r.head {
+		physical += len(r.points)
+	}
+	return physical - r.head
+}
+
+func (r *curveRing) resize(limit int) {
+	if r.head == 0 && (limit == 0 || cap(r.points) <= limit) {
+		return
+	}
+	count := len(r.points)
+	if limit > 0 {
+		count = min(count, limit)
+	}
+	points := make([]CurvePoint, count)
+	r.copyLatest(points)
+	breaks := r.timeBreaks[:0]
+	removed := len(r.points) - count
+	for _, physical := range r.timeBreaks {
+		index := r.logicalIndex(physical) - removed
+		if index > 0 {
+			breaks = append(breaks, index)
+		}
+	}
+	r.timeBreaks = breaks
+	r.points, r.head = points, 0
+	blockCount := (count + curveSummaryBlockSize - 1) / curveSummaryBlockSize
+	r.blocks = make([][]curveBlockCache, bits.Len(uint(blockCount)))
+	for level := range r.blocks {
+		r.blocks[level] = make([]curveBlockCache, ((blockCount-1)>>level)+1)
 	}
 }
 
@@ -150,11 +349,19 @@ func (p *curveParser) reset(compiled compiledCurve) {
 	*p = curveParser{compiled: compiled, rings: make([]curveRing, len(compiled.rules)), revision: revision, statsRevision: statsRevision}
 }
 
+func (p *curveParser) setPointLimit(limit int) {
+	for i := range p.rings {
+		p.rings[i].resize(limit)
+	}
+	p.compiled.pointLimit = limit
+	p.revision++
+}
+
 func (p *curveParser) boundary() {
 	p.lineSize, p.discard = 0, false
 	p.haveX = false
 	for i := range p.rings {
-		p.rings[i].segment = p.rings[i].count > 0
+		p.rings[i].segment = len(p.rings[i].points) > 0
 	}
 }
 
@@ -315,12 +522,16 @@ func (p *curveParser) parseLine(line string, at time.Time) {
 	p.revision++
 	for i := range p.rings {
 		if p.rings[i].pendingValid {
-			p.rings[i].add(CurvePoint{X: x, Y: p.rings[i].pendingValue})
+			p.rings[i].add(CurvePoint{X: x, Y: p.rings[i].pendingValue}, p.compiled.pointLimit)
 		}
 	}
 }
 
 func (p *curveParser) snapshot(dst *CurveSnapshot) {
+	p.snapshotWithCache(dst, nil)
+}
+
+func (p *curveParser) snapshotWithCache(dst *CurveSnapshot, cache *CurveLiveCache) {
 	if p.revision == 0 {
 		p.revision = 1
 	}
@@ -335,18 +546,30 @@ func (p *curveParser) snapshot(dst *CurveSnapshot) {
 	} else {
 		dst.Series = dst.Series[:len(p.rings)]
 	}
-	for i, ring := range p.rings {
+	for i := range p.rings {
+		ring := &p.rings[i]
 		series := &dst.Series[i]
 		series.Name, series.Unit = p.compiled.rules[i].channel.Name, p.compiled.rules[i].channel.Unit
 		series.Color = p.compiled.rules[i].color
-		if cap(series.Points) < ring.count {
-			series.Points = make([]CurvePoint, ring.count)
+		count := len(ring.points)
+		if cache != nil {
+			cache.copyPoints(i, series, ring, p.lines)
 		} else {
-			series.Points = series.Points[:ring.count]
+			if cap(series.Points) < count || (p.compiled.pointLimit > 0 && cap(series.Points) > p.compiled.pointLimit) {
+				series.Points = make([]CurvePoint, count, cap(ring.points))
+			} else {
+				series.Points = series.Points[:count]
+			}
+			ring.copyLatest(series.Points)
 		}
-		first := min(ring.count, len(ring.points)-ring.head)
-		copy(series.Points, ring.points[ring.head:ring.head+first])
-		copy(series.Points[first:], ring.points[:ring.count-first])
+		series.Blocks = ring.copyBlocks(series.Blocks)
+		series.TimeRuns = series.TimeRuns[:0]
+		if count != 0 {
+			series.TimeRuns = append(slices.Grow(series.TimeRuns, 1+len(ring.timeBreaks)), 0)
+			for _, physical := range ring.timeBreaks {
+				series.TimeRuns = append(series.TimeRuns, ring.logicalIndex(physical))
+			}
+		}
 	}
 	dst.LatestX = p.lastX
 	dst.DeviceTime = p.compiled.timeRegex != nil
@@ -390,7 +613,7 @@ func (s *App) DeleteCurveProfile(index int) error {
 
 // sameStoredCurve compares full stored values, including non-finite legacy values.
 func sameStoredCurve(a, b config.CurveProfile) bool {
-	if a.Name != b.Name || a.TimePattern != b.TimePattern || math.Float64bits(a.TimeScale) != math.Float64bits(b.TimeScale) || len(a.Channels) != len(b.Channels) {
+	if a.Name != b.Name || a.TimePattern != b.TimePattern || math.Float64bits(a.TimeScale) != math.Float64bits(b.TimeScale) || a.PointLimit != b.PointLimit || len(a.Channels) != len(b.Channels) {
 		return false
 	}
 	for i, channel := range a.Channels {
@@ -501,6 +724,9 @@ func (s *App) applyCurveProfiles(profiles []config.CurveProfile, active int, for
 			ruleIndex++
 		}
 		s.curve.parser.revision++
+	}
+	if !reset && s.curve.activeValid && s.curve.parser.compiled.pointLimit != profiles[active].PointLimit {
+		s.curve.parser.setPointLimit(profiles[active].PointLimit)
 	}
 	if len(profiles) == 0 || !s.curve.activeValid {
 		s.curve.enabled.Store(false)

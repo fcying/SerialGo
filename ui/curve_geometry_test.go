@@ -2,6 +2,8 @@ package ui
 
 import (
 	"bytes"
+	"fmt"
+	"strings"
 	"testing"
 
 	gui "github.com/egoist/mygo/ui"
@@ -71,5 +73,100 @@ func TestCurveGeometryRefreshesAcrossPreviewLiveAndViewportChanges(t *testing.T)
 				t.Fatal("visible chart did not reflect the data or viewport change")
 			}
 		})
+	}
+}
+
+func TestCurveDenseColumnsPreserveExtremaAndBreaks(t *testing.T) {
+	s := newController(&internal.App{Settings: config.Settings{Language: "en"}})
+	s.curve = newCurveViewState(s.settings)
+	v := s.curve
+	v.span = "All"
+	points := []internal.CurvePoint{{X: 0, Y: 2}}
+	for run, sign := range []float64{1, -1} {
+		for i := range 100 {
+			x := 5 + float64(100*run+i)/100_000
+			y := 2.0
+			if i == 37 {
+				y = 8
+			}
+			points = append(points, internal.CurvePoint{X: x, Y: y * sign, Break: i == 0})
+		}
+	}
+	points = append(points, internal.CurvePoint{X: 10, Y: -2, Break: true})
+	v.snapshot = internal.CurveSnapshot{Revision: 1, Series: []internal.CurveSeries{{Points: points, Color: 0xff0000ff}}}
+	tt := gui.NewTester(func(c *gui.Context) {
+		gui.Column(c).Fill().Children(func() { s.curveChart(c) })
+	}, 500, 300)
+	image := tt.Image()
+	chart, found := tt.Find("Serial curve chart")
+	if !found {
+		t.Fatal("plot is not visible")
+	}
+	plot := gui.Rect{X: chart.X + 66, Y: chart.Y + 14, W: chart.W - 82, H: chart.H - 48}
+	bounds := v.geometry.bounds
+	x := int(plot.X + plot.W/2)
+	redAt := func(value float64) bool {
+		y := int(plot.Y + plot.H - float32((value-bounds.y0)/(bounds.y1-bounds.y0))*plot.H)
+		for dx := -2; dx <= 2; dx++ {
+			pixel := image.RGBAAt(x+dx, y)
+			if int(pixel.R)-int(pixel.G) > 30 && int(pixel.R)-int(pixel.B) > 30 {
+				return true
+			}
+		}
+		return false
+	}
+	peak, trough, bridge := redAt(7), redAt(-7), redAt(0)
+	if !peak || !trough || bridge {
+		t.Fatalf("dense traces: upper extreme=%t lower extreme=%t gap bridged=%t (plot=%+v bounds=%+v path=%+v)", peak, trough, bridge, plot, bounds, v.paths[0].Bounds())
+	}
+}
+
+func TestCurveBlockSummaryDrawPreservesSpikesAndGaps(t *testing.T) {
+	var records strings.Builder
+	records.WriteString("t=0 VBAT=2\nt=1 VBAT=bad\n")
+	for i := 1; i < 1024; i++ {
+		y := 2
+		if i >= 512 {
+			y = -2
+		}
+		switch i {
+		case 300:
+			y = 8
+		case 512:
+			// An invalid record creates a break at the join of two children.
+			records.WriteString("t=5000512 VBAT=bad\n")
+		case 800:
+			y = -8
+		}
+		fmt.Fprintf(&records, "t=%d VBAT=%d\n", 5000000+i, y)
+	}
+	records.WriteString("t=9999999 VBAT=bad\nt=10000000 VBAT=-2\n")
+	s := newController(&internal.App{Settings: config.Settings{Language: "en"}})
+	s.curve = newCurveViewState(s.settings)
+	s.curve.span = "All"
+	s.curve.snapshot = curveTimeWindowSnapshot(t, records.String())
+	s.curve.snapshot.Series[0].Color = 0xff0000ff
+	tt := gui.NewTester(func(c *gui.Context) {
+		gui.Column(c).Fill().Children(func() { s.curveChart(c) })
+	}, 500, 300)
+	chart, found := tt.Find("Serial curve chart")
+	if !found {
+		t.Fatal("plot is not visible")
+	}
+	plot := gui.Rect{X: chart.X + 66, Y: chart.Y + 14, W: chart.W - 82, H: chart.H - 48}
+	bounds, image := s.curve.geometry.bounds, tt.Image()
+	x := int(plot.X + plot.W/2)
+	redAt := func(value float64) bool {
+		y := int(plot.Y + plot.H - float32((value-bounds.y0)/(bounds.y1-bounds.y0))*plot.H)
+		for dx := -2; dx <= 2; dx++ {
+			pixel := image.RGBAAt(x+dx, y)
+			if int(pixel.R)-int(pixel.G) > 30 && int(pixel.R)-int(pixel.B) > 30 {
+				return true
+			}
+		}
+		return false
+	}
+	if !redAt(7) || !redAt(-7) || redAt(0) {
+		t.Fatal("summarized plot lost a spike or bridged a gap")
 	}
 }

@@ -70,7 +70,7 @@ func TestCurveChartDoesNotBridgeParserBoundaries(t *testing.T) {
 		v := newCurveViewState(&config.Settings{})
 		v.span, v.position = "10 s", 50
 		v.snapshot = curveTimeWindowSnapshot(t, text)
-		segments := curveVisibleSegments{points: v.snapshot.Series[0].Points, x0: 45, x1: 55}
+		segments := newCurveVisibleSegments(v.snapshot.Series[0], 45, 55)
 		_, _, visible := segments.next()
 		if visible {
 			t.Fatalf("parser boundary produced a spurious crossing: %q", text)

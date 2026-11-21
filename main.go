@@ -9,7 +9,7 @@ import (
 
 const (
 	appName    = "SerialGo"
-	appVersion = "1.1.0"
+	appVersion = "1.1.1"
 )
 
 func main() {

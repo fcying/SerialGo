@@ -1,7 +1,9 @@
 package ui
 
 import (
+	"fmt"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/fcying/SerialGo/config"
@@ -132,4 +134,109 @@ func TestCurvePausedTimeWindowUsesFrozenSnapshot(t *testing.T) {
 	v.paused = false
 	v.snapshot = live.snapshot
 	assertCurveTimeWindowBounds(t, v, curveBounds{-9, 1, 9.2, 20.8})
+}
+
+func curveSummaryWindowSeries(t *testing.T) internal.CurveSeries {
+	t.Helper()
+	var records strings.Builder
+	for i := range 1024 {
+		fmt.Fprintf(&records, "t=%d VBAT=%d\n", i, (i*29)%127)
+	}
+	return curveTimeWindowSnapshot(t, records.String()).Series[0]
+}
+
+func TestCurveBlockSummarySelectionUsesLargestVisibleColumn(t *testing.T) {
+	series := curveSummaryWindowSeries(t)
+	for _, tc := range []struct {
+		name        string
+		x0, x1      float64
+		columnWidth float64
+		first, end  int
+	}{
+		{"root", 0, 1023, 1024, 0, 1024},
+		{"fallback_to_child", 0, 1023, 512, 0, 512},
+		{"fallback_to_base", 0, 1023, 256, 0, 256},
+		{"fallback_to_raw", 0, 1023, 128, 0, 0},
+		{"clipped_right", 0, 511.5, 0, 0, 512},
+		{"clipped_left", 511.5, 1023, 0, 512, 1024},
+		{"clipped_on_both_sides", 255.5, 511.5, 0, 256, 512},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var column func(float64) int
+			if tc.columnWidth != 0 {
+				column = func(x float64) int { return int(x / tc.columnWidth) }
+			}
+			segments := newCurveVisibleSegments(series, tc.x0, tc.x1)
+			a, b, visible := segments.next()
+			if !visible || a.X != tc.x0 || b.X != float64(tc.first) {
+				t.Fatalf("incoming segment = (%+v, %+v, %t), want [%g, %d]", a, b, visible, tc.x0, tc.first)
+			}
+			block, ok := segments.nextBlock(column)
+			if ok != (tc.end != 0) || (ok && (block.Start != tc.first || block.End != tc.end)) {
+				t.Fatalf("summary = (%+v, %t), want [%d, %d)", block, ok, tc.first, tc.end)
+			}
+			next := max(tc.first+1, tc.end)
+			if next < len(series.Points) {
+				a, b, visible := segments.next()
+				if !visible || a != series.Points[next-1] || b.X != min(tc.x1, float64(next)) {
+					t.Fatalf("outgoing segment = (%+v, %+v, %t), want [%d, %g]", a, b, visible, next-1, min(tc.x1, float64(next)))
+				}
+			}
+		})
+	}
+	if raw := closestCurvePoint(series, 0, 1023, 370.25); raw != 370 || series.Points[raw].Y != 62 {
+		t.Fatalf("hover did not retrieve the original interior sample: index %d", raw)
+	}
+}
+
+func TestCurveBlockSummaryBoundsMatchFullScan(t *testing.T) {
+	series := curveSummaryWindowSeries(t)
+	blocks := series.Blocks
+	v := newCurveViewState(&config.Settings{})
+	v.snapshot = internal.CurveSnapshot{LatestX: 1023, Series: []internal.CurveSeries{series}}
+	for _, span := range []string{"10 s", "60 s", "300 s", "All"} {
+		for _, position := range []float64{0, 35, 100} {
+			v.span, v.position = span, position
+			got, ok := v.bounds()
+			v.snapshot.Series[0].Blocks = nil
+			want, wantOK := v.bounds()
+			v.snapshot.Series[0].Blocks = blocks
+			if ok != wantOK || got != want {
+				t.Fatalf("%s position %g: summarized %+v, full scan %+v", span, position, got, want)
+			}
+		}
+	}
+}
+
+func TestCurveIndexedWindowsMatchFullScan(t *testing.T) {
+	text := "t=0 VBAT=2\nt=1 I=6\nt=10 VBAT=30 I=8\nt=10 VBAT=7 I=9\n" +
+		"t=20 VBAT=bad\nt=30 VBAT=4\nt=4 I=20\nt=5 VBAT=50\n" +
+		"t=6 VBAT=3\nt=40 VBAT=5 I=6\nt=3 VBAT=7\nt=8 I=12\n"
+	snapshot := curveTimeWindowSnapshot(t, text)
+	for _, indexed := range snapshot.Series {
+		unindexed := indexed
+		unindexed.TimeRuns = nil
+		for x0 := -1.0; x0 <= 42; x0++ {
+			for _, width := range []float64{0, .5, 4, 25, 60} {
+				x1 := x0 + width
+				fast, full := newCurveVisibleSegments(indexed, x0, x1), newCurveVisibleSegments(unindexed, x0, x1)
+				for {
+					a, b, ok := fast.next()
+					wantA, wantB, wantOK := full.next()
+					if ok != wantOK || ok && (a != wantA || b != wantB || fast.nextIndex != full.nextIndex) {
+						t.Fatalf("%s [%g, %g]: got %v→%v (%v), want %v→%v (%v)", indexed.Name, x0, x1, a, b, ok, wantA, wantB, wantOK)
+					}
+					if !ok {
+						break
+					}
+				}
+				for _, x := range []float64{x0, (x0 + x1) / 2, x1} {
+					got, want := closestCurvePoint(indexed, x0, x1, x), closestCurvePoint(unindexed, x0, x1, x)
+					if got != want {
+						t.Fatalf("%s [%g, %g] hover %g: index %d, want %d", indexed.Name, x0, x1, x, got, want)
+					}
+				}
+			}
+		}
+	}
 }

@@ -3,6 +3,7 @@ package internal
 import (
 	"math"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -77,6 +78,235 @@ func TestCurveDeleteSameSchemaResetsAcquisition(t *testing.T) {
 				}
 			} else if snapshot.Lines != 0 || len(snapshot.Series[0].Points) != 0 || snapshot.LatestX != 0 {
 				t.Fatalf("停止状态的删除重新启动了采样: %+v", snapshot)
+			}
+		})
+	}
+}
+
+func TestCurvePointLimitResizesLiveHistory(t *testing.T) {
+	profile := config.NewCurveProfile("resize")
+	profile.PointLimit = 3
+	app := &App{Settings: config.Settings{CurveProfiles: []config.CurveProfile{profile}}}
+	err := app.StartCurve(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receive := testCurveReceiver(app.curveReceiver())
+	at := time.Unix(1, 0)
+	var snapshot CurveSnapshot
+	check := func(first, last int, lines uint64) {
+		t.Helper()
+		app.CurveSnapshot(&snapshot)
+		points := snapshot.Series[0].Points
+		if !app.CurveRunning() || len(points) != last-first+1 || snapshot.Lines != lines {
+			t.Fatalf("want points %d through %d after %d lines, got %+v", first, last, lines, snapshot)
+		}
+		for i, point := range points {
+			want := CurvePoint{X: 1, Y: float64(first + i)}
+			if point != want {
+				t.Fatalf("point %d: got %+v, want %+v", i, point, want)
+			}
+		}
+	}
+	resize := func(limit int) {
+		t.Helper()
+		profile.PointLimit = limit
+		err := app.ApplyCurveProfiles([]config.CurveProfile{profile}, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	receive([]byte("VBAT=1000\nVBAT=2000\nVBAT=3000\nVBAT=4000\nVBAT="), at)
+	check(2, 4, 4)
+	resize(5)
+	receive([]byte("5000\nVBAT=6000\n"), at)
+	check(2, 6, 6)
+	resize(2)
+	check(5, 6, 6)
+	receive([]byte("VBAT=7000\n"), at)
+	check(6, 7, 7)
+	resize(0) // Unwrap the existing ring before appending without eviction.
+	receive([]byte("VBAT=8000\nVBAT=9000\nVBAT=10000\n"), at)
+	check(6, 10, 10)
+	resize(1)
+	check(10, 10, 10)
+	receive([]byte("VBAT=11000\n"), at)
+	check(11, 11, 11)
+}
+
+func TestCurveTimeRunsFollowEvictionAndResize(t *testing.T) {
+	profile := config.NewCurveProfile("clock resets")
+	profile.TimePattern = `t=(\d+)`
+	profile.PointLimit = 4
+	parser := testCurveParser(t, profile)
+	var snapshot CurveSnapshot
+	check := func(want []int) {
+		t.Helper()
+		parser.snapshot(&snapshot)
+		got := snapshot.Series[0].TimeRuns
+		if !slices.Equal(got, want) {
+			t.Fatalf("indexed starts %v, want %v for points %v", got, want, snapshot.Series[0].Points)
+		}
+	}
+	parser.feed([]byte("t=10 VBAT=1\nt=20 VBAT=1\nt=0 VBAT=1\nt=1 VBAT=1\n"), time.Time{})
+	check([]int{0, 2})
+	parser.feed([]byte("t=0 VBAT=1\n"), time.Time{})
+	check([]int{0, 1, 3})
+	parser.feed([]byte("t=1 VBAT=1\n"), time.Time{})
+	check([]int{0, 2})
+	parser.setPointLimit(3)
+	check([]int{0, 1})
+	parser.setPointLimit(0)
+	parser.feed([]byte("t=0 VBAT=1\n"), time.Time{})
+	check([]int{0, 1, 3})
+	parser.setPointLimit(1)
+	parser.feed([]byte("t=0 VBAT=1\n"), time.Time{})
+	check([]int{0})
+}
+
+func TestCurveBlockSummariesTrackRingChanges(t *testing.T) {
+	const limit = 4*curveSummaryBlockSize + 77
+	var ring curveRing
+	var retained []CurvePoint
+	add := func(i, limit int) {
+		point := CurvePoint{X: float64(i), Y: float64((i * 71) % 137), Break: i == 512 || i == 2100}
+		if i >= 1408 {
+			point.X -= 1000
+		}
+		ring.segment = point.Break
+		ring.add(point, limit)
+		retained = append(retained, point)
+		if limit > 0 && len(retained) > limit {
+			retained = retained[1:]
+		}
+	}
+	check := func() {
+		t.Helper()
+		points := make([]CurvePoint, len(retained))
+		ring.copyLatest(points)
+		if !slices.Equal(points, retained) {
+			t.Fatalf("raw history diverged at head %d, length %d", ring.head, len(retained))
+		}
+		// Independently scan each aligned range in the retained raw sequence.
+		// This also checks completeness, precedence and earliest-point extrema ties.
+		var want []CurveBlock
+		for size := curveSummaryBlockSize; size <= len(points); size *= 2 {
+			for physical := 0; physical+size <= len(points); physical += size {
+				start := physical - ring.head
+				if start < 0 {
+					start += len(points)
+				}
+				if start+size > len(points) {
+					continue
+				}
+				block := CurveBlock{Start: start, End: start + size, Min: start, Max: start}
+				valid := true
+				for i := start; i < block.End; i++ {
+					if i > start && (points[i].Break || points[i].X < points[i-1].X) {
+						valid = false
+						break
+					}
+					if points[i].Y < points[block.Min].Y {
+						block.Min = i
+					}
+					if points[i].Y > points[block.Max].Y {
+						block.Max = i
+					}
+				}
+				if valid {
+					want = append(want, block)
+				}
+			}
+		}
+		slices.SortFunc(want, func(a, b CurveBlock) int {
+			if a.Start != b.Start {
+				return a.Start - b.Start
+			}
+			return b.End - a.End
+		})
+		if got := ring.copyBlocks(nil); !slices.Equal(got, want) {
+			t.Fatalf("head %d, length %d: summaries %v, want %v", ring.head, len(points), got, want)
+		}
+	}
+	for i := range 2900 {
+		add(i, limit)
+		if i%31 == 0 || (i+1)%curveSummaryBlockSize == 0 || (i+1)%limit == 0 {
+			check()
+		}
+	}
+	check()
+	ring.resize(1400)
+	check()
+	for i := 2900; i < 3220; i++ {
+		add(i, 1400)
+	}
+	check()
+	ring.resize(777)
+	retained = retained[len(retained)-777:]
+	check()
+	ring.resize(0)
+	for i := 3220; i < 3800; i++ {
+		add(i, 0)
+	}
+	check()
+}
+
+func TestCurveBlockParentsRequireContinuousOrderedJoins(t *testing.T) {
+	const base = curveSummaryBlockSize
+	for _, tc := range []struct {
+		name             string
+		change           func(int, *CurvePoint)
+		wantParent       bool
+		wantRightSubtree bool
+	}{
+		{"equal_time_and_leading_break", func(i int, p *CurvePoint) { p.Break = i == 0 }, true, true},
+		{"break_at_join", func(i int, p *CurvePoint) { p.Break = i == 2*base }, false, true},
+		{"backwards_at_join", func(i int, p *CurvePoint) {
+			if i >= 2*base {
+				p.X -= 100
+			}
+		}, false, true},
+		{"nonfinite_value", func(i int, p *CurvePoint) {
+			if i == 2*base+1 {
+				p.Y = math.NaN()
+			}
+		}, false, false},
+		{"nonfinite_time", func(i int, p *CurvePoint) {
+			if i == 2*base+1 {
+				p.X = math.Inf(1)
+			}
+		}, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var ring curveRing
+			for i := range 4 * base {
+				p := CurvePoint{X: float64(i / 8)}
+				if i == base+19 {
+					p.Y = 11
+				}
+				if i == 3*base+21 {
+					p.Y = -13
+				}
+				tc.change(i, &p)
+				ring.segment = p.Break
+				ring.add(p, 0)
+			}
+			blocks := ring.copyBlocks(nil)
+			for _, check := range []struct {
+				block CurveBlock
+				want  bool
+			}{
+				{CurveBlock{Start: 0, End: 4 * base, Min: 3*base + 21, Max: base + 19}, tc.wantParent},
+				{CurveBlock{Start: 0, End: 2 * base, Min: 0, Max: base + 19}, true},
+				{CurveBlock{Start: 2 * base, End: 4 * base, Min: 3*base + 21, Max: 2 * base}, tc.wantRightSubtree},
+				{CurveBlock{Start: 3 * base, End: 4 * base, Min: 3*base + 21, Max: 3 * base}, true},
+			} {
+				index := slices.IndexFunc(blocks, func(b CurveBlock) bool {
+					return b.Start == check.block.Start && b.End == check.block.End
+				})
+				if (index != -1) != check.want || (index != -1 && blocks[index] != check.block) {
+					t.Fatalf("summary %+v present with exact extrema wanted=%t, got %v", check.block, check.want, blocks)
+				}
 			}
 		})
 	}

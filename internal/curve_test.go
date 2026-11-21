@@ -131,12 +131,12 @@ func TestCurveOversizeCRLFAndWrapping(t *testing.T) {
 	if snapshot.Lines != 3 || snapshot.Oversize != 1 || len(snapshot.Series[0].Points) != 1 {
 		t.Fatalf("framing: %+v", snapshot)
 	}
-	for i := range curvePointLimit + 1 {
+	for i := range config.DefaultCurvePointLimit + 1 {
 		parser.feed([]byte(fmt.Sprintf("VBAT=%d\n", i)), at)
 	}
 	parser.snapshot(&snapshot)
 	points := snapshot.Series[0].Points
-	if len(points) != curvePointLimit || points[0].Y != .001 || points[len(points)-1].Y != 10 {
+	if len(points) != config.DefaultCurvePointLimit || points[0].Y != .001 || points[len(points)-1].Y != 10 {
 		t.Fatalf("ring order/count: %d %+v %+v", len(points), points[0], points[len(points)-1])
 	}
 	backing := &snapshot.Series[0].Points[0]

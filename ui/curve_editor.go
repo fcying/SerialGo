@@ -53,7 +53,7 @@ func (s *controller) deleteCurveProfile() {
 			v.paused = false
 		}
 		v.snapshot.Revision = 0
-		s.app.CurveSnapshot(&v.snapshot)
+		s.app.CurveLiveSnapshot(&v.snapshot, &v.liveCache)
 		if len(profiles) == 0 {
 			v.selected, v.choice = -1, ""
 			v.running, v.paused = false, false
@@ -244,7 +244,7 @@ func (s *controller) curveToolbar(c *ui.Context) {
 			if v.running {
 				s.app.StopCurve()
 				if !v.paused {
-					s.app.CurveSnapshot(&v.snapshot)
+					s.app.CurveLiveSnapshot(&v.snapshot, &v.liveCache)
 				}
 				v.running = false
 			} else {
@@ -261,14 +261,14 @@ func (s *controller) curveToolbar(c *ui.Context) {
 				v.previewing = false
 				v.position = 100
 				v.snapshot.Revision = 0
-				s.app.CurveSnapshot(&v.snapshot)
+				s.app.CurveLiveSnapshot(&v.snapshot, &v.liveCache)
 			}
 		})
 		ui.Button(c.Key("clear"), s.tr("清空", "Clear")).Height(controlHeight).Padding(controlPadY, 6).Label(s.tr("清空曲线", "Clear plot")).OnClick(func() {
 			s.app.ClearCurve()
 			v.snapshot.Revision = 0
 			v.previewing = false
-			s.app.CurveSnapshot(&v.snapshot)
+			s.app.CurveLiveSnapshot(&v.snapshot, &v.liveCache)
 		})
 	})
 }

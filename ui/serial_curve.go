@@ -10,6 +10,7 @@ import (
 const (
 	curveWindowMinWidth  = 720
 	curveWindowMinHeight = 260
+	curveRefreshInterval = time.Second / 60
 )
 
 func (s *controller) serialCurveTitle() string {
@@ -55,7 +56,7 @@ func (s *controller) openSerialCurve() {
 		s.closeSerialCurve(w)
 	})
 	go func() {
-		ticker := time.NewTicker(time.Second / 30)
+		ticker := time.NewTicker(curveRefreshInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -102,7 +103,7 @@ func (s *controller) pollSerialCurve(w *mygo.Window) bool {
 	if v.running && !v.paused && !v.previewing {
 		revision := v.snapshot.Revision
 		statsRevision := v.snapshot.StatsRevision
-		s.app.CurveSnapshot(&v.snapshot)
+		s.app.CurveLiveSnapshot(&v.snapshot, &v.liveCache)
 		changed = changed || revision != v.snapshot.Revision || statsRevision != v.snapshot.StatsRevision
 	}
 	return changed

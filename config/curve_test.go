@@ -17,6 +17,8 @@ func TestCurveProfilesPersistAndClone(t *testing.T) {
 	}
 	settings.CurveProfiles = []CurveProfile{NewCurveProfile("固件 A"), NewCurveProfile("固件 B")}
 	settings.CurveProfile = 1
+	settings.CurveProfiles[0].PointLimit = MaxCurvePointLimit
+	settings.CurveProfiles[1].PointLimit = 0
 	for i := 1; i < 32; i++ {
 		channel := settings.CurveProfiles[0].Channels[0]
 		channel.Name = fmt.Sprintf("Channel %d", i)
@@ -59,6 +61,8 @@ func TestCurveValidationLimits(t *testing.T) {
 		func(p *CurveProfile) { p.TimeScale = math.NaN() },
 		func(p *CurveProfile) { p.TimePattern, p.TimeScale = `t=([0-9]+)`, 0 },
 		func(p *CurveProfile) { p.TimePattern, p.TimeScale = `t=([0-9]+)`, -1 },
+		func(p *CurveProfile) { p.PointLimit = -1 },
+		func(p *CurveProfile) { p.PointLimit = MaxCurvePointLimit + 1 },
 		func(p *CurveProfile) { p.Channels[0].Scale = math.Inf(1) },
 		func(p *CurveProfile) { p.Channels[0].Offset = math.NaN() },
 		func(p *CurveProfile) { p.Channels[0].Pattern = strings.Repeat("x", MaxCurvePatternBytes+1) },
@@ -108,6 +112,7 @@ Enabled = false
 Name = 'other'
 TimeScale = 0.5
 TimePattern = 't=([0-9]+)'
+PointLimit = 0
 [[CurveProfiles.Channels]]
 Name = 'temperature'
 Mode = 'prefix'
@@ -125,7 +130,7 @@ Enabled = true
 		t.Fatalf("无效时间设置不应阻止加载: %v", err)
 	}
 	want := []CurveProfile{
-		{Name: "legacy", TimePattern: "[", TimeScale: 0, Channels: []CurveChannel{
+		{Name: "legacy", TimePattern: "[", TimeScale: 0, PointLimit: DefaultCurvePointLimit, Channels: []CurveChannel{
 			{Name: "voltage", Mode: "prefix", Pattern: "VBAT=", Unit: "V", Color: DefaultCurveColor(0), Scale: .001, Offset: -1.5, Enabled: true},
 			{Name: "disabled", Mode: "regex", Pattern: `I=([0-9]+)`, Unit: "A", Color: DefaultCurveColor(1), Scale: 2, Offset: 3, Enabled: false},
 		}},

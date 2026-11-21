@@ -11,6 +11,8 @@ import (
 
 const (
 	CurveProfileLimit                = 16
+	DefaultCurvePointLimit           = 10_000
+	MaxCurvePointLimit               = 1_000_000
 	MaxCurvePatternBytes             = 1024
 	DefaultCurveSidebarWidth float32 = 260
 )
@@ -33,6 +35,7 @@ type CurveProfile struct {
 	Name        string
 	TimePattern string
 	TimeScale   float64
+	PointLimit  int // Zero disables eviction.
 	Channels    []CurveChannel
 }
 
@@ -99,7 +102,7 @@ func CloneCurveProfiles(profiles []CurveProfile) []CurveProfile {
 }
 
 func NewCurveProfile(name string) CurveProfile {
-	return CurveProfile{Name: name, TimeScale: .001, Channels: []CurveChannel{
+	return CurveProfile{Name: name, TimeScale: .001, PointLimit: DefaultCurvePointLimit, Channels: []CurveChannel{
 		{Name: "VBAT", Mode: "prefix", Pattern: "VBAT=", Unit: "V", Color: DefaultCurveColor(0), Scale: .001, Enabled: true},
 	}}
 }
@@ -130,6 +133,11 @@ func ValidateCurveProfiles(profiles []CurveProfile, active int) error {
 			err = i18n.NewError("时间倍率必须是有限数值", "Time scale must be finite")
 		case profile.TimePattern != "" && profile.TimeScale <= 0:
 			err = i18n.NewError("设备时间倍率必须大于零", "Device time scale must be positive")
+		case profile.PointLimit < 0 || profile.PointLimit > MaxCurvePointLimit:
+			err = i18n.NewError(
+				fmt.Sprintf("每条曲线采样上限必须是 0 到 %d 的整数 (0 为不限)", MaxCurvePointLimit),
+				fmt.Sprintf("Samples per curve must be an integer from 0 to %d (0 for unlimited)", MaxCurvePointLimit),
+			)
 		case len(profile.Channels) == 0:
 			err = i18n.NewError("每个方案至少需要一个通道", "Each profile requires at least one channel")
 		}

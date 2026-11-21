@@ -19,6 +19,7 @@ type curveChannelDraft struct {
 
 type curveProfileDraft struct {
 	name, timePattern, timeScale string
+	pointLimit                   int
 	channels                     []curveChannelDraft
 }
 
@@ -33,6 +34,7 @@ type curveViewState struct {
 	statusError            bool
 	previewText            string
 	snapshot               internal.CurveSnapshot
+	liveCache              internal.CurveLiveCache
 	span                   string
 	position               float64
 	rulesWidth             float32 // Preferred width, independent of viewport limits and visibility.
@@ -68,7 +70,7 @@ func newCurveViewState(settings *config.Settings) *curveViewState {
 
 func curveDraft(profile config.CurveProfile) curveProfileDraft {
 	draft := curveProfileDraft{name: profile.Name, timePattern: profile.TimePattern,
-		timeScale: strconv.FormatFloat(profile.TimeScale, 'g', -1, 64)}
+		timeScale: strconv.FormatFloat(profile.TimeScale, 'g', -1, 64), pointLimit: profile.PointLimit}
 	for i, channel := range profile.Channels {
 		color := channel.Color
 		if color == "" {
@@ -113,7 +115,7 @@ func (v *curveViewState) refreshCurveColors(recolorSnapshot bool) {
 }
 
 func (v *curveViewState) profile() (config.CurveProfile, error) {
-	profile := config.CurveProfile{Name: v.draft.name, TimePattern: v.draft.timePattern}
+	profile := config.CurveProfile{Name: v.draft.name, TimePattern: v.draft.timePattern, PointLimit: v.draft.pointLimit}
 	var err error
 	profile.TimeScale, err = strconv.ParseFloat(v.draft.timeScale, 64)
 	if err != nil && profile.TimePattern != "" {
@@ -161,7 +163,8 @@ func (s *controller) applyCurveDraft() bool {
 		profiles = append(profiles, profile)
 	} else {
 		previous := profiles[index]
-		refreshPreview = s.settings.CurveProfile != index || !config.SameCurveSchema(previous, profile)
+		refreshPreview = s.settings.CurveProfile != index || !config.SameCurveSchema(previous, profile) ||
+			v.previewing && previous.PointLimit != profile.PointLimit
 		profiles[index] = profile
 	}
 	err = s.app.ApplyCurveProfiles(profiles, index)
@@ -187,7 +190,7 @@ func (s *controller) applyCurveDraft() bool {
 		}
 	} else {
 		v.refreshCurveColors(false)
-		s.app.CurveSnapshot(&v.snapshot)
+		s.app.CurveLiveSnapshot(&v.snapshot, &v.liveCache)
 	}
 	if v.testWindow != nil {
 		v.testWindow.Invalidate()
@@ -217,7 +220,7 @@ func (s *controller) startCurve() {
 	v.running, v.paused, v.previewing = true, false, false
 	v.position = 100
 	v.snapshot.Revision = 0
-	s.app.CurveSnapshot(&v.snapshot)
+	s.app.CurveLiveSnapshot(&v.snapshot, &v.liveCache)
 }
 
 func (s *controller) previewCurve() {
@@ -233,6 +236,7 @@ func (s *controller) previewCurve() {
 		return
 	}
 	// Preview is isolated from the live parser and never saves settings.
+	v.liveCache = internal.CurveLiveCache{}
 	v.snapshot, v.previewing, v.paused = snapshot, true, true
 	v.refreshCurveColors(false)
 	v.position = 100
