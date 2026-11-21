@@ -15,6 +15,27 @@ var (
 	stopBits  = []string{"1", "1.5", "2"}
 	encodings = []string{"UTF-8", "GB18030"}
 )
+var sendChecksumAlgorithms = []string{"None", "XOR8", "SUM8", "SUM16-LE", "SUM16-BE", "Modbus CRC16", "CRC16-CCITT-FALSE"}
+
+var sendChecksumTooltipsEnglish = []string{
+	"No checksum bytes are appended.",
+	"XORs the included bytes.",
+	"Sums included bytes modulo 256.",
+	"Sums included bytes modulo 65536; low byte first.",
+	"Sums included bytes modulo 65536; high byte first.",
+	"CRC-16/MODBUS: init=0xFFFF, reflected poly=0xA001; low byte first.",
+	"CRC-16/CCITT-FALSE: init=0xFFFF, poly=0x1021, no reflection, xorout=0; high byte first.",
+}
+
+var sendChecksumTooltipsChinese = []string{
+	"不追加校验字节.",
+	"对参与计算的字节逐一异或.",
+	"参与计算的字节求和并模 256.",
+	"参与计算的字节求和并按 65536 回绕, 低字节在前.",
+	"参与计算的字节求和并按 65536 回绕, 高字节在前.",
+	"CRC-16/MODBUS: init=0xFFFF, 反射多项式 0xA001, 低字节在前.",
+	"CRC-16/CCITT-FALSE: init=0xFFFF, 多项式 0x1021, 不反射, xorout=0, 高字节在前.",
+}
 
 const (
 	presetReceiveShare             float32 = 45
@@ -194,7 +215,11 @@ func (s *controller) filePanel(c *ui.Context, width float32) {
 func (s *controller) optionsDialog(c *ui.Context) {
 	ui.Modal(c.Key("options-dialog"), &s.optionsOpen, func() {
 		p := s.settings
-		ui.Column(c.Key("preferences")).Width(360).Gap(sectionGap).Children(func() {
+		dialogWidth := float32(440)
+		if s.settings.Language == "zh-CN" {
+			dialogWidth = 360
+		}
+		ui.Column(c.Key("preferences")).Width(dialogWidth).Gap(sectionGap).Children(func() {
 			ui.Text(c.Key("window-heading"), s.tr("窗口与语言", "Window and language")).FontWeight(600)
 			ui.Row(c.Key("window-language-options")).FillWidth().Gap(groupGap).AlignItems(ui.Center).Children(func() {
 				ui.Checkbox(c.Key("top"), &s.alwaysOnTop, s.tr("置顶", "On top")).Shrink(0).OnChange(s.applyAlwaysOnTop)
@@ -215,11 +240,29 @@ func (s *controller) optionsDialog(c *ui.Context) {
 			ui.Checkbox(c.Key("send-escape-parsing"), &p.ParseSendEscapes, parseEscapes).
 				Label(parseEscapes).Tooltip(escapeTooltip).
 				OnChange(s.app.SettingsChanged)
+			checksumAlgorithmLabel := s.tr("校验算法", "Checksum algorithm")
+			checksumOptionTooltips := sendChecksumTooltipsEnglish
+			if s.settings.Language == "zh-CN" {
+				checksumOptionTooltips = sendChecksumTooltipsChinese
+			}
+			ui.Row(c.Key("checksum-options")).FillWidth().Gap(tightGap).AlignItems(ui.Center).Children(func() {
+				ui.Text(c.Key("checksum-header-caption"), s.tr("帧头", "Head")).Shrink(0)
+				ui.TextInput(c.Key("checksum-header-bytes"), &p.ChecksumHeaderBytes).Width(48).Height(controlHeight).PaddingY(controlPadY).TextAlign(ui.Center).
+					Label(s.tr("排除帧头字节数", "Excluded header byte count")).
+					Tooltip(s.tr("按数据字节计数; CRLF 终止符不参与校验.", "Counts data bytes; the trailing CRLF terminator is excluded.")).OnChange(s.app.SettingsChanged)
+				ui.Text(c.Key("checksum-tail-caption"), s.tr("帧尾", "Tail")).Shrink(0)
+				ui.TextInput(c.Key("checksum-tail-bytes"), &p.ChecksumTailBytes).Width(48).Height(controlHeight).PaddingY(controlPadY).TextAlign(ui.Center).
+					Label(s.tr("排除帧尾字节数", "Excluded tail byte count")).
+					Tooltip(s.tr("按数据字节计数; CRLF 终止符不参与校验.", "Counts data bytes; the trailing CRLF terminator is excluded.")).OnChange(s.app.SettingsChanged)
+				ui.Text(c.Key("checksum-algorithm-caption"), s.tr("校验算法", "Checksum algorithm")).Shrink(0)
+				compactDisplaySelect(c.Key("checksum-algorithm"), &p.ChecksumAlgorithm, sendChecksumAlgorithms, checksumOptionTooltips, checksumAlgorithmLabel,
+					s.tr("设置主发送和预设发送共用的校验算法.", "Selects the checksum algorithm shared by main and preset sends."), s.app.SettingsChanged)
+			})
 			ui.Text(c.Key("display-heading"), s.tr("数据显示", "Data display")).FontWeight(600)
 			ui.Row(c.Key("encoding-options")).Gap(tightGap).AlignItems(ui.Center).Children(func() {
 				ui.Text(c.Key("encoding-label"), s.tr("编码", "Encoding"))
 				label := s.tr("文本编码", "Text encoding")
-				compactDisplaySelect(c.Key("encoding"), &p.Encoding, encodings, label, label, s.applyDisplaySettings)
+				compactDisplaySelect(c.Key("encoding"), &p.Encoding, encodings, nil, label, label, s.applyDisplaySettings)
 			})
 			displayBufferOptions(c.Key("buffer-limit-options"), p, s.applyDisplaySettings)
 			s.receiveHexLineWidthOptions(c.Key("hex-line-width-options"))

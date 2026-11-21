@@ -32,7 +32,7 @@ func displayBufferOptions(c *ui.Context, settings *config.Settings, onChange fun
 	}
 	ui.Row(c.Key("buffer-options")).Gap(groupGap).AlignItems(ui.Center).Children(func() {
 		ui.Text(c.Key("buffer-label"), label)
-		compactDisplaySelect(c.Key("buffer-limit"), &selected, displayBufferLabels, label, tooltip, func() {
+		compactDisplaySelect(c.Key("buffer-limit"), &selected, displayBufferLabels, nil, label, tooltip, func() {
 			for _, preset := range presets {
 				if preset.Label == selected && settings.DisplayBufferLimit != preset.Bytes {
 					settings.DisplayBufferLimit = preset.Bytes
@@ -61,7 +61,7 @@ func (s *controller) receiveHexLineWidthOptions(c *ui.Context) {
 	tooltip := s.tr("仅影响 HEX 显示", "Applies only to HEX display")
 	ui.Row(c).Gap(groupGap).AlignItems(ui.Center).Children(func() {
 		ui.Text(c.Key("caption"), label)
-		compactDisplaySelect(c.Key("width"), &selected, receiveHexLineWidthLabels, label, tooltip, func() {
+		compactDisplaySelect(c.Key("width"), &selected, receiveHexLineWidthLabels, nil, label, tooltip, func() {
 			width, err := strconv.Atoi(selected)
 			if err == nil && width != s.settings.ReceiveHexBytesPerLine {
 				s.settings.ReceiveHexBytesPerLine = width
@@ -71,7 +71,7 @@ func (s *controller) receiveHexLineWidthOptions(c *ui.Context) {
 	})
 }
 
-func compactDisplaySelect(c *ui.Context, selected *string, options []string, label, tooltip string, onChange func()) {
+func compactDisplaySelect(c *ui.Context, selected *string, options, optionTooltips []string, label, tooltip string, onChange func()) {
 	var textWidth float32
 	for _, option := range options {
 		w, _ := c.MeasureText(0, ui.Span{Text: option})
@@ -100,8 +100,11 @@ func compactDisplaySelect(c *ui.Context, selected *string, options []string, lab
 		panel.Padding(3).Radius(theme.Radius).Background(theme.Background).Border(1, theme.Border).Children(func() {
 			ui.Scroll(c.Key("options")).FillWidth().MaxHeight(240).Children(func() {
 				ui.Column(c.Key("choices")).FillWidth().Gap(compactGap).Children(func() {
-					for _, option := range options {
+					for index, option := range options {
 						item := sel.Item(option).Padding(4, displaySelectPaddingX).Radius(theme.Radius)
+						if index < len(optionTooltips) && optionTooltips[index] != "" {
+							item.Tooltip(optionTooltips[index])
+						}
 						if item.Highlighted() {
 							item.Background(theme.Accent).TextColor(theme.AccentText)
 						} else if option == *selected {

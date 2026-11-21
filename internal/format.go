@@ -26,6 +26,20 @@ func Encode(input string, f Format) ([]byte, error) {
 }
 
 func encodeInput(input string, f Format, parseEscapes bool) ([]byte, error) {
+	data, err := encodePayload(input, f, parseEscapes)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateSendData(data, f.CRLF); err != nil {
+		return nil, err
+	}
+	if f.CRLF {
+		data = append(data, '\r', '\n')
+	}
+	return data, nil
+}
+
+func encodePayload(input string, f Format, parseEscapes bool) ([]byte, error) {
 	var data []byte
 	var err error
 	if f.Hex {
@@ -52,13 +66,115 @@ func encodeInput(input string, f Format, parseEscapes bool) ([]byte, error) {
 	} else {
 		data = []byte(input)
 	}
-	if len(data) == 0 && !f.CRLF {
-		return nil, i18n.NewError("没有要发送的数据", "No data to send")
-	}
-	if f.CRLF {
-		data = append(data, '\r', '\n')
-	}
 	return data, nil
+}
+
+func validateSendData(data []byte, crlf bool) error {
+	if len(data) == 0 && !crlf {
+		return i18n.NewError("没有要发送的数据", "No data to send")
+	}
+	return nil
+}
+
+func appendChecksum(data []byte, algorithm, headerBytes, tailBytes string) ([]byte, error) {
+	if algorithm == "" || algorithm == "None" {
+		return data, nil
+	}
+	switch algorithm {
+	case "XOR8", "SUM8", "SUM16-LE", "SUM16-BE", "Modbus CRC16", "CRC16-CCITT-FALSE":
+	default:
+		return nil, i18n.NewError("校验算法无效", "Invalid checksum algorithm")
+	}
+	header, err := checksumByteCount(headerBytes)
+	if err != nil {
+		return nil, err
+	}
+	tail, err := checksumByteCount(tailBytes)
+	if err != nil {
+		return nil, err
+	}
+	if header > len(data) || tail > len(data)-header {
+		return nil, i18n.NewError("校验排除字节数超出帧长度", "Checksum excluded byte counts exceed frame length")
+	}
+	payload := data[header : len(data)-tail]
+	var checksum [2]byte
+	checksumSize := 1
+	switch algorithm {
+	case "XOR8":
+		for _, value := range payload {
+			checksum[0] ^= value
+		}
+	case "SUM8":
+		for _, value := range payload {
+			checksum[0] += value
+		}
+	case "SUM16-LE", "SUM16-BE":
+		sum := uint16(0)
+		for _, value := range payload {
+			sum += uint16(value)
+		}
+		if algorithm == "SUM16-LE" {
+			checksum[0], checksum[1] = byte(sum), byte(sum>>8)
+		} else {
+			checksum[0], checksum[1] = byte(sum>>8), byte(sum)
+		}
+		checksumSize = 2
+	case "Modbus CRC16":
+		value := crc16Modbus(payload)
+		checksum[0], checksum[1] = byte(value), byte(value>>8)
+		checksumSize = 2
+	case "CRC16-CCITT-FALSE":
+		value := crc16CCITTFALSE(payload)
+		checksum[0], checksum[1] = byte(value>>8), byte(value)
+		checksumSize = 2
+	}
+	insertAt := len(data) - tail
+	data = append(data, checksum[:checksumSize]...)
+	copy(data[insertAt+checksumSize:], data[insertAt:len(data)-checksumSize])
+	copy(data[insertAt:insertAt+checksumSize], checksum[:checksumSize])
+	return data, nil
+}
+
+func checksumByteCount(text string) (int, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return 0, nil
+	}
+	count, err := strconv.Atoi(text)
+	if err != nil || count < 0 {
+		return 0, i18n.NewError("校验字节数必须为非负整数", "Checksum byte counts must be non-negative integers")
+	}
+	return count, nil
+}
+
+func crc16Modbus(data []byte) uint16 {
+	crc := uint16(0xFFFF)
+	for _, value := range data {
+		crc ^= uint16(value)
+		for bit := 0; bit < 8; bit++ {
+			if crc&1 != 0 {
+				crc = crc>>1 ^ 0xA001
+			} else {
+				crc >>= 1
+			}
+		}
+	}
+	return crc
+}
+
+func crc16CCITTFALSE(data []byte) uint16 {
+	crc := uint16(0xFFFF)
+	for _, value := range data {
+		crc ^= uint16(value) << 8
+		for bit := 0; bit < 8; bit++ {
+			if crc&0x8000 != 0 {
+				crc = crc<<1 ^ 0x1021
+			} else {
+				crc <<= 1
+			}
+		}
+	}
+	return crc
 }
 
 func encodeEscapedText(input, encoding string) ([]byte, error) {

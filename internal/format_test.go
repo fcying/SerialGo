@@ -81,3 +81,74 @@ func TestEncodeTextEscapesPreservesIncompleteUTF8Bytes(t *testing.T) {
 		t.Fatalf("incomplete UTF-8 segment = % x, %v; want % x", got, err, want)
 	}
 }
+
+func TestAppendChecksumKnownVectors(t *testing.T) {
+	input := []byte("123456789")
+	tests := []struct {
+		name, algorithm string
+		want            []byte
+	}{
+		{"none", "None", []byte("123456789")},
+		{"XOR8", "XOR8", append([]byte("123456789"), 0x31)},
+		{"SUM8", "SUM8", append([]byte("123456789"), 0xDD)},
+		{"SUM16-LE", "SUM16-LE", append([]byte("123456789"), 0xDD, 0x01)},
+		{"SUM16-BE", "SUM16-BE", append([]byte("123456789"), 0x01, 0xDD)},
+		{"Modbus CRC16", "Modbus CRC16", append([]byte("123456789"), 0x37, 0x4B)},
+		{"CRC16-CCITT-FALSE", "CRC16-CCITT-FALSE", append([]byte("123456789"), 0x29, 0xB1)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			data := append([]byte(nil), input...)
+			got, err := appendChecksum(data, tc.algorithm, "0", "0")
+			if err != nil || !bytes.Equal(got, tc.want) {
+				t.Fatalf("appendChecksum = % X, %v; want % X", got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestAppendChecksumExcludesFrameHeaderAndTail(t *testing.T) {
+	data := []byte{0xAA, 0x01, 0x03, 0x00, 0xBB}
+	got, err := appendChecksum(data, "XOR8", "1", "1")
+	want := []byte{0xAA, 0x01, 0x03, 0x00, 0x02, 0xBB}
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("header/tail exclusion = % X, %v; want % X", got, err, want)
+	}
+}
+
+func TestAppendChecksumRejectsInvalidSettings(t *testing.T) {
+	for _, tc := range []struct {
+		algorithm, header, tail string
+	}{
+		{"XOR8", "bad", "0"},
+		{"XOR8", "-1", "0"},
+		{"XOR8", "2", "2"},
+		{"not-a-checksum", "0", "0"},
+	} {
+		got, err := appendChecksum([]byte("123"), tc.algorithm, tc.header, tc.tail)
+		if err == nil || got != nil {
+			t.Errorf("invalid checksum settings %+v produced % X, %v", tc, got, err)
+		}
+	}
+	got, err := appendChecksum([]byte("123"), "None", "bad", "-1")
+	if err != nil || !bytes.Equal(got, []byte("123")) {
+		t.Fatalf("None should ignore exclusion counts: % X, %v", got, err)
+	}
+}
+
+func TestAppendChecksumSUM16WrapsAtUint16Limit(t *testing.T) {
+	data := []byte{0xFF, 0xFF, 0x02}
+	tests := []struct {
+		algorithm string
+		want      []byte
+	}{
+		{"SUM16-LE", []byte{0xFF, 0xFF, 0x02, 0x00, 0x02}},
+		{"SUM16-BE", []byte{0xFF, 0xFF, 0x02, 0x02, 0x00}},
+	}
+	for _, tc := range tests {
+		got, err := appendChecksum(append([]byte(nil), data...), tc.algorithm, "0", "0")
+		if err != nil || !bytes.Equal(got, tc.want) {
+			t.Errorf("%s uint16 wrap = % X, %v; want % X", tc.algorithm, got, err, tc.want)
+		}
+	}
+}
