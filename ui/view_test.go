@@ -105,6 +105,7 @@ func TestStatusBarKeepsLongTextOnOneLine(t *testing.T) {
 					for _, label := range []string{
 						"语言 / Language",
 						s.tr("文本编码", "Text encoding"),
+						s.tr("解析转义符", "Parse text escapes"),
 						s.tr("时间戳分包超时 (ms)", "Timestamp packet gap (ms)"),
 					} {
 						bounds, found := tt.Find(label)
@@ -118,6 +119,69 @@ func TestStatusBarKeepsLongTextOnOneLine(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+func TestSendEscapeSettingTogglesInOptions(t *testing.T) {
+	for _, tc := range []struct {
+		language, label, topLabel, tooltip string
+	}{
+		{
+			language: "en",
+			label:    "Parse text escapes",
+			topLabel: "On top",
+			tooltip: strings.Join([]string{
+				`Text mode only; invalid or incomplete escapes reject the send.`,
+				`Supported: \\, \a, \b, \f, \n, \r, \t, \v, \0, \xNN. \xNN is two hex digits and emits one raw byte.`,
+				`CRLF still appends an additional 0D 0A when enabled.`,
+			}, "\n"),
+		},
+		{
+			language: "zh-CN",
+			label:    "解析转义符",
+			topLabel: "置顶",
+			tooltip: strings.Join([]string{
+				`仅文本模式生效; 无效或不完整转义会阻止发送.`,
+				`支持: \\, \a, \b, \f, \n, \r, \t, \v, \0, \xNN. \xNN 为两位十六进制数并输出原始字节.`,
+				`启用 CRLF 时仍会额外追加 0D 0A.`,
+			}, "\n"),
+		},
+	} {
+		t.Run(tc.language, func(t *testing.T) {
+			s := newController(&internal.App{Settings: config.Settings{Language: tc.language}})
+			tt := gui.NewTester(s.view, 800, 600)
+			if err := tt.Click(s.tr("选项", "Options")); err != nil {
+				t.Fatal(err)
+			}
+			field, found := tt.AccessByRole(gui.RoleCheckBox, tc.label)
+			if !found || field.Offscreen || s.settings.ParseSendEscapes {
+				t.Fatalf("text escape option is unavailable or enabled by default: %+v", field)
+			}
+			top, topFound := tt.AccessByRole(gui.RoleCheckBox, tc.topLabel)
+			language, languageFound := tt.AccessByRole(gui.RoleButton, "语言 / Language")
+			if !topFound || !languageFound {
+				t.Fatal("window and language controls are unavailable")
+			}
+			if language.Bounds.W > 140 {
+				t.Fatalf("language button is wider than its label and padding: %+v", language.Bounds)
+			}
+			topCenter := top.Bounds.Y + top.Bounds.H/2
+			languageCenter := language.Bounds.Y + language.Bounds.H/2
+			if topCenter < languageCenter-1 || topCenter > languageCenter+1 {
+				t.Fatalf("window and language controls do not share one row: top=%+v language=%+v", top.Bounds, language.Bounds)
+			}
+			tt.Move(field.Bounds.X+field.Bounds.W/2, field.Bounds.Y+field.Bounds.H/2)
+			tt.Advance(time.Second)
+			if !tt.HasText(tc.tooltip) {
+				t.Fatalf("text escape tooltip does not contain its three lines: %q", tc.tooltip)
+			}
+			if err := tt.Click(tc.label); err != nil {
+				t.Fatal(err)
+			}
+			if !s.settings.ParseSendEscapes || !s.app.SettingsDirty {
+				t.Fatal("changing text escape option did not update and mark the setting dirty")
+			}
+		})
 	}
 }
 

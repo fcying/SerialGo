@@ -69,6 +69,7 @@ Plotting accepts RX logs terminated by LF or CRLF, independently of receive HEX/
 ## Sending data
 
 - Text supports UTF-8 and GB18030. **HEX** in the send editor accepts contiguous bytes or spaces/commas between bytes, for example `01030000` or `01 03 00 00`.
+- **Parse text escapes** under **Options > Sending** is off by default. When enabled, text mode interprets `\\`, `\a`, `\b`, `\f`, `\n`, `\r`, `\t`, `\v`, `\0`, and `\xNN`; `\xNN` emits the exact byte without text re-encoding. Unknown, malformed, or incomplete escapes reject the send. HEX mode is unchanged.
 - **CRLF**, next to **HEX** in the send controls, appends `\r\n` to outgoing data, independently of serial framing. No checksum is calculated or appended automatically; include protocol-required checksum bytes yourself.
 - Enable **Repeat** and set a millisecond interval to send the current input repeatedly.
 - **Send** starts sending the current input; **Clear send** clears it. Both text and HEX modes show **Enter data to send...** when empty. **Stop** cancels an active file-send task; hover over it to see **Stop file sending**.
@@ -107,7 +108,7 @@ Open **Options** in the receive controls. The language button shows **简体中�
 
 Switching language does not translate or reset serial data, user input, files, preset notes or commands, protocol values, or original operating-system/library errors. Default preset names stay `Preset 1` through `Preset 5` in both languages.
 
-Options also provides On top, text encoding, display history, timestamp packet gap, and receive-font settings. The receive font defaults to `宋体`, 9 pt, black, with a standard 16-color palette. Send and preset data use the system monospace font with Chinese fallback. Icons are embedded; no separate icon files are needed.
+Options also provides On top, text encoding, the default-off text-escape option, display history, timestamp packet gap, and receive-font settings. The receive font defaults to `宋体`, 9 pt, black, with a standard 16-color palette. Send and preset data use the system monospace font with Chinese fallback. Icons are embedded; no separate icon files are needed.
 
 ## Configuration and data safety
 

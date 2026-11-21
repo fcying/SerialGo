@@ -8,6 +8,7 @@ PacketGap = "20"
 FileDelay = "1"
 SendHex = false
 CRLF = true
+ParseSendEscapes = false
 ReceiveHex = false
 ShowSent = false
 Timestamp = false

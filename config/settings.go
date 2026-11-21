@@ -138,6 +138,7 @@ type Settings struct {
 	Encoding                            string
 	Interval, PacketGap, FileDelay      string
 	SendHex, CRLF, ReceiveHex, ShowSent bool
+	ParseSendEscapes                    bool
 	Timestamp, ShowPresets              bool
 	DisplayBufferLimit                  int      // Retained event payload bytes, not rendered text bytes.
 	ReceiveHexBytesPerLine              int
