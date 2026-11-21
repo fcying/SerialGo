@@ -579,6 +579,21 @@ func TestSendValidationAndCancellationRemainFrameworkIndependent(t *testing.T) {
 	if !s.StatusError || s.Sending() {
 		t.Fatal("invalid preset started a job")
 	}
+	s.StatusError = false
+	s.Settings.ParseSendEscapes = true
+	s.Settings.CRLF = false
+	s.Repeat = false
+	s.SendText(`bad\q`)
+	if !s.StatusError || s.Sending() {
+		t.Fatal("invalid text escape started a send")
+	}
+	s.StatusError = false
+	s.Settings.Presets = []config.Preset{{Enabled: true, Data: `bad\x`}}
+	s.SendPresets(-1)
+	if !s.StatusError || s.Sending() {
+		t.Fatal("invalid preset escape started a send")
+	}
+	s.StatusError = false
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancelSend = cancel
 	s.StopSending()
@@ -743,13 +758,22 @@ func TestAsyncFileUseSavesAcceptedSnapshotNotLaterDraft(t *testing.T) {
 
 func TestAppSendFormatUsesHexCRLFAndConfiguredEncoding(t *testing.T) {
 	s := &App{Settings: config.Settings{Encoding: "GB18030", SendHex: true, CRLF: true}}
-	data, err := Encode("01 03 FF", s.format(s.Settings.SendHex, s.Settings.CRLF))
+	data, err := s.encodeSendData("01 03 FF", true, true)
 	if err != nil || string(data) != string([]byte{1, 3, 255, '\r', '\n'}) {
 		t.Fatalf("HEX+CRLF format = % x, %v", data, err)
 	}
-	data, err = Encode("中", s.format(false, true))
+	data, err = s.encodeSendData("中", false, true)
 	if err != nil || string(data) != string([]byte{0xD6, 0xD0, '\r', '\n'}) {
 		t.Fatalf("configured text encoding = % x, %v", data, err)
+	}
+	s.Settings.ParseSendEscapes = true
+	data, err = s.encodeSendData(`中\x00`, false, false)
+	if err != nil || string(data) != string([]byte{0xD6, 0xD0, 0}) {
+		t.Fatalf("escaped text with configured encoding = % x, %v", data, err)
+	}
+	data, err = s.encodeSendData("5C7830", true, false)
+	if err != nil || string(data) != string([]byte{'\\', 'x', '0'}) {
+		t.Fatalf("HEX mode parsed text escapes = % x, %v", data, err)
 	}
 }
 

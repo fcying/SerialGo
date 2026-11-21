@@ -480,12 +480,16 @@ func (s *App) format(hex, crlf bool) Format {
 	return Format{Hex: hex, CRLF: crlf, Encoding: s.Settings.Encoding}
 }
 
+func (s *App) encodeSendData(input string, hex, crlf bool) ([]byte, error) {
+	return encodeInput(input, s.format(hex, crlf), s.Settings.ParseSendEscapes)
+}
+
 func (s *App) SendText(input string) {
 	if !s.CanSend() {
 		return
 	}
 	p := &s.Settings
-	data, err := Encode(input, s.format(p.SendHex, p.CRLF))
+	data, err := s.encodeSendData(input, p.SendHex, p.CRLF)
 	if err != nil {
 		s.Fail("发送失败", "Send failed", err)
 		return
@@ -526,7 +530,7 @@ func (s *App) SendPresets(index int) {
 		if index >= 0 && i != index || index < 0 && !preset.Enabled {
 			continue
 		}
-		data, err := Encode(preset.Data, s.format(preset.Hex, preset.CRLF))
+		data, err := s.encodeSendData(preset.Data, preset.Hex, preset.CRLF)
 		if err != nil {
 			s.Fail(fmt.Sprintf("第 %d 条发送失败", i+1), fmt.Sprintf("Failed to send preset %d", i+1), err)
 			return

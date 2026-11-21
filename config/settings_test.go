@@ -56,6 +56,7 @@ func TestConfiguredPresetsKeepEmptyEntriesAndSettings(t *testing.T) {
 	want.Language = "zh-CN"
 	want.Port.Name, want.Port.Baud = "COM12", "1000000"
 	want.SendText, want.SendHexText = "发送内容\r\n", "00 FF"
+	want.ParseSendEscapes = true
 	want.Presets[0] = Preset{Label: "自定义", Data: "01 03", Interval: "25", Hex: true, CRLF: true, Enabled: true}
 	want.Presets[2].Label = ""
 	want.Presets = append(want.Presets, NewPreset())
@@ -575,6 +576,9 @@ func TestLegacyConfigUsesWindowDefaultsWithoutRewrite(t *testing.T) {
 	got, gotPath, err := load(path)
 	if err != nil || gotPath != path {
 		t.Fatalf("loading legacy config: path=%q err=%v", gotPath, err)
+	}
+	if got.ParseSendEscapes {
+		t.Fatal("legacy config enabled text escape parsing by default")
 	}
 	if got.Window != defaults().Window {
 		t.Fatalf("legacy config did not receive default window settings: %+v", got.Window)

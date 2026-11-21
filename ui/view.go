@@ -196,12 +196,25 @@ func (s *controller) optionsDialog(c *ui.Context) {
 		p := s.settings
 		ui.Column(c.Key("preferences")).Width(360).Gap(sectionGap).Children(func() {
 			ui.Text(c.Key("window-heading"), s.tr("窗口与语言", "Window and language")).FontWeight(600)
-			ui.Checkbox(c.Key("top"), &s.alwaysOnTop, s.tr("置顶", "On top")).OnChange(s.applyAlwaysOnTop)
-			ui.Row(c.Key("language-options")).Gap(groupGap).AlignItems(ui.Center).Children(func() {
-				ui.Text(c.Key("language-label"), s.tr("语言", "Language"))
+			ui.Row(c.Key("window-language-options")).FillWidth().Gap(groupGap).AlignItems(ui.Center).Children(func() {
+				ui.Checkbox(c.Key("top"), &s.alwaysOnTop, s.tr("置顶", "On top")).Shrink(0).OnChange(s.applyAlwaysOnTop)
+				ui.Text(c.Key("language-label"), s.tr("语言", "Language")).Shrink(0)
 				ui.Button(c.Key("language"), s.tr("English", "简体中文")).Height(controlHeight).PaddingY(controlPadY).
 					Label("语言 / Language").Tooltip(s.tr("切换到英文界面", "Switch to Simplified Chinese")).OnClick(s.toggleLanguage)
 			})
+			ui.Text(c.Key("send-heading"), s.tr("发送", "Sending")).FontWeight(600)
+			parseEscapes := s.tr("解析转义符", "Parse text escapes")
+			escapeTooltip := s.tr(
+				`仅文本模式生效; 无效或不完整转义会阻止发送.`+"\n"+
+					`支持: \\, \a, \b, \f, \n, \r, \t, \v, \0, \xNN. \xNN 为两位十六进制数并输出原始字节.`+"\n"+
+					`启用 CRLF 时仍会额外追加 0D 0A.`,
+				`Text mode only; invalid or incomplete escapes reject the send.`+"\n"+
+					`Supported: \\, \a, \b, \f, \n, \r, \t, \v, \0, \xNN. \xNN is two hex digits and emits one raw byte.`+"\n"+
+					`CRLF still appends an additional 0D 0A when enabled.`,
+			)
+			ui.Checkbox(c.Key("send-escape-parsing"), &p.ParseSendEscapes, parseEscapes).
+				Label(parseEscapes).Tooltip(escapeTooltip).
+				OnChange(s.app.SettingsChanged)
 			ui.Text(c.Key("display-heading"), s.tr("数据显示", "Data display")).FontWeight(600)
 			ui.Row(c.Key("encoding-options")).Gap(tightGap).AlignItems(ui.Center).Children(func() {
 				ui.Text(c.Key("encoding-label"), s.tr("编码", "Encoding"))

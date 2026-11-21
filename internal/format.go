@@ -3,6 +3,7 @@ package internal
 import (
 	"encoding/hex"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +22,10 @@ type Format struct {
 }
 
 func Encode(input string, f Format) ([]byte, error) {
+	return encodeInput(input, f, false)
+}
+
+func encodeInput(input string, f Format, parseEscapes bool) ([]byte, error) {
 	var data []byte
 	var err error
 	if f.Hex {
@@ -33,6 +38,11 @@ func Encode(input string, f Format) ([]byte, error) {
 		data, err = hex.DecodeString(clean)
 		if err != nil {
 			return nil, i18n.WrapError("HEX 数据须由完整的十六进制字节组成", "HEX data must consist of complete hexadecimal bytes", err)
+		}
+	} else if parseEscapes {
+		data, err = encodeEscapedText(input, f.Encoding)
+		if err != nil {
+			return nil, err
 		}
 	} else if f.Encoding == "GB18030" {
 		data, err = simplifiedchinese.GB18030.NewEncoder().Bytes([]byte(input))
@@ -49,6 +59,130 @@ func Encode(input string, f Format) ([]byte, error) {
 		data = append(data, '\r', '\n')
 	}
 	return data, nil
+}
+
+func encodeEscapedText(input, encoding string) ([]byte, error) {
+	var source []byte
+	var encoder transform.Transformer
+	if encoding == "GB18030" {
+		source = []byte(input)
+		encoder = simplifiedchinese.GB18030.NewEncoder()
+	}
+	data := make([]byte, 0, len(input))
+	literalStart := 0
+	for i := 0; i < len(input); {
+		if input[i] != '\\' {
+			i++
+			continue
+		}
+		var err error
+		data, err = appendEscapedTextSegment(data, input, source, literalStart, i, encoder)
+		if err != nil {
+			return nil, i18n.WrapError("编码失败", "Encoding failed", err)
+		}
+		i++
+		if i == len(input) {
+			return nil, invalidTextEscapeError()
+		}
+		escape := input[i]
+		i++
+		switch escape {
+		case '\\':
+			data = append(data, '\\')
+		case 'a':
+			data = append(data, '\a')
+		case 'b':
+			data = append(data, '\b')
+		case 'f':
+			data = append(data, '\f')
+		case 'v':
+			data = append(data, '\v')
+		case 'r':
+			data = append(data, '\r')
+		case 'n':
+			data = append(data, '\n')
+		case 't':
+			data = append(data, '\t')
+		case '0':
+			data = append(data, 0)
+		case 'x':
+			if len(input)-i < 2 {
+				return nil, invalidTextEscapeError()
+			}
+			hi, hiOK := textEscapeHexValue(input[i])
+			lo, loOK := textEscapeHexValue(input[i+1])
+			if !hiOK || !loOK {
+				return nil, invalidTextEscapeError()
+			}
+			data = append(data, hi<<4|lo)
+			i += 2
+		default:
+			return nil, invalidTextEscapeError()
+		}
+		literalStart = i
+	}
+	var err error
+	data, err = appendEscapedTextSegment(data, input, source, literalStart, len(input), encoder)
+	if err != nil {
+		return nil, i18n.WrapError("编码失败", "Encoding failed", err)
+	}
+	return data, nil
+}
+
+func appendEscapedTextSegment(dst []byte, input string, source []byte, start, end int, encoder transform.Transformer) ([]byte, error) {
+	if start == end {
+		return dst, nil
+	}
+	if encoder == nil {
+		return append(dst, input[start:end]...), nil
+	}
+	return appendGB18030(dst, encoder, source[start:end])
+}
+
+func appendGB18030(dst []byte, encoder transform.Transformer, source []byte) ([]byte, error) {
+	if len(source) == 0 {
+		return dst, nil
+	}
+	encoder.Reset()
+	for {
+		dst = slices.Grow(dst, len(source))
+		start := len(dst)
+		buffer := dst[:cap(dst)]
+		nDst, nSrc, err := encoder.Transform(buffer[start:], source, true)
+		dst = dst[:start+nDst]
+		source = source[nSrc:]
+		if err == transform.ErrShortDst {
+			free := cap(dst) - len(dst)
+			dst = slices.Grow(dst, free+max(len(source), 1))
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if len(source) == 0 {
+			return dst, nil
+		}
+		if nSrc == 0 {
+			return nil, fmt.Errorf("GB18030 encoder made no progress")
+		}
+	}
+}
+
+func textEscapeHexValue(value byte) (byte, bool) {
+	switch {
+	case value >= '0' && value <= '9':
+		return value - '0', true
+	case value >= 'a' && value <= 'f':
+		return value - 'a' + 10, true
+	case value >= 'A' && value <= 'F':
+		return value - 'A' + 10, true
+	default:
+		return 0, false
+	}
+}
+
+func invalidTextEscapeError() error {
+	return i18n.NewError("文本转义符无效", "Invalid text escape sequence")
 }
 
 func Milliseconds(value, label string, min int) (time.Duration, error) {
