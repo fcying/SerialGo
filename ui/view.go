@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/fcying/SerialGo/config"
 
@@ -140,16 +141,22 @@ func (s *controller) receivePane(c *ui.Context) {
 	l.view.Theme = &l.theme
 	l.view.OnInput = l.receiveInput
 	l.view.Label = s.tr("接收窗口", "Receive log")
-	area := editor.View(c.Key("receive"), &l.view).Fill().MinHeight(80).Grow(1)
-	area.ContextMenu(func(m *ui.Menu) {
-		hasSelection := l.hasSelection()
-		copyChosen := m.Item(s.tr("复制", "Copy")).Shortcut(ui.Cmd, ui.KeyC).Disabled(!hasSelection).Chosen()
-		if copyChosen && hasSelection {
-			l.view.Run(editor.Copy)
-		}
-		selectAll := m.Item(s.tr("全选", "Select all")).Shortcut(ui.Cmd, ui.KeyA).Chosen()
-		if selectAll {
-			l.view.Run(editor.SelectAll)
+	var area ui.Element
+	ui.Column(c.Key("receive-pane")).Fill().MinHeight(minReceiveHeight).Grow(1).Gap(compactGap).Children(func() {
+		area = editor.View(c.Key("receive"), &l.view).Fill().MinHeight(80).Grow(1)
+		area.ContextMenu(func(m *ui.Menu) {
+			hasSelection := l.hasSelection()
+			copyChosen := m.Item(s.tr("复制", "Copy")).Shortcut(ui.Cmd, ui.KeyC).Disabled(!hasSelection).Chosen()
+			if copyChosen && hasSelection {
+				l.view.Run(editor.Copy)
+			}
+			selectAll := m.Item(s.tr("全选", "Select all")).Shortcut(ui.Cmd, ui.KeyA).Chosen()
+			if selectAll {
+				l.view.Run(editor.SelectAll)
+			}
+		})
+		if s.app.FileProgress.Visible {
+			s.fileSendProgress(c)
 		}
 	})
 	if !l.scrollToEnd {
@@ -167,6 +174,55 @@ func (s *controller) receivePane(c *ui.Context) {
 	end := l.text.Len()
 	l.view.Select(end, end)
 	l.scrollToEnd = false
+}
+
+func (s *controller) fileSendProgress(c *ui.Context) {
+	progress := s.app.FileProgress
+	_, percentage := fileProgressDisplay(progress.SentBytes, progress.TotalBytes, progress.Active, progress.Error)
+	text := fmt.Sprintf(s.tr("发送文件 %s: %s (%s / %s)", "Sending file %s: %s (%s / %s)"), progress.Name, percentage, fileSizeText(progress.SentBytes), fileSizeText(progress.TotalBytes))
+	if !progress.Active {
+		text += " - " + s.tr(progress.Status.ZH, progress.Status.EN)
+	}
+	ui.Text(c.Key("file-send-progress"), text).FillWidth().Height(18).SingleLine().Tooltip(text)
+}
+
+func fileProgressDisplay(sentBytes, totalBytes uint64, active, failed bool) (float64, string) {
+	if totalBytes == 0 {
+		if active {
+			return -1, "--%"
+		}
+		if failed {
+			return 0, "0%"
+		}
+		return -1, "--%"
+	}
+	value := min(float64(sentBytes)/float64(totalBytes), 1)
+	percent := int(value * 100)
+	if active {
+		percent = min(percent, 99)
+	}
+	return value, fmt.Sprintf("%d%%", percent)
+}
+
+func fileSizeText(size uint64) string {
+	units := [...]string{"B", "KB", "MB", "GB", "TB"}
+	value := float64(size)
+	unit := 0
+	for value >= 1000 && unit < len(units)-1 {
+		value /= 1000
+		unit++
+	}
+	precision := 0
+	if unit > 0 && value < 10 {
+		precision = 2
+	} else if unit > 0 && value < 100 {
+		precision = 1
+	}
+	formatted := fmt.Sprintf("%.*f", precision, value)
+	if precision > 0 {
+		formatted = strings.TrimRight(strings.TrimRight(formatted, "0"), ".")
+	}
+	return formatted + " " + units[unit]
 }
 
 func (s *controller) filePanel(c *ui.Context, width float32) {

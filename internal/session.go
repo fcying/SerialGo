@@ -57,26 +57,30 @@ type sessionPort interface {
 }
 
 type Session struct {
-	port          sessionPort
-	ctx           context.Context
-	cancel        context.CancelFunc
-	events        chan Event
-	writeChunk    int
-	readDone      chan struct{}
-	sendMu        sync.Mutex
-	captureMu     sync.Mutex
-	captureOps    sync.Mutex
-	capture       *captureWriter
-	captureWorker *captureWriter
-	captureErrors map[*captureWriter]error
-	displayMu     sync.Mutex
-	displayEvents [displayEventLimit]Event
-	displayHead   int
-	displayCount  int
-	displayBytes  int
-	displayRx     uint64
-	displayTx     uint64
-	curve         *curveWorker
+	port               sessionPort
+	ctx                context.Context
+	cancel             context.CancelFunc
+	events             chan Event
+	writeChunk         int
+	readDone           chan struct{}
+	sendMu             sync.Mutex
+	captureMu          sync.Mutex
+	captureOps         sync.Mutex
+	capture            *captureWriter
+	captureWorker      *captureWriter
+	captureErrors      map[*captureWriter]error
+	displayMu          sync.Mutex
+	displayEvents      [displayEventLimit]Event
+	displayHead        int
+	displayCount       int
+	displayBytes       int
+	displayRx          uint64
+	displayTx          uint64
+	fileSendActive     bool
+	fileSendBytes      uint64
+	fileSendReported   uint64
+	fileSendNextUpdate time.Time
+	curve              *curveWorker
 }
 
 func NewSession(port *serialport.Port, baud int) *Session {
@@ -117,6 +121,9 @@ func (s *Session) enqueueDisplay(event Event) {
 	s.displayMu.Lock()
 	if event.Sent {
 		s.displayTx += uint64(dataBytes)
+		if s.fileSendActive {
+			s.fileSendBytes += uint64(dataBytes)
+		}
 	} else {
 		s.displayRx += uint64(dataBytes)
 	}
@@ -155,6 +162,41 @@ func (s *Session) drainDisplay() ([]Event, uint64, uint64) {
 	s.displayRx, s.displayTx = 0, 0
 	s.displayMu.Unlock()
 	return events, rx, tx
+}
+
+func (s *Session) beginFileSendProgress() {
+	s.displayMu.Lock()
+	s.fileSendBytes = 0
+	s.fileSendReported = 0
+	s.fileSendNextUpdate = time.Now().Add(fileSendProgressInterval)
+	s.fileSendActive = true
+	s.displayMu.Unlock()
+}
+
+func (s *Session) fileSendProgressBytes() uint64 {
+	s.displayMu.Lock()
+	defer s.displayMu.Unlock()
+	return s.fileSendBytes
+}
+
+func (s *Session) takeFileSendProgress() uint64 {
+	s.displayMu.Lock()
+	defer s.displayMu.Unlock()
+	s.fileSendReported = s.fileSendBytes
+	s.fileSendNextUpdate = time.Now().Add(fileSendProgressInterval)
+	return s.fileSendBytes
+}
+
+func (s *Session) fileSendProgressDue(now time.Time) bool {
+	s.displayMu.Lock()
+	defer s.displayMu.Unlock()
+	return s.fileSendActive && s.fileSendBytes != s.fileSendReported && !now.Before(s.fileSendNextUpdate)
+}
+
+func (s *Session) endFileSendProgress() {
+	s.displayMu.Lock()
+	s.fileSendActive = false
+	s.displayMu.Unlock()
 }
 
 func (s *Session) hasDisplay() bool {
@@ -481,6 +523,10 @@ func (s *Session) SendFile(ctx context.Context, path string, delay time.Duration
 }
 
 func sendFile(ctx context.Context, path string, delay time.Duration, sender fileSender) error {
+	return sendFileWithProgress(ctx, path, delay, sender, nil)
+}
+
+func sendFileWithProgress(ctx context.Context, path string, delay time.Duration, sender fileSender, onSize func(int64)) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return err
@@ -494,6 +540,16 @@ func sendFile(ctx context.Context, path string, delay time.Duration, sender file
 		return err
 	}
 	defer file.Close()
+	info, err = file.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return errFileNotRegular
+	}
+	if onSize != nil {
+		onSize(info.Size())
+	}
 	buf := make([]byte, 256)
 	next := make([]byte, 256)
 	n, readErr := file.Read(buf)

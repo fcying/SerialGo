@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -18,7 +19,10 @@ import (
 	"github.com/fcying/SerialGo/internal/i18n"
 )
 
-const eventPumpInterval = 10 * time.Millisecond
+const (
+	eventPumpInterval        = 10 * time.Millisecond
+	fileSendProgressInterval = 200 * time.Millisecond
+)
 
 // View confines all application state and display updates to the frontend thread.
 // Dispatch must post asynchronously and may discard callbacks after shutdown.
@@ -29,6 +33,16 @@ type View interface {
 
 type Text struct{ ZH, EN string }
 
+type FileSendProgress struct {
+	Name       string
+	SentBytes  uint64
+	TotalBytes uint64
+	Status     Text
+	Visible    bool
+	Active     bool
+	Error      bool
+}
+
 type captureTarget struct {
 	path   string
 	opened <-chan struct{}
@@ -36,6 +50,11 @@ type captureTarget struct {
 
 type terminalError struct {
 	err error
+}
+
+type sendResult struct {
+	done chan struct{}
+	err  error
 }
 
 // App owns serial operations, operation state and persisted preferences.
@@ -56,29 +75,32 @@ type App struct {
 	PortBusy              bool
 	RefreshingPorts       bool
 	FileBusy              bool
+	FileProgress          FileSendProgress
 
-	view              View
-	ports             []serialport.Info
-	session           *Session
-	closingSessions   map[*Session]struct{}
-	stopPump          chan struct{}
-	closed            chan struct{}
-	closing           bool
-	jobs              sync.WaitGroup
-	pendingPortMu     sync.Mutex
-	pendingPort       *serialport.Port
-	captureMu         sync.Mutex
-	captureTargets    map[*Session]*captureTarget
-	terminalMu        sync.Mutex
-	terminalErrors    map[*terminalError]struct{}
-	saver             *settingsSaver
-	settingsSaveError bool
-	cancelSend        context.CancelFunc
-	sendDone          <-chan struct{}
-	sendingFilePath   string
-	loadErrorReported bool
-	settingsWarning   Text
-	curve             curveEngine
+	view                   View
+	ports                  []serialport.Info
+	session                *Session
+	closingSessions        map[*Session]struct{}
+	stopPump               chan struct{}
+	closed                 chan struct{}
+	closing                bool
+	jobs                   sync.WaitGroup
+	pendingPortMu          sync.Mutex
+	pendingPort            *serialport.Port
+	captureMu              sync.Mutex
+	captureTargets         map[*Session]*captureTarget
+	terminalMu             sync.Mutex
+	terminalErrors         map[*terminalError]struct{}
+	saver                  *settingsSaver
+	settingsSaveError      bool
+	cancelSend             context.CancelFunc
+	sendDone               *sendResult
+	sendingFilePath        string
+	fileProgressUpdatedAt  time.Time
+	fileProgressGeneration uint64
+	loadErrorReported      bool
+	settingsWarning        Text
+	curve                  curveEngine
 }
 
 func NewApp() *App {
@@ -355,8 +377,8 @@ func (s *App) pump(p *Session, stop <-chan struct{}) {
 			return
 		case <-stop:
 			return
-		case <-ticker.C:
-			if len(p.Events()) == 0 && !p.hasDisplay() {
+		case now := <-ticker.C:
+			if len(p.Events()) == 0 && !p.hasDisplay() && !p.fileSendProgressDue(now) {
 				continue
 			}
 			if !dispatchPending.CompareAndSwap(false, true) {
@@ -404,7 +426,7 @@ func (s *App) drain(p *Session) {
 		}
 	}
 	if readErr != nil {
-		s.disconnect()
+		s.disconnect(readErr)
 		s.Fail("串口已断开", "Serial port disconnected", readErr)
 	}
 }
@@ -415,6 +437,13 @@ func (s *App) deliverDisplay(p *Session) {
 	records, rx, tx := p.drainDisplay()
 	s.Rx += rx
 	s.Tx += tx
+	if s.FileProgress.Active && p == s.session {
+		now := time.Now()
+		if now.Sub(s.fileProgressUpdatedAt) >= fileSendProgressInterval {
+			s.FileProgress.SentBytes = p.takeFileSendProgress()
+			s.fileProgressUpdatedAt = now
+		}
+	}
 	if s.view != nil {
 		s.view.AppendEvents(records)
 	}
@@ -428,27 +457,31 @@ func (s *App) startSending(label Text, filePath string, send func(context.Contex
 	}
 	p := s.session
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	done := &sendResult{done: make(chan struct{})}
 	s.sendDone = done
 	s.cancelSend = cancel
 	if filePath != "" {
 		s.sendingFilePath = filePath
+		s.FileProgress = FileSendProgress{
+			Name:    filepath.Base(filePath),
+			Status:  Text{ZH: "发送中", EN: "Sending"},
+			Visible: true,
+			Active:  true,
+		}
+		s.fileProgressUpdatedAt = time.Now()
+		p.beginFileSendProgress()
 	}
 	s.Note(label.ZH+"中", label.EN+" in progress")
 	s.SaveUsedSettings()
 	s.jobs.Add(1)
 	go func() {
 		defer s.jobs.Done()
-		err := send(ctx, p)
+		done.err = send(ctx, p)
 		cancel()
-		close(done)
+		close(done.done)
 		s.dispatch(func() {
 			if s.sendDone != done {
 				return
-			}
-			s.sendDone = nil
-			if filePath != "" {
-				s.sendingFilePath = ""
 			}
 			if s.session != p {
 				return
@@ -458,16 +491,37 @@ func (s *App) startSending(label Text, filePath string, send func(context.Contex
 			if s.session != p {
 				return
 			}
+			s.sendDone = nil
+			err := done.err
 			switch {
 			case errors.Is(err, context.Canceled):
 				s.Note("已停止发送", "Sending stopped")
+				if filePath != "" {
+					s.finishFileSendProgress(p, true, Text{ZH: "已取消", EN: "Cancelled"}, false)
+				}
 			case err != nil:
 				s.Fail(label.ZH+"失败", label.EN+" failed", err)
+				if filePath != "" {
+					s.finishFileSendProgress(p, true, s.Status, true)
+				}
 			default:
 				s.Note(label.ZH+"完成", label.EN+" completed")
+				if filePath != "" {
+					s.finishFileSendProgress(p, false, s.Status, false)
+				}
 			}
 		})
 	}()
+}
+
+func (s *App) finishFileSendProgress(p *Session, visible bool, status Text, failed bool) {
+	s.FileProgress.SentBytes = p.fileSendProgressBytes()
+	s.FileProgress.Visible = visible
+	s.FileProgress.Active = false
+	s.FileProgress.Status = status
+	s.FileProgress.Error = failed
+	p.endFileSendProgress()
+	s.sendingFilePath = ""
 }
 
 func (s *App) StopSending() {
@@ -595,8 +649,17 @@ func (s *App) SendFile() {
 	if !s.CanSendFile() {
 		return
 	}
+	s.fileProgressGeneration++
+	progressGeneration := s.fileProgressGeneration
 	s.startSending(Text{ZH: "发送文件", EN: "File send"}, path, func(ctx context.Context, p *Session) error {
-		return p.SendFile(ctx, path, delay)
+		return sendFileWithProgress(ctx, path, delay, p, func(total int64) {
+			s.dispatch(func() {
+				if s.fileProgressGeneration != progressGeneration || !s.FileProgress.Active {
+					return
+				}
+				s.FileProgress.TotalBytes = uint64(total)
+			})
+		})
 	})
 }
 
@@ -647,7 +710,7 @@ func (s *App) TogglePort() {
 	if s.session != nil {
 		s.drain(s.session)
 		if s.session != nil {
-			s.disconnect()
+			s.disconnect(nil)
 		}
 		return
 	}
@@ -686,7 +749,7 @@ func (s *App) TogglePort() {
 	}()
 }
 
-func (s *App) disconnect() {
+func (s *App) disconnect(readErr error) {
 	p := s.session
 	if p == nil {
 		return
@@ -714,7 +777,7 @@ func (s *App) disconnect() {
 			<-target.opened
 		}
 		if sendDone != nil {
-			<-sendDone
+			<-sendDone.done
 		}
 		s.releaseCapture(p, target)
 		result := s.retainTerminalError(err)
@@ -723,6 +786,26 @@ func (s *App) disconnect() {
 			delete(s.closingSessions, p)
 			if s.session != nil {
 				return
+			}
+			if s.FileProgress.Active {
+				switch {
+				case sendDone != nil && sendDone.err == nil:
+					s.finishFileSendProgress(p, false, Text{ZH: "发送文件完成", EN: "File send completed"}, false)
+				case readErr != nil:
+					status := Text{
+						ZH: "串口已断开: " + i18n.ErrorText(readErr, false),
+						EN: "Serial port disconnected: " + i18n.ErrorText(readErr, true),
+					}
+					s.finishFileSendProgress(p, true, status, true)
+				case sendDone != nil && !errors.Is(sendDone.err, context.Canceled):
+					status := Text{
+						ZH: "发送文件失败: " + i18n.ErrorText(sendDone.err, false),
+						EN: "File send failed: " + i18n.ErrorText(sendDone.err, true),
+					}
+					s.finishFileSendProgress(p, true, status, true)
+				default:
+					s.finishFileSendProgress(p, true, Text{ZH: "已取消", EN: "Cancelled"}, false)
+				}
 			}
 			s.sendingFilePath = ""
 			s.PortBusy = false
@@ -740,6 +823,9 @@ func (s *App) disconnect() {
 }
 
 func (s *App) SelectFile(path string) {
+	if !s.FileProgress.Active {
+		s.FileProgress = FileSendProgress{}
+	}
 	s.FilePath = path
 	s.Note("待发送文件已选择", "File selected for sending")
 }

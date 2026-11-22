@@ -822,6 +822,141 @@ func TestFileActionsAndCaptureStateAreTransient(t *testing.T) {
 	}
 }
 
+func TestFileSendProgressIsLocalizedAndSeparateFromReceiveHistory(t *testing.T) {
+	for _, test := range []struct {
+		language, expected string
+	}{
+		{language: "en", expected: "Sending file firmware.bin: 65% (650 KB / 1 MB)"},
+		{language: "zh-CN", expected: "发送文件 firmware.bin: 65% (650 KB / 1 MB)"},
+	} {
+		t.Run(test.language, func(t *testing.T) {
+			app := &internal.App{
+				Settings: config.Settings{Language: test.language},
+				FileProgress: internal.FileSendProgress{
+					Name: "firmware.bin", SentBytes: 650_000, TotalBytes: 1_000_000,
+					Status: internal.Text{ZH: "发送中", EN: "Sending"}, Visible: true, Active: true,
+				},
+			}
+			s := newController(app)
+			s.configureLog()
+			tt := gui.NewTester(s.view, 900, 600)
+			if !tt.HasText(test.expected) {
+				t.Fatalf("file progress is missing %q: %q", test.expected, tt.Texts())
+			}
+			if s.log.text.Len() != 0 {
+				t.Fatalf("file progress was appended to receive history: %q", s.log.text.String())
+			}
+		})
+	}
+}
+
+func TestFileProgressLongMessageShowsFullTooltip(t *testing.T) {
+	name := strings.Repeat("firmware", 30) + ".bin"
+	detail := strings.Repeat("serial write failed; ", 20)
+	message := "Sending file " + name + ": --% (0 B / 0 B) - " + detail
+	app := &internal.App{Settings: config.Settings{Language: "en"}, FileProgress: internal.FileSendProgress{
+		Name: name, Status: internal.Text{EN: detail}, Visible: true,
+	}}
+	s := newController(app)
+	s.configureLog()
+	tt := gui.NewTester(s.view, minWindowWidth, minWindowHeight)
+	bounds, found := tt.Find(message)
+	if !found || bounds.H > 18 || bounds.X+bounds.W > minWindowWidth {
+		t.Fatalf("long progress line is not constrained: bounds=%+v found=%t", bounds, found)
+	}
+	before := 0
+	for _, text := range tt.Texts() {
+		if text == message {
+			before++
+		}
+	}
+	tt.Move(bounds.X+10, bounds.Y+bounds.H/2)
+	tt.Advance(time.Second)
+	after := 0
+	for _, text := range tt.Texts() {
+		if text == message {
+			after++
+		}
+	}
+	if after <= before {
+		t.Fatal("long progress tooltip did not retain the complete message")
+	}
+}
+
+func TestFileProgressCancellationBeforeSizeKnown(t *testing.T) {
+	app := &internal.App{Settings: config.Settings{Language: "en"}, FileProgress: internal.FileSendProgress{
+		Name: "firmware.bin", Status: internal.Text{EN: "Cancelled"}, Visible: true,
+	}}
+	s := newController(app)
+	s.configureLog()
+	tt := gui.NewTester(s.view, minWindowWidth, minWindowHeight)
+	message := "Sending file firmware.bin: --% (0 B / 0 B) - Cancelled"
+	if !tt.HasText(message) {
+		t.Fatalf("cancelled progress did not show an unknown percentage: %q", tt.Texts())
+	}
+}
+
+func TestFileProgressPercentDoesNotReach100WhileActive(t *testing.T) {
+	for _, tc := range []struct {
+		sent, total uint64
+		active      bool
+		want        string
+	}{
+		{996, 1000, true, "99%"},
+		{1000, 1000, true, "99%"},
+		{1000, 1000, false, "100%"},
+	} {
+		_, got := fileProgressDisplay(tc.sent, tc.total, tc.active, false)
+		if got != tc.want {
+			t.Errorf("progress %d/%d active=%t = %s, want %s", tc.sent, tc.total, tc.active, got, tc.want)
+		}
+	}
+}
+
+func TestFileSizeTextUsesDecimalNotation(t *testing.T) {
+	for _, tc := range []struct {
+		bytes uint64
+		want  string
+	}{
+		{0, "0 B"},
+		{1500, "1.5 KB"},
+		{999500, "1000 KB"},
+		{999999, "1000 KB"},
+		{1000000, "1 MB"},
+		{999999999, "1000 MB"},
+	} {
+		if got := fileSizeText(tc.bytes); got != tc.want {
+			t.Errorf("fileSizeText(%d) = %q, want %q", tc.bytes, got, tc.want)
+		}
+	}
+}
+
+func TestFileProgressFitsMinimumReceiveArea(t *testing.T) {
+	for _, active := range []bool{true, false} {
+		app := &internal.App{Settings: config.Settings{Language: "en"}, FileProgress: internal.FileSendProgress{
+			Name: "firmware.bin", SentBytes: 650000, TotalBytes: 1000000,
+			Status: internal.Text{EN: "Sending"}, Visible: true, Active: active,
+		}}
+		s := newController(app)
+		s.configureLog()
+		s.receiveSplitAdjusted = true
+		s.receiveSplit = 0
+		tt := gui.NewTester(s.view, minWindowWidth, minWindowHeight)
+		log, found := tt.Find("Receive log")
+		if !found || log.H < 80 {
+			t.Fatalf("receive log is missing or too short: %+v", log)
+		}
+		label := "Sending file firmware.bin: 65% (650 KB / 1 MB)"
+		if !active {
+			label += " - Sending"
+		}
+		bounds, found := tt.Find(label)
+		if !found || bounds.Y < log.Y+log.H || bounds.Y+bounds.H > log.Y+minReceiveHeight+1 || bounds.X < 0 || bounds.X+bounds.W > minWindowWidth {
+			t.Errorf("active=%t progress outside receive area: log=%+v bounds=%+v found=%t", active, log, bounds, found)
+		}
+	}
+}
+
 func TestFileSendStopTooltipShowsOnHover(t *testing.T) {
 	for _, language := range []string{"en", "zh-CN"} {
 		t.Run(language, func(t *testing.T) {

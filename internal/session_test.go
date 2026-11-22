@@ -43,7 +43,8 @@ func TestSendFileWaitsOnlyBetweenChunks(t *testing.T) {
 	}
 	ctx := &fileSendTestContext{Context: context.Background()}
 	sender := &fileSendTestSender{}
-	if err := sendFile(ctx, path, 0, sender); err != nil {
+	var total int64
+	if err := sendFileWithProgress(ctx, path, 0, sender, func(size int64) { total = size }); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(sender.data, want) {
@@ -52,6 +53,72 @@ func TestSendFileWaitsOnlyBetweenChunks(t *testing.T) {
 	if ctx.errChecks != 1 {
 		t.Fatalf("inter-chunk cancellation checks = %d, want 1", ctx.errChecks)
 	}
+	if total != int64(len(want)) {
+		t.Fatalf("reported file size = %d, want %d", total, len(want))
+	}
+}
+
+func TestSendFileUsesOpenedFileAfterPathReplacement(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows may prevent renaming an open file")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "payload.bin")
+	original := []byte("original content")
+	if err := os.WriteFile(path, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	sender := &fileSendTestSender{}
+	var reported int64
+	err := sendFileWithProgress(context.Background(), path, 0, sender, func(size int64) {
+		reported = size
+		if err := os.Rename(path, filepath.Join(dir, "old.bin")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("replacement"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reported != int64(len(original)) || !bytes.Equal(sender.data, original) {
+		t.Fatalf("size = %d, sent = %q; want size %d, content %q", reported, sender.data, len(original), original)
+	}
+}
+
+type fileProgressTestPort struct{ writes int }
+
+func (p *fileProgressTestPort) Read([]byte) (int, error) { return 0, io.EOF }
+
+func (p *fileProgressTestPort) Write(data []byte) (int, error) {
+	p.writes++
+	if p.writes == 1 {
+		return min(2, len(data)), nil
+	}
+	return 1, errors.New("write failed")
+}
+
+func (p *fileProgressTestPort) SetLines(bool, bool) error { return nil }
+
+func (p *fileProgressTestPort) Close() error { return nil }
+
+func TestFileSendProgressCountsSuccessfulWritesAcrossClear(t *testing.T) {
+	s := &Session{port: &fileProgressTestPort{}, ctx: context.Background(), writeChunk: 5}
+	s.beginFileSendProgress()
+	err := s.Send(context.Background(), []byte("abcde"))
+	if err == nil {
+		t.Fatal("partial write failure was ignored")
+	}
+	if got := s.fileSendProgressBytes(); got != 3 {
+		t.Fatalf("file progress = %d, want 3 successfully written bytes", got)
+	}
+	s.clearDisplay()
+	_, _, tx := s.drainDisplay()
+	if tx != 0 || s.fileSendProgressBytes() != 3 {
+		t.Fatalf("clear reset cumulative TX and file progress incorrectly: TX=%d file=%d", tx, s.fileSendProgressBytes())
+	}
+	s.endFileSendProgress()
 }
 
 type captureTestFile struct {
