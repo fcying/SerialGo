@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -526,6 +527,221 @@ func TestSendFileCannotStartWhileFileOutputIsBusy(t *testing.T) {
 	}
 }
 
+type appFileSendPort struct{}
+
+func (appFileSendPort) Read([]byte) (int, error) { return 0, io.EOF }
+
+func (appFileSendPort) Write(data []byte) (int, error) { return len(data), nil }
+
+func (appFileSendPort) SetLines(bool, bool) error { return nil }
+
+func (appFileSendPort) Close() error { return nil }
+
+func TestFileSendProgressTerminalStates(t *testing.T) {
+	tests := []struct {
+		name            string
+		err             error
+		visible, failed bool
+		status          Text
+	}{
+		{name: "complete", visible: false, status: Text{ZH: "发送文件完成", EN: "File send completed"}},
+		{name: "cancelled", err: context.Canceled, visible: true, status: Text{ZH: "已取消", EN: "Cancelled"}},
+		{name: "failed", err: errors.New("write failed"), visible: true, failed: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			view := &appTestView{callbacks: make(chan func(), 1)}
+			p := &Session{ctx: context.Background()}
+			s := &App{view: view, session: p}
+			s.startSending(Text{ZH: "发送文件", EN: "File send"}, filepath.Join("firmware", "firmware.bin"), func(_ context.Context, session *Session) error {
+				session.emit(Event{Data: []byte("abc"), Sent: true})
+				return tc.err
+			})
+			awaitAppCallback(t, view)
+			if s.FileProgress.Active || s.FileProgress.Visible != tc.visible || s.FileProgress.Error != tc.failed {
+				t.Fatalf("file progress terminal state = %+v", s.FileProgress)
+			}
+			if s.FileProgress.Name != "firmware.bin" || s.FileProgress.SentBytes != 3 {
+				t.Fatalf("file progress identity/count = %+v", s.FileProgress)
+			}
+			if tc.status != (Text{}) && s.FileProgress.Status != tc.status {
+				t.Fatalf("file progress status = %+v, want %+v", s.FileProgress.Status, tc.status)
+			}
+			if tc.failed && !strings.Contains(s.FileProgress.Status.EN, "write failed") {
+				t.Fatalf("file failure reason was not retained: %+v", s.FileProgress.Status)
+			}
+		})
+	}
+}
+
+func TestAppFileProgressUsesIndependentSuccessfulByteCount(t *testing.T) {
+	p := &Session{}
+	p.beginFileSendProgress()
+	s := &App{session: p, FileProgress: FileSendProgress{Active: true}, fileProgressUpdatedAt: time.Now()}
+	p.emit(Event{Data: []byte("abc"), Sent: true})
+	s.deliverDisplay(p)
+	if s.FileProgress.SentBytes != 0 || s.Tx != 3 {
+		t.Fatalf("progress updated before interval or TX count wrong: progress=%d TX=%d", s.FileProgress.SentBytes, s.Tx)
+	}
+	s.ClearReceiveLog()
+	p.emit(Event{Data: []byte("de"), Sent: true})
+	s.fileProgressUpdatedAt = time.Now().Add(-fileSendProgressInterval)
+	s.deliverDisplay(p)
+	if s.Tx != 2 || s.FileProgress.SentBytes != 5 {
+		t.Fatalf("clearing S changed file progress: progress=%d TX=%d", s.FileProgress.SentBytes, s.Tx)
+	}
+	p.endFileSendProgress()
+}
+
+func TestFileProgressUpdatesDuringLongChunkDelay(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "firmware.bin")
+	err := os.WriteFile(path, bytes.Repeat([]byte{0x5A}, 768), 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := &appTestView{callbacks: make(chan func(), 16)}
+	p := &Session{port: appFileSendPort{}, ctx: context.Background(), events: make(chan Event, 1), writeChunk: 256}
+	stop := make(chan struct{})
+	s := &App{Settings: config.Settings{FileDelay: "1000"}, view: view, session: p, FilePath: path, closed: make(chan struct{})}
+	s.SendFile()
+	go s.pump(p, stop)
+	defer func() {
+		s.StopSending()
+		s.jobs.Wait()
+		close(stop)
+	}()
+	deadline := time.NewTimer(900 * time.Millisecond)
+	defer deadline.Stop()
+	for s.FileProgress.SentBytes != 256 {
+		select {
+		case fn := <-view.callbacks:
+			fn()
+		case <-deadline.C:
+			t.Fatalf("first chunk was not reflected during the delay: %+v TX=%d", s.FileProgress, s.Tx)
+		}
+	}
+	if s.FileProgress.TotalBytes != 768 || s.Tx != 256 {
+		t.Fatalf("first chunk progress = %+v TX=%d", s.FileProgress, s.Tx)
+	}
+}
+
+func TestFileProgressDisconnectUsesDisconnectReason(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		readErr error
+		failed  bool
+		want    string
+	}{
+		{name: "manual", want: "Cancelled"},
+		{name: "read failure", readErr: errors.New("device vanished"), failed: true, want: "device vanished"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			readDone := make(chan struct{})
+			close(readDone)
+			p := &Session{port: appFileSendPort{}, ctx: ctx, cancel: cancel, readDone: readDone, events: make(chan Event, 1)}
+			p.beginFileSendProgress()
+			view := &appTestView{callbacks: make(chan func(), 1)}
+			s := &App{view: view, session: p, stopPump: make(chan struct{}), FileProgress: FileSendProgress{Active: true}, StatusError: true, Status: Text{EN: "unrelated export failure"}}
+			if tc.readErr != nil {
+				p.emit(Event{Err: tc.readErr, ReadFailed: true})
+				s.drain(p)
+			} else {
+				s.TogglePort()
+			}
+			s.jobs.Wait()
+			awaitAppCallback(t, view)
+			if s.FileProgress.Active || !s.FileProgress.Visible || s.FileProgress.Error != tc.failed || !strings.Contains(s.FileProgress.Status.EN, tc.want) {
+				t.Fatalf("disconnect progress = %+v", s.FileProgress)
+			}
+			if strings.Contains(s.FileProgress.Status.EN, "export failure") {
+				t.Fatalf("disconnect used an unrelated error: %+v", s.FileProgress)
+			}
+		})
+	}
+}
+
+func TestDisconnectBeforeFileSendCompletionCallback(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		err     error
+		visible bool
+		failed  bool
+		status  string
+	}{
+		{name: "complete", status: "File send completed"},
+		{name: "cancelled", err: context.Canceled, visible: true, status: "Cancelled"},
+		{name: "failed", err: errors.New("write failed"), visible: true, failed: true, status: "write failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			readDone := make(chan struct{})
+			close(readDone)
+			p := &Session{port: appFileSendPort{}, ctx: ctx, cancel: cancel, readDone: readDone, events: make(chan Event, 1)}
+			view := &appTestView{callbacks: make(chan func(), 2)}
+			s := &App{view: view, session: p, stopPump: make(chan struct{})}
+			s.startSending(Text{ZH: "发送文件", EN: "File send"}, "firmware.bin", func(_ context.Context, p *Session) error {
+				p.emit(Event{Data: []byte("abc"), Sent: true})
+				return tc.err
+			})
+			s.jobs.Wait()
+			s.TogglePort()
+			s.jobs.Wait()
+			awaitAppCallback(t, view)
+			awaitAppCallback(t, view)
+			progress := s.FileProgress
+			if progress.Active || progress.Visible != tc.visible || progress.Error != tc.failed || progress.SentBytes != 3 || !strings.Contains(progress.Status.EN, tc.status) {
+				t.Fatalf("disconnect progress = %+v", progress)
+			}
+		})
+	}
+}
+
+func TestSuccessfulFileSendDrainDisconnectKeepsResult(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	readDone := make(chan struct{})
+	close(readDone)
+	p := &Session{port: appFileSendPort{}, ctx: ctx, cancel: cancel, readDone: readDone, events: make(chan Event, 1)}
+	view := &appTestView{callbacks: make(chan func(), 2)}
+	s := &App{view: view, session: p, stopPump: make(chan struct{})}
+	s.startSending(Text{ZH: "发送文件", EN: "File send"}, "firmware.bin", func(_ context.Context, p *Session) error {
+		p.emit(Event{Data: []byte("abc"), Sent: true})
+		return nil
+	})
+	s.jobs.Wait()
+	p.emit(Event{Err: errors.New("device vanished"), ReadFailed: true})
+	awaitAppCallback(t, view)
+	s.jobs.Wait()
+	awaitAppCallback(t, view)
+	if s.FileProgress.Active || s.FileProgress.Visible || s.FileProgress.Error || s.FileProgress.SentBytes != 3 || s.FileProgress.Status.EN != "File send completed" {
+		t.Fatalf("successful file send was lost after read error: %+v", s.FileProgress)
+	}
+	if !s.StatusError || !strings.Contains(s.Status.EN, "device vanished") {
+		t.Fatalf("serial read error was not reported: %+v", s.Status)
+	}
+}
+
+func TestAppFileSendReportsTotalAndSuccessfulBytes(t *testing.T) {
+	data := bytes.Repeat([]byte{0x5A}, 700)
+	path := filepath.Join(t.TempDir(), "firmware.bin")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	view := &appTestView{callbacks: make(chan func(), 4)}
+	p := &Session{port: appFileSendPort{}, ctx: context.Background(), writeChunk: 100}
+	s := &App{Settings: config.Settings{FileDelay: "0"}, view: view, session: p, FilePath: path}
+	s.SendFile()
+	awaitAppCallback(t, view)
+	awaitAppCallback(t, view)
+	s.jobs.Wait()
+	if s.FileProgress.Name != "firmware.bin" || s.FileProgress.TotalBytes != uint64(len(data)) || s.FileProgress.SentBytes != uint64(len(data)) {
+		t.Fatalf("completed file progress = %+v, want %d bytes", s.FileProgress, len(data))
+	}
+	if s.FileProgress.Visible || s.FileProgress.Active || s.Tx != uint64(len(data)) {
+		t.Fatalf("completed file progress visibility/counters = %+v TX=%d", s.FileProgress, s.Tx)
+	}
+}
+
 func TestStartupSettingsFallbackWarnsWithoutMaskingErrors(t *testing.T) {
 	settings := config.Settings{Encoding: "ASCII", PacketGap: "0"}
 	warning := normalizeStartupSettings(&settings)
@@ -941,7 +1157,7 @@ func TestDisconnectProtectsCaptureAndHardLinkUntilFileCloseCompletes(t *testing.
 		t.Fatal(err)
 	}
 	p.enqueueCapture([]byte("pending"))
-	s.disconnect()
+	s.disconnect(nil)
 	awaitSessionBarrier(t, blocked.closeStarted)
 	if s.CapturePath != "" || s.FileBusy || !s.PortBusy {
 		t.Fatal("capture close did not expose the expected detached UI state")
@@ -1004,7 +1220,7 @@ func TestCaptureTerminalErrorsSurviveDiscardedFrontendCallbacks(t *testing.T) {
 				p.captureMu.Unlock()
 				p.enqueueCapture([]byte("buffered"))
 				if disconnect {
-					s.disconnect()
+					s.disconnect(nil)
 				} else {
 					s.StopCapture()
 				}
@@ -1046,7 +1262,7 @@ func TestDisconnectCompletionDoesNotApplyOldErrorsToNewConnection(t *testing.T) 
 		_ = s.Shutdown()
 	}()
 	awaitSessionBarrier(t, port.readStarted)
-	s.disconnect()
+	s.disconnect(nil)
 	awaitSessionBarrier(t, port.closeStarted)
 	releaseSessionBarrier(port.releaseRead)
 	s.jobs.Wait()
@@ -1160,7 +1376,7 @@ func TestClearReceiveLogDiscardsDetachedSessionDataBeforeFinalDelivery(t *testin
 			awaitSessionBarrier(t, port.readStarted)
 			p.emit(Event{Data: []byte("queued RX")})
 			p.emit(Event{Data: []byte("queued TX"), Sent: true})
-			s.disconnect()
+			s.disconnect(nil)
 			awaitSessionBarrier(t, port.closeStarted)
 			// Include data queued after detach but before the user's clear.
 			p.emit(Event{Data: []byte("detached TX"), Sent: true})
