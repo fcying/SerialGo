@@ -11,6 +11,12 @@ import (
 	"github.com/fcying/SerialGo/internal/i18n"
 )
 
+var (
+	errPortSettingsBusy     = i18n.NewError("串口操作进行中", "A serial port operation is in progress")
+	errPortSettingsObsolete = i18n.NewError("原串口连接已关闭", "The original serial port connection has closed")
+	errConnectedBaudNeeded  = i18n.NewError("串口已打开, 必须保留一个选中的波特率", "The port is open; a baud rate must remain selected")
+)
+
 func normalizedBaud(text string) (string, bool) {
 	value, err := strconv.ParseUint(strings.TrimSpace(text), 10, 32)
 	if err != nil || value == 0 {
@@ -69,13 +75,12 @@ func (s *App) InitializeBaudRates() {
 	s.Settings.Port.Baud = current
 }
 
-// CustomBaud validates and edits either an isolated property draft or live settings.
+// CustomBaud edits an isolated draft, or selects the baud on the live port.
+// On a live request it returns validation errors immediately and reports
+// driver failures through the application's status after completion.
 func (s *App) CustomBaud(text string, draft *serialport.Settings, rates *[]string) error {
-	if s.PortBusy {
-		return i18n.NewError("串口操作进行中", "A serial port operation is in progress")
-	}
-	if s.Connected() {
-		return i18n.NewError("串口已打开, 不能修改波特率", "The port is open; the baud rate cannot be changed")
+	if err := s.portSettingsAvailable(); err != nil {
+		return err
 	}
 	value, valid := normalizedBaud(text)
 	if !valid {
@@ -86,7 +91,12 @@ func (s *App) CustomBaud(text string, draft *serialport.Settings, rates *[]strin
 		draft.Baud = value
 	} else {
 		next := insertBaudRate(s.Settings.BaudRates, value)
-		if value != s.Settings.Port.Baud || !slices.Equal(next, s.Settings.BaudRates) {
+		if value == s.Settings.Port.Baud && slices.Equal(next, s.Settings.BaudRates) {
+			return nil
+		}
+		if s.Connected() {
+			s.applyLiveBaud(value, next)
+		} else {
 			s.Settings.BaudRates, s.Settings.Port.Baud = next, value
 			s.SettingsChanged()
 			s.SaveUsedSettings()
@@ -96,19 +106,36 @@ func (s *App) CustomBaud(text string, draft *serialport.Settings, rates *[]strin
 }
 
 func (s *App) SelectBaud(value string) {
-	if s.Connected() || s.PortBusy || !slices.Contains(s.Settings.BaudRates, value) || value == s.Settings.Port.Baud {
+	if s.portSettingsAvailable() != nil || !slices.Contains(s.Settings.BaudRates, value) || value == s.Settings.Port.Baud {
+		return
+	}
+	if s.Connected() {
+		s.applyLiveBaud(value, s.Settings.BaudRates)
 		return
 	}
 	s.Settings.Port.Baud = value
 	s.SettingsChanged()
 }
 
+func (s *App) applyLiveBaud(value string, rates []string) {
+	p := s.session
+	next := s.Settings.Port
+	next.Baud = value
+	s.ApplyPortSettingsAsync(next, rates, func(err error) {
+		if err == nil {
+			return
+		}
+		if s.session == p {
+			s.Fail("设置波特率失败", "Failed to set baud rate", err)
+		} else {
+			s.ReportPortSettingsFailure(err)
+		}
+	})
+}
+
 func (s *App) DeleteBaud(value string, draft *serialport.Settings, rates *[]string) error {
-	if s.PortBusy {
-		return i18n.NewError("串口操作进行中", "A serial port operation is in progress")
-	}
-	if s.Connected() {
-		return i18n.NewError("串口已打开, 不能删除波特率", "The port is open; baud rates cannot be deleted")
+	if err := s.portSettingsAvailable(); err != nil {
+		return err
 	}
 	live := draft == nil
 	if live {
@@ -118,16 +145,24 @@ func (s *App) DeleteBaud(value string, draft *serialport.Settings, rates *[]stri
 	if index < 0 {
 		return nil
 	}
+	if s.Connected() {
+		if live && draft.Baud == value {
+			return i18n.NewError("串口已打开, 不能删除当前波特率", "The port is open; the current baud rate cannot be deleted")
+		}
+		if len(*rates) == 1 {
+			return errConnectedBaudNeeded
+		}
+	}
 	next := make([]string, len(*rates)-1)
 	copy(next, (*rates)[:index])
 	copy(next[index:], (*rates)[index+1:])
-	*rates = next
 	if draft.Baud == value {
 		draft.Baud = ""
 		if len(next) > 0 {
 			draft.Baud = next[0]
 		}
 	}
+	*rates = next
 	if live {
 		s.SettingsChanged()
 		s.SaveUsedSettings()
@@ -139,42 +174,106 @@ func (s *App) PortSettingsDraft() (serialport.Settings, []string) {
 	return s.Settings.Port, slices.Clone(s.Settings.BaudRates)
 }
 
-func (s *App) ApplyPortSettings(next serialport.Settings, rates []string) error {
+func (s *App) portSettingsAvailable() error {
+	if s.closing {
+		return errPortSettingsObsolete
+	}
 	if s.PortBusy {
-		return i18n.NewError("串口操作进行中", "A serial port operation is in progress")
-	}
-	previous := s.Settings.Port
-	next.Name = previous.Name
-	if s.Connected() {
-		next.Baud, next.DataBits, next.Parity, next.StopBits = previous.Baud, previous.DataBits, previous.Parity, previous.StopBits
-		rates = s.Settings.BaudRates
-		if next.DTR != previous.DTR || next.RTS != previous.RTS {
-			if err := applyControlLines(s.session.SetLines, previous, next); err != nil {
-				return err
-			}
-		}
-	}
-	if next != previous || !slices.Equal(rates, s.Settings.BaudRates) {
-		s.Settings.Port, s.Settings.BaudRates = next, slices.Clone(rates)
-		s.SettingsChanged()
-		s.Note("串口设置已更新", "Port settings updated")
-		s.SaveUsedSettings()
+		return errPortSettingsBusy
 	}
 	return nil
 }
 
-func applyControlLines(setLines func(bool, bool) error, previous, next serialport.Settings) error {
-	if err := setLines(next.DTR, next.RTS); err != nil {
-		restoreErr := setLines(previous.DTR, previous.RTS)
-		if restoreErr != nil {
-			return errors.Join(
-				i18n.WrapError("设置控制线失败", "Failed to set control lines", err),
-				i18n.WrapError("恢复原控制线配置失败, 硬件状态可能与配置不一致", "Failed to restore previous control-line settings; hardware state may not match configuration", restoreErr),
-			)
+// ApplyPortSettingsAsync commits only after the captured connection accepts
+// the settings. Offline edits and immediate rejections complete inline; a
+// live request completes on the frontend, unless shutdown discards the post.
+func (s *App) ApplyPortSettingsAsync(next serialport.Settings, rates []string, done func(error)) {
+	finish := func(err error) {
+		if done != nil {
+			done(err)
 		}
-		return i18n.WrapError("设置控制线失败, 已重新应用原配置状态", "Failed to set control lines; previous configured state was reapplied", err)
 	}
-	return nil
+	if err := s.portSettingsAvailable(); err != nil {
+		finish(err)
+		return
+	}
+	previous := s.Settings.Port
+	next.Name = previous.Name
+	p := s.session
+	if p == nil {
+		if !slices.Equal(rates, s.Settings.BaudRates) {
+			rates = slices.Clone(rates)
+		}
+		s.commitPortSettings(next, rates)
+		finish(nil)
+		return
+	}
+	if next.Baud == "" || !slices.Contains(rates, next.Baud) {
+		finish(errConnectedBaudNeeded)
+		return
+	}
+	rates = slices.Clone(rates)
+	s.PortBusy = true
+	s.jobs.Add(1)
+	go func() {
+		defer s.jobs.Done()
+		err := p.applyPortSettings(previous, next)
+		var failure *terminalError
+		if err != nil && err != errPortSettingsObsolete {
+			failure = s.retainTerminalError(err)
+		}
+		s.dispatch(func() {
+			if s.session == p {
+				// Prefer an already-queued read failure to a settings commit.
+				s.drain(p)
+			}
+			if s.session != p {
+				// The disconnect or replacement owns PortBusy now.
+				if err == nil {
+					err = errPortSettingsObsolete
+				} else if err != errPortSettingsObsolete {
+					err = errors.Join(errPortSettingsObsolete, err)
+				}
+			} else {
+				s.PortBusy = false
+				if p.ctx.Err() != nil && err == nil {
+					err = errPortSettingsObsolete
+				}
+				if err == nil {
+					s.commitPortSettings(next, rates)
+				}
+			}
+			finish(err)
+			if failure != nil && done != nil {
+				s.acknowledgeTerminalError(failure)
+			}
+		})
+	}()
+}
+
+// ReportPortSettingsFailure delivers a completion that its original UI can no longer show.
+func (s *App) ReportPortSettingsFailure(err error) {
+	if err == nil || (err == errPortSettingsObsolete && s.StatusError) {
+		return
+	}
+	if errors.Is(err, errPortSettingsObsolete) && s.StatusError {
+		s.appendOperationError("设置串口参数失败", "Failed to set serial port parameters", err)
+		return
+	}
+	s.Fail("设置串口参数失败", "Failed to set serial port parameters", err)
+}
+
+func (s *App) commitPortSettings(next serialport.Settings, rates []string) {
+	if next == s.Settings.Port && slices.Equal(rates, s.Settings.BaudRates) {
+		return
+	}
+	s.Settings.Port = next
+	if !slices.Equal(rates, s.Settings.BaudRates) {
+		s.Settings.BaudRates = rates
+	}
+	s.SettingsChanged()
+	s.Note("串口设置已更新", "Port settings updated")
+	s.SaveUsedSettings()
 }
 
 func (s *App) AddPreset() bool {

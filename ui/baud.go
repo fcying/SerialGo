@@ -67,13 +67,17 @@ func (s *controller) baudPicker(c *ui.Context, forPort bool, height float32) ui.
 	triggerWidth := s.baudPickerWidth(c, state)
 	theme := c.Theme()
 	sel := ui.SelectBaseOpen(c, &state.choice, &state.open)
-	if s.app.Connected() || s.app.PortBusy {
+	if s.app.PortBusy {
 		sel.SetOpen(false)
 	}
 	trigger := sel.Trigger.Width(triggerWidth).MinWidth(triggerWidth).Grow(0).Shrink(0).Height(height).
 		Padding(controlPadY, serialSelectorArrowPaddingX, controlPadY, 0).Gap(microGap).Radius(theme.Radius).Border(baudPickerBorderWidth, theme.Border).
 		Background(theme.Surface).TextColor(theme.Text).AlignItems(ui.Center).
-		Label(s.tr("波特率", "Baud rate")).Disabled(s.app.Connected() || s.app.PortBusy).OnChange(func() {
+		Label(s.tr("波特率", "Baud rate")).Disabled(s.app.PortBusy).OnChange(func() {
+		if s.app.PortBusy {
+			state.choice = *value
+			return
+		}
 		if state.choice == customLabel {
 			state.choice = *value
 			s.openCustomBaud(forPort)
@@ -132,7 +136,7 @@ func (s *controller) baudPicker(c *ui.Context, forPort bool, height float32) ui.
 }
 
 func (s *controller) openCustomBaud(forPort bool) {
-	if s.app.Connected() || s.app.PortBusy {
+	if s.app.PortBusy {
 		return
 	}
 	s.customBaudForPort = forPort
@@ -145,6 +149,9 @@ func (s *controller) openCustomBaud(forPort bool) {
 }
 
 func (s *controller) applyCustomBaud() {
+	if s.app.PortBusy {
+		return
+	}
 	var err error
 	if s.customBaudForPort {
 		err = s.app.CustomBaud(s.customBaudText, &s.portDraft, &s.portBaudRatesDraft)
@@ -168,7 +175,7 @@ func (s *controller) customBaudDialog(c *ui.Context) {
 				ui.Text(c.Key("error"), s.tr(s.customBaudError.zh, s.customBaudError.en)).FillWidth().TextColor(c.Theme().Danger)
 			}
 			ui.Row(c.Key("actions")).FillWidth().Gap(wideGap).Justify(ui.End).Children(func() {
-				ui.Button(c.Key("ok"), s.tr("确定", "OK")).Width(76).Height(28).OnClick(s.applyCustomBaud)
+				ui.Button(c.Key("ok"), s.tr("确定", "OK")).Width(76).Height(28).Disabled(s.app.PortBusy).OnClick(s.applyCustomBaud)
 				ui.Button(c.Key("cancel"), s.tr("取消", "Cancel")).Width(76).Height(28).OnClick(func() { s.customBaudOpen = false })
 			})
 		})

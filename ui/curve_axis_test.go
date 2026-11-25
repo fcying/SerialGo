@@ -195,15 +195,15 @@ func TestCurveYAxisCloseValuesRendered(t *testing.T) {
 		gui.Column(c).Fill().Children(func() {
 			gui.Box(c).FillWidth().Grow(1).MinHeight(64).Background(c.Theme().Surface).
 				Border(1, c.Theme().Border).Radius(4).Draw(func(p *gui.Painter, r gui.Rect) {
-					for _, label := range labels {
-						width, _ := p.MeasureText(0, gui.Span{Text: label, Size: 10})
-						widest = max(widest, width)
-					}
-					for i, label := range labels {
-						y := r.Y + 14 + max(1, r.H-48)*float32(i)/4
-						p.Text(r.X+4, y-6, label, 10, c.Theme().TextMuted)
-					}
-				})
+				for _, label := range labels {
+					width, _ := p.MeasureText(0, gui.Span{Text: label, Size: 10})
+					widest = max(widest, width)
+				}
+				for i, label := range labels {
+					y := r.Y + 14 + max(1, r.H-48)*float32(i)/4
+					p.Text(r.X+4, y-6, label, 10, c.Theme().TextMuted)
+				}
+			})
 		})
 	}, 500, 300)
 	want := reference.Image()
@@ -312,10 +312,10 @@ func TestCurveHoverDistinguishesCloseValuesAndDeviceTimes(t *testing.T) {
 					gui.Column(c).Fill().Children(func() {
 						gui.Box(c).FillWidth().Grow(1).MinHeight(64).Background(c.Theme().Surface).
 							Border(1, c.Theme().Border).Radius(4).Cache().Draw(func(p *gui.Painter, r gui.Rect) {
-								referenceRect = r
-								p.Fill(gui.Rect{X: plot.X + 4, Y: plot.Y + 4, W: max(0, plot.W-8), H: 17}, c.Theme().Surface, 2)
-								p.Text(plot.X+8, plot.Y+5, sample.label, 11, gui.Hex("#1677cc"))
-							})
+							referenceRect = r
+							p.Fill(gui.Rect{X: plot.X + 4, Y: plot.Y + 4, W: max(0, plot.W-8), H: 17}, c.Theme().Surface, 2)
+							p.Text(plot.X+8, plot.Y+5, sample.label, 11, gui.Hex("#1677cc"))
+						})
 					})
 				}, 720, 300)
 				got, want := tt.Image(), reference.Image()

@@ -372,7 +372,7 @@ func (s *controller) serialPanel(c *ui.Context, width float32) {
 		ui.Row(c.Key("baud-row")).FillWidth().Gap(controlGap).AlignItems(ui.Center).Children(func() {
 			s.baudPicker(c.Key("baud"), false, controlHeight).Shrink(0)
 			ui.Button(c.Key("port-settings"), s.tr("设置", "Settings")).Height(controlHeight).PaddingY(controlPadY).PaddingX(serialConfigPaddingX).Border(serialConfigBorderWidth, c.Theme().Border).
-				Label(s.tr("串口设置", "Port settings")).Tooltip(s.tr("配置数据位, 校验位, 停止位及 RTS/DTR", "Configure data bits, parity, stop bits, and RTS/DTR")).OnClick(s.openPortSettings)
+				Label(s.tr("串口设置", "Port settings")).Tooltip(s.tr("配置数据位, 校验位, 停止位及 RTS/DTR", "Configure data bits, parity, stop bits, and RTS/DTR")).Disabled(s.app.PortBusy).OnClick(s.openPortSettings)
 		})
 		ui.Row(c.Key("serial-actions")).FillWidth().Gap(controlGap).Children(func() {
 			s.toolsMenu(c.Key("tools"))

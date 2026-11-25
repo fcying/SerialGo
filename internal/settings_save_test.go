@@ -405,8 +405,15 @@ func TestUnchangedClearAndPortSettingsDoNotWrite(t *testing.T) {
 	s, _ := settingsSaveFixture(t, path, config.Save)
 	s.ClearSend()
 	draft, rates := s.PortSettingsDraft()
-	if err := s.ApplyPortSettings(draft, rates); err != nil {
-		t.Fatal(err)
+	var called bool
+	s.ApplyPortSettingsAsync(draft, rates, func(err error) {
+		called = true
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !called {
+		t.Fatal("offline settings completion did not run inline")
 	}
 	s.SaveUsedSettings()
 	err := s.FlushSettings()

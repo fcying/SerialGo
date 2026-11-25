@@ -19,7 +19,7 @@
 - `cth-win10` is the test machine. Check direct connectivity with `ssh -o BatchMode=yes cth-win10 hostname`; do not jump through the host machine. Do not store connection credentials in the repository.
 - Build the Windows artifact with `just windows`, then use `scp` to update `SerialGo/SerialGo.exe` on the test machine's desktop. Always use this one directory; do not create version-specific directories. Replace only the EXE and preserve the existing `config.toml`. Focused Go tests can be cross-compiled with `CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go test -c -o <test-program.exe> <package>`, uploaded, and executed on the test machine.
 - Launch GUI verification in the logged-in desktop session. If using an interactive scheduled task, give it a name specific to this test run. Do not overwrite the user's existing configuration.
-- Without a physical or virtual COM port, report only the UI, settings, and error paths actually verified; do not claim successful real serial transmission or reception. Do not install drivers or change the shared environment for testing.
+- Without a physical or virtual COM port, report only the UI, settings, and error paths actually verified; do not claim successful real serial transmission or reception.
 - After verification, retain `Desktop/SerialGo/SerialGo.exe` and the existing configuration. Clean up only processes, scheduled tasks, test scripts, and other temporary files created for this run.
 
 ## Configuration Safety

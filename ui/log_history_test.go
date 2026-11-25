@@ -221,7 +221,7 @@ func TestReceiveLogHexRowsSurviveReadsEvictionAndDisplayChanges(t *testing.T) {
 	at := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	old := internal.Event{At: at, Data: []byte(strings.Repeat("x", 17_001))}
 	retained := []byte(strings.Repeat("y", limit-16_384))
-	l.append([]internal.Event{old, {At: at, Data: retained[:5]}, {At: at, Data: retained[5:len(retained)-1000]}})
+	l.append([]internal.Event{old, {At: at, Data: retained[:5]}, {At: at, Data: retained[5 : len(retained)-1000]}})
 	l.append([]internal.Event{{At: at, Data: retained[len(retained)-1000:]}})
 	if l.bytes != len(retained) {
 		t.Fatalf("expected the first complete event to be evicted, got %d bytes", l.bytes)

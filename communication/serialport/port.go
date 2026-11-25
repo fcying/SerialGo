@@ -42,8 +42,8 @@ type Port struct {
 	readMu  sync.Mutex
 	writeMu sync.Mutex
 
-	// Keep the library handle alive during each operation. The backend's
-	// Close must not race with I/O or with changes to modem lines.
+	// Keep the handle alive and its configuration stable during each
+	// backend operation. Close and configuration changes take mu exclusively.
 	mu   sync.RWMutex
 	conn *serial.Port
 	fd   int // borrowed Unix descriptor; conn owns it
@@ -55,59 +55,14 @@ func Open(s Settings) (*Port, error) {
 	if name == "" {
 		return nil, errors.New("serial port name is required")
 	}
-	baud, err := strconv.Atoi(strings.TrimSpace(s.Baud))
-	if err != nil || baud <= 0 || uint64(baud) > 1<<32-1 {
-		return nil, fmt.Errorf("invalid baud rate %q", s.Baud)
-	}
-	dataBits, err := strconv.Atoi(strings.TrimSpace(s.DataBits))
-	if err != nil || dataBits < 5 || dataBits > 8 {
-		return nil, fmt.Errorf("invalid data bits %q (want 5 through 8)", s.DataBits)
-	}
-	var parity serial.Parity
-	switch strings.ToLower(strings.TrimSpace(s.Parity)) {
-	case "none":
-		parity = serial.NoParity
-	case "odd":
-		parity = serial.OddParity
-	case "even":
-		parity = serial.EvenParity
-	case "mark":
-		parity = serial.MarkParity
-	case "space":
-		parity = serial.SpaceParity
-	default:
-		return nil, fmt.Errorf("invalid parity %q", s.Parity)
-	}
-	var stopBits serial.StopBits
-	switch strings.TrimSpace(s.StopBits) {
-	case "1":
-		stopBits = serial.OneStopBit
-	case "1.5":
-		stopBits = serial.OnePointFiveStopBits
-		if runtime.GOOS != "windows" {
-			if dataBits != 5 {
-				return nil, errors.New("1.5 stop bits require 5 data bits on Unix")
-			}
-			// Termios exposes only CSTOPB. With a 5-bit word the
-			// long-stop setting selects 1.5 stop bits on UARTs.
-			stopBits = serial.TwoStopBits
-		}
-	case "2":
-		if runtime.GOOS == "linux" && dataBits == 5 {
-			return nil, i18n.NewError(
-				"Linux 不支持 5 数据位和 2 停止位的组合；该设置可能产生 1.5 停止位",
-				"Linux does not support 5 data bits with 2 stop bits; this setting can produce 1.5 stop bits",
-			)
-		}
-		stopBits = serial.TwoStopBits
-	default:
-		return nil, fmt.Errorf("invalid stop bits %q", s.StopBits)
+	mode, err := parseParameters(s)
+	if err != nil {
+		return nil, err
 	}
 
 	conn, err := serial.Open(name,
-		serial.WithBaudrate(baud), serial.WithDataBits(dataBits),
-		serial.WithParity(parity), serial.WithStopBits(stopBits),
-		serial.WithWriteTimeout(writeTimeoutMS),
+		serial.WithBaudrate(mode.baud), serial.WithDataBits(mode.dataBits), serial.WithParity(mode.parity),
+		serial.WithStopBits(mode.stopBits), serial.WithWriteTimeout(writeTimeoutMS),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("open serial port %q: %w", name, err)
@@ -131,22 +86,100 @@ func Open(s Settings) (*Port, error) {
 	return p, nil
 }
 
+type parameters struct {
+	baud, dataBits int
+	parity         serial.Parity
+	stopBits       serial.StopBits
+}
+
+func (p parameters) options() [4]serial.Option {
+	return [4]serial.Option{
+		serial.WithBaudrate(p.baud), serial.WithDataBits(p.dataBits),
+		serial.WithParity(p.parity), serial.WithStopBits(p.stopBits),
+	}
+}
+
+func parseParameters(s Settings) (parameters, error) {
+	baud, err := strconv.Atoi(strings.TrimSpace(s.Baud))
+	if err != nil || baud <= 0 || uint64(baud) > 1<<32-1 {
+		return parameters{}, fmt.Errorf("invalid baud rate %q", s.Baud)
+	}
+	dataBits, err := strconv.Atoi(strings.TrimSpace(s.DataBits))
+	if err != nil || dataBits < 5 || dataBits > 8 {
+		return parameters{}, fmt.Errorf("invalid data bits %q (want 5 through 8)", s.DataBits)
+	}
+	var parity serial.Parity
+	switch strings.ToLower(strings.TrimSpace(s.Parity)) {
+	case "none":
+		parity = serial.NoParity
+	case "odd":
+		parity = serial.OddParity
+	case "even":
+		parity = serial.EvenParity
+	case "mark":
+		parity = serial.MarkParity
+	case "space":
+		parity = serial.SpaceParity
+	default:
+		return parameters{}, fmt.Errorf("invalid parity %q", s.Parity)
+	}
+	stopBits, err := parseStopBits(s.StopBits, dataBits)
+	if err != nil {
+		return parameters{}, err
+	}
+	return parameters{baud: baud, dataBits: dataBits, parity: parity, stopBits: stopBits}, nil
+}
+
+func parseStopBits(value string, dataBits int) (serial.StopBits, error) {
+	var stopBits serial.StopBits
+	switch strings.TrimSpace(value) {
+	case "1":
+		stopBits = serial.OneStopBit
+	case "1.5":
+		stopBits = serial.OnePointFiveStopBits
+		if runtime.GOOS != "windows" {
+			if dataBits != 5 {
+				return 0, errors.New("1.5 stop bits require 5 data bits on Unix")
+			}
+			// Termios exposes only CSTOPB. With a 5-bit word the
+			// long-stop setting selects 1.5 stop bits on UARTs.
+			stopBits = serial.TwoStopBits
+		}
+	case "2":
+		if runtime.GOOS == "linux" && dataBits == 5 {
+			return 0, i18n.NewError(
+				"Linux 不支持 5 数据位和 2 停止位的组合；该设置可能产生 1.5 停止位",
+				"Linux does not support 5 data bits with 2 stop bits; this setting can produce 1.5 stop bits",
+			)
+		}
+		stopBits = serial.TwoStopBits
+	default:
+		return 0, fmt.Errorf("invalid stop bits %q", value)
+	}
+
+	return stopBits, nil
+}
+
 // v2.6.1 puts Unix descriptors in blocking mode, and its Write calls write(2)
 // before checking any timeout. The package has no public descriptor accessor.
 // Read the pinned backend's integer descriptor without unsafe or taking over
 // ownership; fail closed if its layout changes. Nonblocking syscalls also
 // avoid the backend's fixed-size select sets on Unix.
 func nonblockingTTY[FD ~int | ~uintptr](conn *serial.Port, setNonblock func(FD, bool) error) (int, error) {
-	internal := reflect.ValueOf(conn).Elem().FieldByName("internal")
-	if internal.Kind() != reflect.Pointer || internal.IsNil() || internal.Elem().Kind() != reflect.Struct {
-		return 0, errors.New("UART backend has no Unix descriptor")
-	}
-	handle := internal.Elem().FieldByName("handle")
+	handle := backendHandle(conn)
 	if handle.Kind() != reflect.Int || handle.Int() < 0 {
 		return 0, errors.New("UART backend has no Unix descriptor")
 	}
 	fd := int(handle.Int())
 	return fd, setNonblock(FD(fd), true)
+}
+
+func backendHandle(conn *serial.Port) reflect.Value {
+	internal := reflect.ValueOf(conn).Elem().FieldByName("internal")
+	if internal.Kind() != reflect.Pointer || internal.IsNil() || internal.Elem().Kind() != reflect.Struct {
+		return reflect.Value{}
+	}
+	return internal.Elem().FieldByName("handle")
 }
 
 // syscall uses different descriptor types on Unix and Windows. Keep the Unix
@@ -248,6 +281,58 @@ func (p *Port) write(b []byte) (int, error) {
 	}
 	n, err := ttyIO(syscall.Write, p.fd, b)
 	return max(n, 0), err
+}
+
+// SetParameters changes baud, data bits, parity and stop bits without reopening
+// the port or changing its modem line settings. previous must describe the last
+// applied parameters so a failed change can be rolled back. The device name and
+// modem line fields in next and previous are ignored.
+//
+// This does not drain driver queues; callers should quiesce the link if bytes
+// must not cross a framing change.
+func (p *Port) SetParameters(next, previous Settings) error {
+	// Wait for whole I/O calls, not just individual syscalls: in particular,
+	// a Linux Write may retry and must not submit bytes in two modes.
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	p.readMu.Lock()
+	defer p.readMu.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.conn == nil {
+		return os.ErrClosed
+	}
+	nextMode, err := parseParameters(next)
+	if err != nil {
+		return err
+	}
+	previousMode, err := parseParameters(previous)
+	if err != nil {
+		return i18n.WrapError("原串口参数无效", "invalid previous serial port parameters", err)
+	}
+	return p.reconfigure(nextMode, previousMode)
+}
+
+// ParametersRestoreError reports that recovery failed after a parameter change
+// was rejected. The live parameters may not match the previous settings.
+type ParametersRestoreError struct {
+	Err error
+}
+
+func (e *ParametersRestoreError) Error() string { return e.Err.Error() }
+func (e *ParametersRestoreError) Unwrap() error { return e.Err }
+
+func applyWithRestore(apply, restore func() error) error {
+	err := apply()
+	if err == nil {
+		return nil
+	}
+	err = i18n.WrapError("应用串口参数失败", "apply serial port parameters", err)
+	if restoreErr := restore(); restoreErr != nil {
+		restoreErr = i18n.WrapError("恢复原串口参数失败", "restore previous serial port parameters", restoreErr)
+		return errors.Join(err, &ParametersRestoreError{Err: restoreErr})
+	}
+	return err
 }
 
 // SetLines sets both modem output lines and reports any driver errors.

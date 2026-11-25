@@ -170,7 +170,9 @@ func TestInstallSettingsFileReportsUnsupportedFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	rename := func(_ int, _ string, _ int, _ string, _ uint) error { return unix.ENOSYS }
-	link := func(old, new string) error { return &os.LinkError{Op: "link", Old: old, New: new, Err: unix.EOPNOTSUPP} }
+	link := func(old, new string) error {
+		return &os.LinkError{Op: "link", Old: old, New: new, Err: unix.EOPNOTSUPP}
+	}
 	if err := installSettingsFileWith(source, target, rename, link); !errors.Is(err, unix.EOPNOTSUPP) {
 		t.Fatalf("install error = %v, want EOPNOTSUPP", err)
 	}

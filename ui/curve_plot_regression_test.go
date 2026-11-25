@@ -272,8 +272,8 @@ func TestCurveFollowRoundedWindowShowsLatestAtRight(t *testing.T) {
 		gui.Column(c).Fill().Children(func() {
 			gui.Box(c).FillWidth().Grow(1).MinHeight(64).Background(c.Theme().Surface).
 				Border(1, c.Theme().Border).Radius(4).Cache().Draw(func(_ *gui.Painter, r gui.Rect) {
-					paintRect = r
-				})
+				paintRect = r
+			})
 		})
 	}, 500, 300)
 	probe.Image()
@@ -363,15 +363,15 @@ func TestCurveYAxisReservesMeasuredLabelsAndUpdatesHitTesting(t *testing.T) {
 		gui.Column(c).Fill().Children(func() {
 			gui.Box(c).FillWidth().Grow(1).MinHeight(64).Background(c.Theme().Surface).
 				Border(1, c.Theme().Border).Radius(4).Cache().Draw(func(p *gui.Painter, r gui.Rect) {
-					var widest float32
-					for i := 0; i <= 4; i++ {
-						value := curveLerp(ordinary.y1, ordinary.y0, float64(i)/4)
-						label := strconv.FormatFloat(value, 'g', 5, 64)
-						width, _ := p.MeasureText(0, gui.Span{Text: label, Size: 10})
-						widest = max(widest, width)
-					}
-					expectedX = r.X + max(float32(66), widest+8)
-				})
+				var widest float32
+				for i := 0; i <= 4; i++ {
+					value := curveLerp(ordinary.y1, ordinary.y0, float64(i)/4)
+					label := strconv.FormatFloat(value, 'g', 5, 64)
+					width, _ := p.MeasureText(0, gui.Span{Text: label, Size: 10})
+					widest = max(widest, width)
+				}
+				expectedX = r.X + max(float32(66), widest+8)
+			})
 		})
 	}, 500, 300)
 	measure.Image()

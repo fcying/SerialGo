@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fcying/SerialGo/communication/serialport"
 	"github.com/fcying/SerialGo/config"
 )
 
@@ -38,6 +39,10 @@ func (p *curveWorkerTestPort) Read(dst []byte) (int, error) {
 
 func (p *curveWorkerTestPort) Write(data []byte) (int, error) { return len(data), nil }
 func (p *curveWorkerTestPort) SetLines(bool, bool) error      { return nil }
+
+func (p *curveWorkerTestPort) SetParameters(serialport.Settings, serialport.Settings) error {
+	return nil
+}
 func (p *curveWorkerTestPort) Close() error {
 	p.once.Do(func() { close(p.closed) })
 	return nil

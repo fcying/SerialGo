@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/fcying/SerialGo/communication/serialport"
 )
 
 const captureTestTimeout = 5 * time.Second
@@ -100,6 +102,10 @@ func (p *fileProgressTestPort) Write(data []byte) (int, error) {
 }
 
 func (p *fileProgressTestPort) SetLines(bool, bool) error { return nil }
+
+func (p *fileProgressTestPort) SetParameters(serialport.Settings, serialport.Settings) error {
+	return nil
+}
 
 func (p *fileProgressTestPort) Close() error { return nil }
 
@@ -476,6 +482,10 @@ func (p *barrierSessionPort) Write(data []byte) (int, error) {
 }
 
 func (p *barrierSessionPort) SetLines(bool, bool) error { return nil }
+
+func (p *barrierSessionPort) SetParameters(serialport.Settings, serialport.Settings) error {
+	return nil
+}
 
 func (p *barrierSessionPort) Close() error {
 	p.closeOnce.Do(func() { close(p.closeStarted) })
