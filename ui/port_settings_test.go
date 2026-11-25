@@ -153,8 +153,8 @@ func TestPortSettingDropdownValuesAreCentered(t *testing.T) {
 
 func TestPortSettingsControlLinesAreCentered(t *testing.T) {
 	s, _ := portSettingsFixture(t)
-	s.app.PortBusy = true // Exercise the layout with the connected-state hint.
 	s.openPortSettings()
+	s.app.PortBusy = true // Exercise the layout while a settings operation is pending.
 	tt := gui.NewTester(s.portSettingsDialog, 800, 600)
 	dialog, dialogFound := tt.AccessByRole(gui.RoleDialog, "Port settings")
 	rts, rtsFound := tt.AccessByRole(gui.RoleCheckBox, "RTS")

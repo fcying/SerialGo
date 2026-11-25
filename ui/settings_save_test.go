@@ -34,7 +34,7 @@ func settingsSaveFixture(t *testing.T, path string) (*controller, <-chan func())
 	app := internal.NewAppWithSettingsStore(config.Settings{
 		Language: "en", DisplayBufferLimit: config.NormalizeDisplayBufferLimit(0),
 		ReceiveHexBytesPerLine: config.DefaultReceiveHexBytesPerLine,
-		ReceiveFont: config.DefaultReceiveFont, ReceiveFontSize: config.DefaultReceiveFontSize, ReceiveFontColor: config.DefaultReceiveFontColor,
+		ReceiveFont:            config.DefaultReceiveFont, ReceiveFontSize: config.DefaultReceiveFontSize, ReceiveFontColor: config.DefaultReceiveFontColor,
 		CurveSidebarWidth: config.DefaultCurveSidebarWidth,
 		Presets:           []config.Preset{config.NewPreset()},
 	}, path, settingsTestStore{})

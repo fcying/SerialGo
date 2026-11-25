@@ -23,6 +23,7 @@ type controller struct {
 	log                                                               receiveLog
 	portMenuOpen, portMenuRefreshed                                   bool
 	portSettingsOpen, optionsOpen                                     bool
+	portSettingsGeneration                                            uint64
 	portDraft                                                         serialport.Settings
 	portBaudRatesDraft                                                []string
 	portSettingsError                                                 localizedText

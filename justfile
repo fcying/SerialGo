@@ -16,8 +16,11 @@ _default: test
 _config:
     cp -- config.toml assets/default-config.toml
 
-_icon: _config
+_icon: fmt _config
     go run ./cmd/appicon -arch "{{GOARCH}}"
+
+fmt:
+    gofmt -w main.go assets cmd communication config internal ui
 
 build:
     just windows

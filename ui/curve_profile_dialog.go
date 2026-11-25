@@ -165,7 +165,7 @@ func (s *controller) curveProfileEditorView(c *ui.Context) {
 					rangeHint := s.tr("(1-"+maxLimit+", 0 为不限)", "(1-"+maxLimit+", 0 for unlimited)")
 					ui.Text(c.Key("caption"), label+" "+rangeHint).FontSize(11)
 					input := ui.TextInput(c.Key("input"), &e.pointLimit).FillWidth().Height(controlHeight).PaddingY(controlPadY).
-						MaxLength(len(maxLimit)+1).Label(label).Description(rangeHint).OnPaste(func(text string) bool {
+						MaxLength(len(maxLimit) + 1).Label(label).Description(rangeHint).OnPaste(func(text string) bool {
 						e.pointLimitPaste = filterCurvePointLimitInput(text)
 						return true
 					}).OnChange(func() {

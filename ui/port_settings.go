@@ -10,25 +10,45 @@ const (
 )
 
 func (s *controller) openPortSettings() {
+	if s.app.PortBusy {
+		return
+	}
+	s.portSettingsGeneration++
 	s.portDraft, s.portBaudRatesDraft = s.app.PortSettingsDraft()
 	s.portSettingsError = localizedText{}
 	s.portSettingsOpen = true
 }
 
+func (s *controller) closePortSettings() {
+	s.portSettingsOpen = false
+	s.portDraft = s.settings.Port
+	s.baudPickers[1].open = false
+}
+
 func (s *controller) applyPortSettings() {
-	s.portSettingsError = localizedText{}
-	if err := s.app.ApplyPortSettings(s.portDraft, s.portBaudRatesDraft); err != nil {
-		s.portSettingsError = dialogError(err)
+	if !s.portSettingsOpen || s.app.PortBusy {
 		return
 	}
-	s.portSettingsOpen = false
+	s.portSettingsError = localizedText{}
+	generation := s.portSettingsGeneration
+	s.app.ApplyPortSettingsAsync(s.portDraft, s.portBaudRatesDraft, func(err error) {
+		if !s.portSettingsOpen || s.portSettingsGeneration != generation {
+			s.app.ReportPortSettingsFailure(err)
+			return
+		}
+		if err != nil {
+			s.portSettingsError = dialogError(err)
+			return
+		}
+		s.closePortSettings()
+	})
 }
 
 func (s *controller) portSettingsDialog(c *ui.Context) {
 	wasOpen := s.portSettingsOpen
 	ui.Modal(c.Key("port-settings-dialog"), &s.portSettingsOpen, func() {
 		p := &s.portDraft
-		open := s.app.Connected() || s.app.PortBusy
+		busy := s.app.PortBusy
 		baudWidth := s.portBaudPickerWidth(c)
 		fieldRowWidth := portSettingsFieldLabelWidth + sectionGap + baudWidth
 		actionRowWidth := 2*portSettingsActionButtonWidth + wideGap
@@ -41,32 +61,26 @@ func (s *controller) portSettingsDialog(c *ui.Context) {
 						ui.Text(c.Key("caption"), s.tr("波特率", "Baud rate")).Width(portSettingsFieldLabelWidth)
 						s.baudPicker(c.Key("value"), true, 26)
 					})
-					portSettingSelect(c, "bits", s.tr("数据位", "Data bits"), &p.DataBits, dataBits, baudWidth, open)
-					portSettingSelect(c, "stops", s.tr("停止位", "Stop bits"), &p.StopBits, stopBits, baudWidth, open)
-					portSettingSelect(c, "parity", s.tr("校验位", "Parity"), &p.Parity, parities, baudWidth, open)
+					portSettingSelect(c, "bits", s.tr("数据位", "Data bits"), &p.DataBits, dataBits, baudWidth, busy)
+					portSettingSelect(c, "stops", s.tr("停止位", "Stop bits"), &p.StopBits, stopBits, baudWidth, busy)
+					portSettingSelect(c, "parity", s.tr("校验位", "Parity"), &p.Parity, parities, baudWidth, busy)
 					ui.Row(c.Key("control-lines")).FillWidth().Gap(pairedControlGap).Justify(ui.Center).Children(func() {
-						ui.Checkbox(c.Key("rts"), &p.RTS, "RTS")
-						ui.Checkbox(c.Key("dtr"), &p.DTR, "DTR")
+						ui.Checkbox(c.Key("rts"), &p.RTS, "RTS").Disabled(busy)
+						ui.Checkbox(c.Key("dtr"), &p.DTR, "DTR").Disabled(busy)
 					})
-					if open {
-						ui.Text(c.Key("connected-hint"), s.tr("串口已打开, 仅可修改 RTS/DTR", "Port is open; only RTS/DTR can be changed")).FillWidth()
-					}
 					if s.portSettingsError.en != "" || s.portSettingsError.zh != "" {
 						ui.Text(c.Key("error"), s.tr(s.portSettingsError.zh, s.portSettingsError.en)).FillWidth().TextColor(c.Theme().Danger)
 					}
 				})
 			})
 			ui.Row(c.Key("actions")).FillWidth().Gap(wideGap).Justify(ui.End).Children(func() {
-				ui.Button(c.Key("ok"), s.tr("确定", "OK")).Width(portSettingsActionButtonWidth).Height(28).OnClick(s.applyPortSettings)
-				ui.Button(c.Key("cancel"), s.tr("取消", "Cancel")).Width(portSettingsActionButtonWidth).Height(28).OnClick(func() {
-					s.portSettingsOpen = false
-					s.portDraft = s.settings.Port
-				})
+				ui.Button(c.Key("ok"), s.tr("确定", "OK")).Width(portSettingsActionButtonWidth).Height(28).Disabled(busy).OnClick(s.applyPortSettings)
+				ui.Button(c.Key("cancel"), s.tr("取消", "Cancel")).Width(portSettingsActionButtonWidth).Height(28).OnClick(s.closePortSettings)
 			})
 		})
 	}).Label(s.tr("串口设置", "Port settings"))
 	if wasOpen && !s.portSettingsOpen {
-		s.portDraft = s.settings.Port
+		s.closePortSettings()
 	}
 }
 
@@ -75,6 +89,9 @@ func portSettingSelect(c *ui.Context, id, label string, value *string, options [
 		ui.Text(c.Key("caption"), label).Width(portSettingsFieldLabelWidth)
 		theme := c.Theme()
 		sel := ui.SelectBase(c, value)
+		if disabled {
+			sel.SetOpen(false)
+		}
 		trigger := sel.Trigger.Width(width).MinWidth(width).Grow(0).Shrink(0).Height(26).
 			Padding(controlPadY, serialSelectorArrowPaddingX, controlPadY, 0).Gap(microGap).Radius(theme.Radius).Border(baudPickerBorderWidth, theme.Border).
 			Background(theme.Surface).TextColor(theme.Text).AlignItems(ui.Center).Label(label).Disabled(disabled)

@@ -401,7 +401,9 @@ func (s *controller) curveChart(c *ui.Context) {
 			bounds.x0 = bounds.x1 - span
 		}
 		xPixel := func(x float64) float32 { return plot.X + float32(curveFraction(x, bounds.x0, bounds.x1))*plot.W }
-		yPixel := func(y float64) float32 { return plot.Y + plot.H - float32(curveFraction(y, bounds.y0, bounds.y1))*plot.H }
+		yPixel := func(y float64) float32 {
+			return plot.Y + plot.H - float32(curveFraction(y, bounds.y0, bounds.y1))*plot.H
+		}
 		for i := 0; i <= yTicks; i++ {
 			fraction := float64(i) / float64(yTicks)
 			y := plot.Y + plot.H*float32(fraction)

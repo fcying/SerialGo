@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,6 +56,7 @@ type captureWriter struct {
 type sessionPort interface {
 	Read([]byte) (int, error)
 	Write([]byte) (int, error)
+	SetParameters(next, previous serialport.Settings) error
 	SetLines(bool, bool) error
 	Close() error
 }
@@ -63,9 +66,11 @@ type Session struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
 	events             chan Event
+	writeMu            sync.Mutex // guards the write chunk and each write against reconfiguration
 	writeChunk         int
 	readDone           chan struct{}
 	sendMu             sync.Mutex
+	settingsMu         sync.Mutex // keeps Close out of the entire settings transaction
 	captureMu          sync.Mutex
 	captureOps         sync.Mutex
 	capture            *captureWriter
@@ -95,11 +100,15 @@ func newSession(port sessionPort, baud int, receiver *curveReceiver) *Session {
 	if receiver != nil {
 		s.curve = newCurveWorker(receiver)
 	}
-	// A Windows driver can wait for every byte to leave the UART. Keep each
-	// write comfortably within the backend's deadline, even at low baud.
-	s.writeChunk = min(4096, max(1, baud/100))
+	s.writeChunk = serialWriteChunk(baud)
 	go s.receive()
 	return s
+}
+
+func serialWriteChunk(baud int) int {
+	// A Windows driver can wait for every byte to leave the UART. Keep each
+	// write comfortably within the backend's deadline, even at low baud.
+	return min(4096, max(1, baud/100))
 }
 
 func (s *Session) Events() <-chan Event { return s.events }
@@ -406,7 +415,64 @@ func (s *Session) finishCapture(capture *captureWriter, writer *bufio.Writer, wr
 	}
 }
 
-func (s *Session) SetLines(dtr, rts bool) error { return s.port.SetLines(dtr, rts) }
+func framingChanged(previous, next serialport.Settings) bool {
+	return next.Baud != previous.Baud || next.DataBits != previous.DataBits || next.Parity != previous.Parity || next.StopBits != previous.StopBits
+}
+
+// applyPortSettings runs on a worker. No write can see an intermediate
+// configuration, and Close cannot interrupt rollback. Take writeMu first so
+// Close can still release the driver if an in-flight Write blocks.
+func (s *Session) applyPortSettings(previous, next serialport.Settings) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
+	if s.ctx.Err() != nil {
+		return errPortSettingsObsolete
+	}
+	select {
+	case <-s.readDone:
+		return errPortSettingsObsolete
+	default:
+	}
+
+	changeFraming := framingChanged(previous, next)
+	chunk := s.writeChunk
+	if next.Baud != previous.Baud {
+		baud, _ := strconv.Atoi(strings.TrimSpace(next.Baud))
+		chunk = serialWriteChunk(baud)
+	}
+	if changeFraming {
+		if err := s.port.SetParameters(next, previous); err != nil {
+			var restoreErr *serialport.ParametersRestoreError
+			if errors.As(err, &restoreErr) {
+				s.writeChunk = min(s.writeChunk, chunk)
+			}
+			return i18n.WrapError("设置串口参数失败", "Failed to set serial port parameters", err)
+		}
+	}
+	if next.DTR != previous.DTR || next.RTS != previous.RTS {
+		if err := s.port.SetLines(next.DTR, next.RTS); err != nil {
+			var restoreErr error
+			if lineErr := s.port.SetLines(previous.DTR, previous.RTS); lineErr != nil {
+				restoreErr = i18n.WrapError("恢复原控制线配置失败", "Failed to restore previous control-line settings", lineErr)
+			}
+			if changeFraming {
+				if paramErr := s.port.SetParameters(previous, next); paramErr != nil {
+					restoreErr = errors.Join(restoreErr, i18n.WrapError("恢复原串口参数失败", "Failed to restore previous serial port parameters", paramErr))
+					// The active baud may still be the requested one.
+					s.writeChunk = min(s.writeChunk, chunk)
+				}
+			}
+			if restoreErr == nil {
+				return i18n.WrapError("设置控制线失败, 已重新应用原配置状态", "Failed to set control lines; previous configured state was reapplied", err)
+			}
+			return i18n.WrapError("设置控制线失败, 硬件状态可能与配置不一致", "Failed to set control lines; hardware state may not match configuration", errors.Join(err, restoreErr))
+		}
+	}
+	s.writeChunk = chunk
+	return nil
+}
 
 // SetCapture takes ownership of file only on success. Passing nil flushes and closes the active capture.
 func (s *Session) SetCapture(file *os.File) error {
@@ -486,7 +552,9 @@ func (s *Session) acknowledgeCaptureError(capture *captureWriter) {
 
 func (s *Session) Close() error {
 	s.cancel()
+	s.settingsMu.Lock()
 	err := s.port.Close()
+	s.settingsMu.Unlock()
 	<-s.readDone
 	// Port.Close may return before Write has returned and emitted its byte count.
 	// Cancellation prevents later sends from producing any new records.
@@ -511,14 +579,10 @@ func (s *Session) Send(ctx context.Context, data []byte) error {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 	for len(data) != 0 {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := s.ctx.Err(); err != nil {
-			return err
-		}
+		s.writeMu.Lock()
 		at := time.Now()
-		n, err := s.port.Write(data[:min(s.writeChunk, len(data))])
+		n, err := s.write(ctx, data)
+		s.writeMu.Unlock()
 		if n > 0 {
 			s.emit(Event{At: at, Data: append([]byte(nil), data[:n]...), Sent: true})
 			data = data[n:]
@@ -531,6 +595,17 @@ func (s *Session) Send(ctx context.Context, data []byte) error {
 		}
 	}
 	return nil
+}
+
+// write requires writeMu to couple the selected chunk size to the active baud.
+func (s *Session) write(ctx context.Context, data []byte) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if err := s.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return s.port.Write(data[:min(s.writeChunk, len(data))])
 }
 
 type fileSender interface {

@@ -39,7 +39,7 @@ const (
 	panelChromeWidth                      = 2 * panelInsetX
 	baudPickerArrowSize           float32 = 6
 	serialSelectorPaddingX        float32 = 4
-	displaySelectPaddingX          float32 = 8
+	displaySelectPaddingX         float32 = 8
 	serialSelectorArrowPaddingX   float32 = 4
 	baudPickerBorderWidth         float32 = 1
 	baudPickerChromeWidth                 = 2*(serialSelectorPaddingX+baudPickerBorderWidth) + serialSelectorArrowPaddingX + microGap + baudPickerArrowSize

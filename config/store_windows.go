@@ -315,9 +315,9 @@ func renameRootNoReplace(root *os.Root, oldName, newName string) error {
 	defer windows.CloseHandle(h)
 	type renameInfo struct {
 		ReplaceIfExists byte
-		RootDirectory windows.Handle
-		FileNameLength uint32
-		FileName [1]uint16
+		RootDirectory   windows.Handle
+		FileNameLength  uint32
+		FileName        [1]uint16
 	}
 	utf16Name, err := windows.UTF16FromString(newName)
 	if err != nil {

@@ -130,27 +130,27 @@ func validReceiveFontSettings(settings Settings) bool {
 }
 
 type Settings struct {
-	Port                                serialport.Settings
-	Window                              WindowSettings
-	CurveWindow                         WindowSettings
-	BaudRates                           []string
-	SendText, SendHexText               string
-	Language                            string
-	Encoding                            string
-	Interval, PacketGap, FileDelay      string
-	SendHex, CRLF, ReceiveHex, ShowSent bool
-	ParseSendEscapes                    bool
+	Port                                                      serialport.Settings
+	Window                                                    WindowSettings
+	CurveWindow                                               WindowSettings
+	BaudRates                                                 []string
+	SendText, SendHexText                                     string
+	Language                                                  string
+	Encoding                                                  string
+	Interval, PacketGap, FileDelay                            string
+	SendHex, CRLF, ReceiveHex, ShowSent                       bool
+	ParseSendEscapes                                          bool
 	ChecksumAlgorithm, ChecksumHeaderBytes, ChecksumTailBytes string
-	Timestamp, ShowPresets              bool
-	DisplayBufferLimit                  int      // Retained event payload bytes, not rendered text bytes.
-	ReceiveHexBytesPerLine              int
-	ReceiveFont                         string   // Font family for the receive display.
-	ReceiveFontSize                     int      // Font size in points.
-	ReceiveFontColor                    string   // Foreground color as #RRGGBB.
-	Presets                             []Preset `toml:"-"`
-	CurveProfiles                       []CurveProfile
-	CurveProfile                        int
-	CurveSidebarWidth                   float32
+	Timestamp, ShowPresets                                    bool
+	DisplayBufferLimit                                        int // Retained event payload bytes, not rendered text bytes.
+	ReceiveHexBytesPerLine                                    int
+	ReceiveFont                                               string   // Font family for the receive display.
+	ReceiveFontSize                                           int      // Font size in points.
+	ReceiveFontColor                                          string   // Foreground color as #RRGGBB.
+	Presets                                                   []Preset `toml:"-"`
+	CurveProfiles                                             []CurveProfile
+	CurveProfile                                              int
+	CurveSidebarWidth                                         float32
 }
 
 type fileSettings struct {

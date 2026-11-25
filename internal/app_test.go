@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,28 +21,149 @@ import (
 	"github.com/fcying/SerialGo/internal/i18n"
 )
 
-func connectedAppFixture(t *testing.T) *App {
-	t.Helper()
-	p := NewSession(&serialport.Port{}, 115200)
-	if err := p.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return &App{Settings: config.Settings{
-		Language: "en", BaudRates: []string{"9600", "115200", "250000"},
-		Port: serialport.Settings{Name: "COM17", Baud: "115200", DataBits: "8", Parity: "None", StopBits: "1"},
-	}, session: p}
+type liveSettingsTestPort struct {
+	readFailure chan error
+	closed      chan struct{}
+	closeOnce   sync.Once
+	beforeClose func()
+	parameters  func(next, previous serialport.Settings) error
+	lines       func(bool, bool) error
+	writes      []int
 }
 
-func TestPortSettingsConnectedFramingRemainsUnchanged(t *testing.T) {
-	s := connectedAppFixture(t)
-	before := s.Settings
+func (p *liveSettingsTestPort) Read([]byte) (int, error) {
+	select {
+	case err := <-p.readFailure:
+		return 0, err
+	case <-p.closed:
+		return 0, os.ErrClosed
+	}
+}
+
+func (p *liveSettingsTestPort) Write(data []byte) (int, error) {
+	p.writes = append(p.writes, len(data))
+	return len(data), nil
+}
+
+func (p *liveSettingsTestPort) SetParameters(next, previous serialport.Settings) error {
+	if p.parameters != nil {
+		return p.parameters(next, previous)
+	}
+	return nil
+}
+
+func (p *liveSettingsTestPort) SetLines(dtr, rts bool) error {
+	if p.lines != nil {
+		return p.lines(dtr, rts)
+	}
+	return nil
+}
+
+func (p *liveSettingsTestPort) Close() error {
+	p.closeOnce.Do(func() {
+		if p.beforeClose != nil {
+			p.beforeClose()
+		}
+		close(p.closed)
+	})
+	return nil
+}
+
+func liveSettingsFixture(t *testing.T) (*App, *appTestView, *liveSettingsTestPort) {
+	t.Helper()
+	backend := &liveSettingsTestPort{closed: make(chan struct{}), readFailure: make(chan error, 1)}
+	p := newSession(backend, 115200, nil)
+	v := &appTestView{callbacks: make(chan func(), 8)}
+	s := &App{Settings: config.Settings{
+		Language: "en", BaudRates: []string{"9600", "115200", "250000"},
+		Port: serialport.Settings{Name: "COM17", Baud: "115200", DataBits: "8", Parity: "None", StopBits: "1"},
+	}, session: p, view: v, stopPump: make(chan struct{})}
+	t.Cleanup(func() {
+		_ = p.Close()
+		s.jobs.Wait()
+	})
+	return s, v, backend
+}
+
+func TestConnectedPortSettingsCommitAfterHardwareAndRetainPortName(t *testing.T) {
+	s, v, port := liveSettingsFixture(t)
+	previous := s.Settings.Port
 	draft, rates := s.PortSettingsDraft()
 	draft.Name, draft.Baud, draft.DataBits, draft.Parity, draft.StopBits = "friendly label", "9600", "7", "Odd", "2"
-	if err := s.ApplyPortSettings(draft, rates[:1]); err != nil {
+	draft.DTR, draft.RTS = true, true
+	want := draft
+	want.Name = previous.Name
+	rates = append(rates, "500000")
+	wantRates := slices.Clone(rates)
+	entered, release := make(chan struct{}), make(chan struct{})
+	defer releaseSessionBarrier(release)
+	port.parameters = func(next, prior serialport.Settings) error {
+		close(entered)
+		<-release
+		if next != want || prior != previous {
+			return fmt.Errorf("SetParameters(%+v, %+v), want (%+v, %+v)", next, prior, want, previous)
+		}
+		return nil
+	}
+	var gotLines [2]bool
+	port.lines = func(dtr, rts bool) error { gotLines = [2]bool{dtr, rts}; return nil }
+	var called bool
+	var result error
+	submitted := make(chan struct{})
+	go func() {
+		s.ApplyPortSettingsAsync(draft, rates, func(err error) { called, result = true, err })
+		close(submitted)
+	}()
+	awaitSessionBarrier(t, submitted) // must return without waiting for the backend
+	awaitSessionBarrier(t, entered)
+	if !s.PortBusy || called || s.Settings.Port != previous || s.SettingsDirty || s.SettingsRevision != 0 {
+		t.Fatal("a live request committed or completed before the driver accepted it")
+	}
+	var rejected error
+	s.ApplyPortSettingsAsync(draft, rates, func(err error) { rejected = err })
+	if !errors.Is(rejected, errPortSettingsBusy) {
+		t.Fatalf("overlapping apply error = %v; want busy", rejected)
+	}
+	s.TogglePort()
+	if !s.Connected() || !s.PortBusy {
+		t.Fatal("a pending apply did not gate the close command")
+	}
+	rates[0] = "1" // the worker must own an immutable snapshot
+	close(release)
+	awaitAppCallback(t, v)
+	if !called || result != nil || s.PortBusy || s.Settings.Port != want || gotLines != [2]bool{true, true} {
+		t.Fatalf("live settings result = %v, busy = %v, settings = %+v, lines = %v", result, s.PortBusy, s.Settings.Port, gotLines)
+	}
+	if !s.SettingsDirty || s.SettingsRevision != 1 || !slices.Equal(s.Settings.BaudRates, wantRates) {
+		t.Fatal("accepted settings and baud choices were not committed as one revision")
+	}
+	if err := s.session.Send(context.Background(), make([]byte, 200)); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(s.Settings, before) || s.SettingsDirty || s.SettingsRevision != 0 {
-		t.Fatal("connected properties changed raw name, framing or baud list")
+	if !slices.Equal(port.writes, []int{96, 96, 8}) {
+		t.Fatalf("write lengths = %v; want chunks at the new 9600 baud", port.writes)
+	}
+}
+
+func TestConnectedPortSettingsCanChangeOnlyStopBits(t *testing.T) {
+	s, v, port := liveSettingsFixture(t)
+	previous := s.Settings.Port
+	draft, rates := s.PortSettingsDraft()
+	draft.StopBits = "2"
+	var calls int
+	port.parameters = func(next, prior serialport.Settings) error {
+		calls++
+		if next != draft || prior != previous {
+			return fmt.Errorf("SetParameters(%+v, %+v), want (%+v, %+v)", next, prior, draft, previous)
+		}
+		return nil
+	}
+	port.lines = func(dtr, rts bool) error { return errors.New("unexpected modem line change") }
+	var result error
+	s.ApplyPortSettingsAsync(draft, rates, func(err error) { result = err })
+	awaitAppCallback(t, v)
+	if result != nil || calls != 1 || s.Settings.Port != draft || s.SettingsRevision != 1 {
+		t.Fatalf("stop-bit-only change: %v, %d calls, settings = %+v, revision = %d", result, calls, s.Settings.Port, s.SettingsRevision)
 	}
 }
 
@@ -72,148 +194,262 @@ func TestPortRefreshErrorPreservesLastKnownSelection(t *testing.T) {
 	}
 }
 
-func TestPortSettingsLineFailureKeepsSettingsAndStatus(t *testing.T) {
-	for _, line := range []string{"DTR", "RTS"} {
-		for _, dirty := range []bool{false, true} {
-			t.Run(line+"/"+map[bool]string{false: "clean", true: "dirty"}[dirty], func(t *testing.T) {
-				s := connectedAppFixture(t)
-				s.SettingsDirty = dirty
-				s.Status = Text{ZH: "原状态", EN: "Original status"}
-				before, status, revision := s.Settings, s.Status, s.SettingsRevision
-				draft, rates := s.PortSettingsDraft()
-				if line == "DTR" {
-					draft.DTR = true
-				} else {
-					draft.RTS = true
-				}
-				for range 2 {
-					err := s.ApplyPortSettings(draft, rates)
-					if err == nil || !strings.Contains(i18n.ErrorText(err, true), os.ErrClosed.Error()) || i18n.ErrorText(err, true) == i18n.ErrorText(err, false) {
-						t.Fatalf("missing localized driver error: %v", err)
+func TestConnectedPortSettingsFailureRollsBackAndPreservesAppState(t *testing.T) {
+	applyErr := errors.New("driver rejected proposed settings")
+	lineRestoreErr := errors.New("DTR restore failed")
+	framingRestoreErr := errors.New("framing restore failed")
+	for _, tc := range []struct {
+		name                        string
+		failParams, failBothRestore bool
+		dirty                       bool
+	}{
+		{name: "initial parameter failure"},
+		{name: "line failure with restoration", dirty: true},
+		{name: "line and framing restoration failures", failBothRestore: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, v, port := liveSettingsFixture(t)
+			s.SettingsDirty = tc.dirty
+			s.Status = Text{ZH: "原状态", EN: "Original status"}
+			before, status, revision := s.Settings, s.Status, s.SettingsRevision
+			draft, rates := s.PortSettingsDraft()
+			draft.Baud, draft.DataBits, draft.Parity, draft.DTR, draft.RTS = "9600", "7", "Even", true, true
+			var calls []string
+			port.parameters = func(next, previous serialport.Settings) error {
+				if next == draft && previous == before.Port {
+					calls = append(calls, "parameters")
+					if tc.failParams {
+						return applyErr
 					}
-					if !reflect.DeepEqual(s.Settings, before) || s.SettingsDirty != dirty || s.SettingsRevision != revision || s.Status != status || s.StatusError {
-						t.Fatal("failed control-line operation changed settings or main status")
-					}
+					return nil
 				}
-			})
-		}
+				if next == before.Port && previous == draft {
+					calls = append(calls, "restore parameters")
+					if tc.failBothRestore {
+						return framingRestoreErr
+					}
+					return nil
+				}
+				return fmt.Errorf("unexpected parameter call: (%+v, %+v)", next, previous)
+			}
+			port.lines = func(dtr, rts bool) error {
+				if dtr && rts {
+					calls = append(calls, "lines")
+					return applyErr
+				}
+				if !dtr && !rts {
+					calls = append(calls, "restore lines")
+					if tc.failBothRestore {
+						return lineRestoreErr
+					}
+					return nil
+				}
+				return fmt.Errorf("unexpected line call: (%v, %v)", dtr, rts)
+			}
+			var result error
+			s.ApplyPortSettingsAsync(draft, slices.Delete(rates, 2, 3), func(err error) { result = err })
+			awaitAppCallback(t, v)
+			if !errors.Is(result, applyErr) || i18n.ErrorText(result, true) == i18n.ErrorText(result, false) {
+				t.Fatalf("missing localized driver error: %v", result)
+			}
+			wantCalls := []string{"parameters"}
+			chunk := 200
+			if !tc.failParams {
+				wantCalls = append(wantCalls, "lines", "restore lines", "restore parameters")
+			}
+			if tc.failBothRestore {
+				chunk = 96
+				if !errors.Is(result, lineRestoreErr) || !errors.Is(result, framingRestoreErr) || !strings.Contains(i18n.ErrorText(result, true), "hardware state may not match configuration") {
+					t.Fatalf("incomplete rollback result: %v", result)
+				}
+			} else if !tc.failParams && !strings.Contains(i18n.ErrorText(result, true), "previous configured state was reapplied") {
+				t.Fatalf("successful rollback not conveyed: %v", result)
+			}
+			if !slices.Equal(calls, wantCalls) || s.PortBusy || !reflect.DeepEqual(s.Settings, before) || s.SettingsDirty != tc.dirty || s.SettingsRevision != revision || s.Status != status || s.StatusError {
+				t.Fatalf("failed apply changed app state or issued unexpected calls: %v (want %v)", calls, wantCalls)
+			}
+			if err := s.session.Send(context.Background(), make([]byte, 200)); err != nil || len(port.writes) == 0 || port.writes[0] != chunk {
+				t.Fatalf("write lengths after rollback = %v, error = %v; want first chunk %d", port.writes, err, chunk)
+			}
+		})
 	}
 }
 
-func TestApplyControlLinesRestoresPreviousSettingsAfterPartialFailure(t *testing.T) {
-	previous := serialport.Settings{DTR: false, RTS: false}
-	next := serialport.Settings{DTR: true, RTS: true}
-	actual := previous
-	applyErr := errors.New("RTS control line failed")
-	calls := 0
-	setLines := func(dtr, rts bool) error {
-		calls++
-		if calls == 1 {
-			actual.DTR = dtr
-			return applyErr
+func TestConnectedBaudActionsCommitOnlyOnSuccess(t *testing.T) {
+	s, v, port := liveSettingsFixture(t)
+	before := s.Settings
+	fail := errors.New("unsupported baud")
+	port.parameters = func(next, previous serialport.Settings) error {
+		if next.Baud == "38400" {
+			return fail
 		}
-		actual.DTR, actual.RTS = dtr, rts
 		return nil
 	}
-
-	err := applyControlLines(setLines, previous, next)
-	if !errors.Is(err, applyErr) {
-		t.Fatalf("applyControlLines() error = %v, want original error %v", err, applyErr)
+	draft, rates := s.PortSettingsDraft()
+	if err := s.CustomBaud(" 038400 ", &draft, &rates); err != nil || draft.Baud != "38400" || !slices.Equal(rates, []string{"9600", "38400", "115200", "250000"}) {
+		t.Fatalf("connected draft custom baud: %+v, %v, %v", draft, rates, err)
 	}
-	if calls != 2 {
-		t.Fatalf("SetLines() calls = %d, want initial apply and rollback", calls)
+	if s.PortBusy || !reflect.DeepEqual(s.Settings, before) || s.SettingsDirty {
+		t.Fatal("editing a draft changed live settings")
 	}
-	if actual.DTR != previous.DTR || actual.RTS != previous.RTS {
-		t.Fatalf("restored lines = DTR %t, RTS %t; want DTR %t, RTS %t", actual.DTR, actual.RTS, previous.DTR, previous.RTS)
+	if err := s.CustomBaud("38400", nil, nil); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(i18n.ErrorText(err, true), "previous configured state was reapplied") {
-		t.Fatalf("error does not report successful rollback: %v", err)
+	awaitAppCallback(t, v)
+	if !s.StatusError || !strings.Contains(s.Status.EN, fail.Error()) || !reflect.DeepEqual(s.Settings, before) || s.SettingsDirty {
+		t.Fatal("failed custom baud was not reported or changed app settings")
 	}
-}
-
-func TestApplyControlLinesReportsFailedRestore(t *testing.T) {
-	previous := serialport.Settings{DTR: false, RTS: false}
-	next := serialport.Settings{DTR: true, RTS: true}
-	actual := previous
-	applyErr := errors.New("RTS control line failed")
-	restoreErr := errors.New("DTR restore failed")
-	calls := 0
-	setLines := func(dtr, rts bool) error {
-		calls++
-		if calls == 1 {
-			actual.DTR = dtr
-			return applyErr
-		}
-		return restoreErr
+	s.SelectBaud("9600")
+	awaitAppCallback(t, v)
+	if s.Settings.Port.Baud != "9600" || s.StatusError || s.SettingsRevision != 1 {
+		t.Fatal("live picker did not apply an existing baud")
 	}
-
-	err := applyControlLines(setLines, previous, next)
-	if !errors.Is(err, applyErr) || !errors.Is(err, restoreErr) {
-		t.Fatalf("applyControlLines() error = %v, want both apply and restore errors", err)
+	if err := s.CustomBaud("57600", nil, nil); err != nil {
+		t.Fatal(err)
 	}
-	if calls != 2 {
-		t.Fatalf("SetLines() calls = %d, want initial apply and rollback", calls)
-	}
-	if actual.DTR == previous.DTR {
-		t.Fatal("test setup did not leave DTR in its partially applied state")
-	}
-	if !strings.Contains(i18n.ErrorText(err, true), "hardware state may not match configuration") {
-		t.Fatalf("error does not report uncertain hardware state: %v", err)
+	awaitAppCallback(t, v)
+	if s.Settings.Port.Baud != "57600" || !slices.Equal(s.Settings.BaudRates, []string{"9600", "57600", "115200", "250000"}) || s.SettingsRevision != 2 {
+		t.Fatal("successful custom baud did not atomically update selection and list")
 	}
 }
 
-func TestConnectedBaudCommandsCannotChangeSettingsOrDraft(t *testing.T) {
-	for _, forPort := range []bool{false, true} {
-		s := connectedAppFixture(t)
-		before := s.Settings
-		draft, rates := s.PortSettingsDraft()
-		initialDraft, initialRates := draft, slices.Clone(rates)
-		var err error
-		if forPort {
-			err = s.CustomBaud("38400", &draft, &rates)
-		} else {
-			err = s.CustomBaud("38400", nil, nil)
+func TestLiveBaudDisconnectRetainsDriverAndReadErrors(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		name := "obsolete success"
+		if fail {
+			name = "driver and rollback failure"
 		}
-		if err == nil {
-			t.Fatal("connected custom baud accepted")
-		}
-		if forPort {
-			err = s.DeleteBaud("115200", &draft, &rates)
-		} else {
-			err = s.DeleteBaud("115200", nil, nil)
-		}
-		if err == nil {
-			t.Fatal("connected baud deletion accepted")
-		}
-		s.SelectBaud("9600")
-		if !reflect.DeepEqual(s.Settings, before) || draft != initialDraft || !slices.Equal(rates, initialRates) || s.SettingsDirty {
-			t.Fatal("connected baud command mutated settings or draft")
-		}
+		t.Run(name, func(t *testing.T) {
+			s, v, port := liveSettingsFixture(t)
+			p, before := s.session, s.Settings.Port
+			entered, release := make(chan struct{}), make(chan struct{})
+			closeEntered, releaseClose := make(chan struct{}), make(chan struct{})
+			defer releaseSessionBarrier(release)
+			defer releaseSessionBarrier(releaseClose)
+			port.parameters = func(serialport.Settings, serialport.Settings) error {
+				close(entered)
+				<-release
+				if fail {
+					return errors.Join(errors.New("baud driver failed"), &serialport.ParametersRestoreError{Err: errors.New("baud rollback failed")})
+				}
+				return nil
+			}
+			port.beforeClose = func() {
+				close(closeEntered)
+				<-releaseClose
+			}
+			s.SelectBaud("9600")
+			awaitSessionBarrier(t, entered)
+			port.readFailure <- errors.New("serial read failed")
+			awaitSessionBarrier(t, p.readDone)
+			s.drain(p)
+			awaitSessionBarrier(t, p.ctx.Done())
+			close(release)
+			awaitSessionBarrier(t, closeEntered)
+			awaitAppCallback(t, v)
+			if !s.StatusError || !strings.Contains(s.Status.EN, "serial read failed") || s.Settings.Port != before || s.SettingsDirty {
+				t.Fatalf("disconnect reason or settings lost: status=%+v settings=%+v", s.Status, s.Settings.Port)
+			}
+			if fail && (!strings.Contains(s.Status.EN, "baud driver failed") || !strings.Contains(s.Status.EN, "baud rollback failed")) {
+				t.Fatalf("driver or rollback error lost: %+v", s.Status)
+			}
+			close(releaseClose)
+			awaitAppCallback(t, v)
+			if !s.StatusError || !strings.Contains(s.Status.EN, "serial read failed") || (fail && !strings.Contains(s.Status.EN, "baud rollback failed")) {
+				t.Fatalf("completion lost an error: %+v", s.Status)
+			}
+		})
 	}
 }
 
-func TestPropertyBaudChangesStagedBeforeConnectionCannotCommit(t *testing.T) {
-	for _, deletion := range []bool{false, true} {
-		connected := connectedAppFixture(t)
-		s := &App{Settings: connected.Settings}
-		before := s.Settings
-		draft, rates := s.PortSettingsDraft()
-		var err error
-		if deletion {
-			err = s.DeleteBaud("115200", &draft, &rates)
-		} else {
-			err = s.CustomBaud("38400", &draft, &rates)
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		s.session = connected.session
-		if err := s.ApplyPortSettings(draft, rates); err != nil {
-			t.Fatal(err)
-		}
-		if !reflect.DeepEqual(s.Settings, before) || s.SettingsDirty {
-			t.Fatal("connection allowed staged baud mutation to commit")
-		}
+func TestConnectedBaudDeletionProtectsSelectionOrStagesReplacement(t *testing.T) {
+	s, v, backend := liveSettingsFixture(t)
+	before := s.Settings.Port
+	if err := s.DeleteBaud(before.Baud, nil, nil); err == nil || s.SettingsRevision != 0 {
+		t.Fatal("live deletion removed a currently selected baud")
+	}
+	if err := s.DeleteBaud("250000", nil, nil); err != nil || s.Settings.Port != before || s.PortBusy || s.SettingsRevision != 1 {
+		t.Fatalf("live deletion of an unselected baud = %v", err)
+	}
+	draft, rates := s.PortSettingsDraft()
+	if err := s.DeleteBaud("115200", &draft, &rates); err != nil || draft.Baud != "9600" || !slices.Equal(rates, []string{"9600"}) {
+		t.Fatalf("draft did not replace deleted selection: %+v, %v, %v", draft, rates, err)
+	}
+	if err := s.DeleteBaud("9600", &draft, &rates); err == nil || draft.Baud != "9600" || !slices.Equal(rates, []string{"9600"}) {
+		t.Fatal("connected draft lost its final baud choice")
+	}
+	if s.Settings.Port != before || !slices.Equal(s.Settings.BaudRates, []string{"9600", "115200"}) {
+		t.Fatal("deletion from a draft changed live settings")
+	}
+	fail := errors.New("baud rejected by driver")
+	backend.parameters = func(next, previous serialport.Settings) error { return fail }
+	var result error
+	s.ApplyPortSettingsAsync(draft, rates, func(err error) { result = err })
+	awaitAppCallback(t, v)
+	if !errors.Is(result, fail) || s.Settings.Port != before || !slices.Equal(s.Settings.BaudRates, []string{"9600", "115200"}) || s.SettingsRevision != 1 {
+		t.Fatal("failure committed a staged deletion or replacement baud")
+	}
+	backend.parameters = nil
+	s.ApplyPortSettingsAsync(draft, rates, func(err error) { result = err })
+	awaitAppCallback(t, v)
+	if result != nil || s.Settings.Port != draft || !slices.Equal(s.Settings.BaudRates, rates) || s.SettingsRevision != 2 {
+		t.Fatalf("success did not commit the deletion and replacement atomically: %v", result)
+	}
+}
+
+func TestLiveSettingsCompletionAfterReadDisconnectCannotCommit(t *testing.T) {
+	s, v, port := liveSettingsFixture(t)
+	p, before := s.session, s.Settings.Port
+	setEntered, releaseSet := make(chan struct{}), make(chan struct{})
+	closeEntered, releaseClose := make(chan struct{}), make(chan struct{})
+	defer releaseSessionBarrier(releaseSet)
+	defer releaseSessionBarrier(releaseClose)
+	port.parameters = func(serialport.Settings, serialport.Settings) error {
+		close(setEntered)
+		<-releaseSet
+		return nil
+	}
+	port.beforeClose = func() {
+		close(closeEntered)
+		<-releaseClose
+	}
+	draft, rates := s.PortSettingsDraft()
+	draft.Baud = "9600"
+	var result error
+	s.ApplyPortSettingsAsync(draft, rates, func(err error) {
+		result = err
+		s.ReportPortSettingsFailure(err)
+	})
+	awaitSessionBarrier(t, setEntered)
+	port.readFailure <- errors.New("device disconnected")
+	awaitSessionBarrier(t, p.readDone)
+	s.drain(p)
+	awaitSessionBarrier(t, p.ctx.Done())
+	select {
+	case <-closeEntered:
+		t.Fatal("driver closed while its settings transaction was in flight")
+	default:
+	}
+	close(releaseSet)
+	awaitSessionBarrier(t, closeEntered)
+	awaitAppCallback(t, v)
+	if !errors.Is(result, errPortSettingsObsolete) || s.Connected() || !s.PortBusy || s.Settings.Port != before || s.SettingsDirty || !s.StatusError || !strings.Contains(s.Status.EN, "device disconnected") {
+		t.Fatalf("obsolete completion changed disconnect or settings state: %v", result)
+	}
+	close(releaseClose)
+	awaitAppCallback(t, v)
+	if s.PortBusy || !s.StatusError || !strings.Contains(s.Status.EN, "device disconnected") {
+		t.Fatalf("disconnect did not own the final busy state and error: %+v", s.Status)
+	}
+}
+
+func TestPortSettingsFailurePreservesDisconnectAndReportsRollback(t *testing.T) {
+	s := &App{}
+	s.Fail("串口已断开", "Serial port disconnected", errors.New("device read failed"))
+	err := errors.Join(errPortSettingsObsolete, errors.New("rollback failed"))
+	s.ReportPortSettingsFailure(err)
+	if !s.StatusError || !strings.Contains(s.Status.EN, "device read failed") || !strings.Contains(s.Status.EN, "rollback failed") {
+		t.Fatalf("disconnect or rollback failure lost: %+v", s.Status)
 	}
 }
 
@@ -536,6 +772,8 @@ func (appFileSendPort) Read([]byte) (int, error) { return 0, io.EOF }
 func (appFileSendPort) Write(data []byte) (int, error) { return len(data), nil }
 
 func (appFileSendPort) SetLines(bool, bool) error { return nil }
+
+func (appFileSendPort) SetParameters(serialport.Settings, serialport.Settings) error { return nil }
 
 func (appFileSendPort) Close() error { return nil }
 
@@ -1075,7 +1313,9 @@ func TestPendingPortOperationRejectsSettingsMutation(t *testing.T) {
 	s.SelectBaud("115200")
 	draft, rates := s.PortSettingsDraft()
 	draft.Baud = "115200"
-	if s.ApplyPortSettings(draft, rates) == nil || s.CustomBaud("38400", nil, nil) == nil || s.DeleteBaud("9600", nil, nil) == nil {
+	var result error
+	s.ApplyPortSettingsAsync(draft, rates, func(err error) { result = err })
+	if !errors.Is(result, errPortSettingsBusy) || s.CustomBaud("38400", nil, nil) == nil || s.DeleteBaud("9600", nil, nil) == nil {
 		t.Fatal("pending serial operation accepted a settings mutation")
 	}
 	if !reflect.DeepEqual(s.Settings, before) || s.SettingsDirty {
@@ -1681,7 +1921,7 @@ func TestCaptureSetupFailureSurvivesShutdown(t *testing.T) {
 	failure := errors.New("previous capture close failure")
 	p := &Session{
 		port: appFileSendPort{}, ctx: ctx, cancel: cancel, readDone: readDone,
-		events: make(chan Event, 1),
+		events:        make(chan Event, 1),
 		captureWorker: &captureWriter{stopped: true, done: done, result: failure},
 	}
 	view := &appTestView{callbacks: make(chan func(), 4)}

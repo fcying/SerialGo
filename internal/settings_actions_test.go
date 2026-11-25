@@ -2,11 +2,11 @@ package internal
 
 import (
 	"github.com/BurntSushi/toml"
+	"github.com/fcying/SerialGo/communication/serialport"
+	"github.com/fcying/SerialGo/config"
 	"os"
 	"path/filepath"
 	"slices"
-	"github.com/fcying/SerialGo/communication/serialport"
-	"github.com/fcying/SerialGo/config"
 	"testing"
 )
 
