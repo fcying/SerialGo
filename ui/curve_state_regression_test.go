@@ -5,10 +5,115 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/egoist/mygo"
 	gui "github.com/egoist/mygo/ui"
 	"github.com/fcying/SerialGo/config"
 	"github.com/fcying/SerialGo/internal"
 )
+
+func TestCurveCloseProtectsPartiallyRepairedLegacyRules(t *testing.T) {
+	profile := config.NewCurveProfile("legacy")
+	profile.Channels[0].Mode, profile.Channels[0].Pattern = "regex", "["
+	second := profile.Channels[0]
+	second.Name = "Second"
+	profile.Channels = append(profile.Channels, second)
+	app := &internal.App{Settings: config.Settings{Language: "en", CurveProfiles: []config.CurveProfile{profile}}}
+	s := newController(app)
+	s.curve = newCurveViewState(s.settings)
+	s.curve.ruleEditor = newCurveRuleEdit(s.curve.draft, 0)
+	s.curve.ruleEditor.channel.pattern = `(\d+)`
+	s.confirmCurveRuleEditor()
+	if s.curve.ruleEditor != nil || !s.curve.dirty || s.curve.error.en == "" || app.SettingsDirty {
+		t.Fatal("partial repair must remain an unapplied dirty draft")
+	}
+	closed := false
+	event := &mygo.CloseEvent{}
+	s.confirmSerialCurveClose(event, func() { closed = true })
+	if !event.DefaultPrevented() || !s.curve.confirmOpen {
+		t.Fatal("closing a dirty curve did not request confirmation")
+	}
+	tt := gui.NewTester(s.serialCurveView, 1040, 600)
+	if err := tt.Click("Cancel"); err != nil {
+		t.Fatal(err)
+	}
+	if closed || s.curve.confirmOpen || !s.curve.dirty || s.curve.draft.channels[0].pattern != `(\d+)` || !reflect.DeepEqual(app.Settings.CurveProfiles[0], profile) {
+		t.Fatal("canceling close lost or applied the partial repair")
+	}
+	s.curve.ruleEditor = newCurveRuleEdit(s.curve.draft, 1)
+	s.curve.ruleEditor.channel.pattern = `(\d+)`
+	s.confirmCurveRuleEditor()
+	if s.curve.ruleEditor != nil || s.curve.dirty || !app.SettingsDirty || app.Settings.CurveProfiles[0].Channels[0].Pattern != `(\d+)` || app.Settings.CurveProfiles[0].Channels[1].Pattern != `(\d+)` {
+		t.Fatal("completing the repair did not apply both rules")
+	}
+	event = &mygo.CloseEvent{}
+	s.confirmSerialCurveClose(event, func() { closed = true })
+	if event.DefaultPrevented() || s.curve.confirmOpen || closed {
+		t.Fatal("clean close should proceed without confirmation")
+	}
+}
+
+func TestCurveCloseDiscardConfirmation(t *testing.T) {
+	s := newController(&internal.App{Settings: config.Settings{Language: "en"}})
+	s.curve = newCurveViewState(s.settings)
+	s.curve.dirty = true
+	closed := false
+	event := &mygo.CloseEvent{}
+	s.confirmSerialCurveClose(event, func() { closed = true })
+	if !event.DefaultPrevented() || !s.curve.confirmOpen {
+		t.Fatal("dirty close was not intercepted")
+	}
+	tt := gui.NewTester(s.serialCurveView, 1040, 600)
+	if err := tt.Click("OK"); err != nil {
+		t.Fatal(err)
+	}
+	if !closed || s.curve.confirmOpen {
+		t.Fatal("confirming discard did not close the curve")
+	}
+}
+
+func TestMainCloseProtectsCurveDraft(t *testing.T) {
+	for _, choice := range []string{"Cancel", "OK"} {
+		t.Run(choice, func(t *testing.T) {
+			s := newController(&internal.App{Settings: config.Settings{Language: "en"}})
+			s.curve = newCurveViewState(s.settings)
+			s.curve.dirty = true
+			s.curveWindow = &mygo.Window{}
+			closed := []string{}
+			event := &mygo.CloseEvent{}
+			s.confirmMainWindowClose(event, func() { closed = append(closed, "curve") }, func() { closed = append(closed, "main") })
+			if !event.DefaultPrevented() || !s.curve.confirmOpen || len(closed) != 0 {
+				t.Fatal("main close did not wait for dirty curve confirmation")
+			}
+			tt := gui.NewTester(s.serialCurveView, 1040, 600)
+			if err := tt.Click(choice); err != nil {
+				t.Fatal(err)
+			}
+			if choice == "Cancel" {
+				if len(closed) != 0 || !s.curve.dirty || s.curve.confirmOpen {
+					t.Fatal("canceling exit did not retain both windows and the draft")
+				}
+			} else if !reflect.DeepEqual(closed, []string{"curve", "main"}) {
+				t.Fatalf("confirmed exit did not close both windows in order: %v", closed)
+			}
+		})
+	}
+}
+
+func TestMainCloseWithoutDirtyCurve(t *testing.T) {
+	for _, open := range []bool{false, true} {
+		s := newController(&internal.App{Settings: config.Settings{Language: "en"}})
+		if open {
+			s.curve = newCurveViewState(s.settings)
+			s.curveWindow = &mygo.Window{}
+		}
+		curveClosed, mainClosed := false, false
+		event := &mygo.CloseEvent{}
+		s.confirmMainWindowClose(event, func() { curveClosed = true }, func() { mainClosed = true })
+		if event.DefaultPrevented() || curveClosed != open || mainClosed {
+			t.Fatalf("unexpected clean close handling: open=%v prevented=%v curveClosed=%v mainClosed=%v", open, event.DefaultPrevented(), curveClosed, mainClosed)
+		}
+	}
+}
 
 func TestCurveManyStoredChannelsRemainEditable(t *testing.T) {
 	for _, invalidColor := range []bool{false, true} {

@@ -32,6 +32,8 @@ type Event struct {
 	Sent       bool
 	Err        error
 	ReadFailed bool
+	// SessionEnd marks the end of a serial session in display history.
+	SessionEnd bool
 	capture    *captureWriter
 }
 
@@ -215,6 +217,20 @@ func (s *Session) clearDisplay() {
 	s.displayMu.Unlock()
 }
 
+type curveReadState struct {
+	epoch   uint64
+	enabled bool
+}
+
+func (s *Session) curveReadState() curveReadState {
+	if s.curve == nil {
+		return curveReadState{}
+	}
+	// Read the epoch first so a concurrent start cannot tag an old read
+	// with the newly enabled acquisition.
+	return curveReadState{epoch: s.curve.receiver.epoch.Load(), enabled: s.curve.receiver.enabled.Load()}
+}
+
 func (s *Session) receive() {
 	defer close(s.readDone)
 	if s.curve != nil {
@@ -222,9 +238,12 @@ func (s *Session) receive() {
 	}
 	buf := make([]byte, receiveBufferSize)
 	for s.ctx.Err() == nil {
+		// A read spanning a curve transition is conservatively excluded from
+		// the new acquisition, even if its bytes arrive after that transition.
+		curveState := s.curveReadState()
 		n, err := s.port.Read(buf)
 		if n > 0 {
-			s.receiveChunk(buf[:n], time.Now())
+			s.receiveChunk(buf[:n], time.Now(), curveState)
 		}
 		if err != nil {
 			s.emit(Event{Err: i18n.WrapError("接收失败", "Receive failed", err), ReadFailed: true})
@@ -233,12 +252,12 @@ func (s *Session) receive() {
 	}
 }
 
-func (s *Session) receiveChunk(chunk []byte, at time.Time) {
+func (s *Session) receiveChunk(chunk []byte, at time.Time, curveState curveReadState) {
 	data := append([]byte(nil), chunk...)
 	s.enqueueCapture(data)
 	s.emit(Event{At: at, Data: data})
 	if s.curve != nil {
-		s.curve.enqueue(data, at)
+		s.curve.enqueue(data, at, curveState.epoch, curveState.enabled)
 	}
 }
 
@@ -527,20 +546,16 @@ func sendFile(ctx context.Context, path string, delay time.Duration, sender file
 }
 
 func sendFileWithProgress(ctx context.Context, path string, delay time.Duration, sender fileSender, onSize func(int64)) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	if !info.Mode().IsRegular() {
-		return errFileNotRegular
-	}
-
-	file, err := os.Open(path)
+	file, err := os.OpenFile(path, os.O_RDONLY|outputNonblock, 0)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-	info, err = file.Stat()
+	return sendOpenedFileWithProgress(ctx, file, delay, sender, onSize)
+}
+
+func sendOpenedFileWithProgress(ctx context.Context, file *os.File, delay time.Duration, sender fileSender, onSize func(int64)) error {
+	info, err := file.Stat()
 	if err != nil {
 		return err
 	}

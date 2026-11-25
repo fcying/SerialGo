@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -721,6 +723,36 @@ func TestSuccessfulFileSendDrainDisconnectKeepsResult(t *testing.T) {
 	}
 }
 
+func TestDisconnectReportsInterruptedTextAndPresetWriteErrors(t *testing.T) {
+	for _, label := range []Text{{ZH: "发送", EN: "Send"}, {ZH: "多条发送", EN: "Preset send"}} {
+		t.Run(label.EN, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			readDone := make(chan struct{})
+			close(readDone)
+			p := &Session{port: appFileSendPort{}, ctx: ctx, cancel: cancel, readDone: readDone, events: make(chan Event, 1)}
+			view := &appTestView{callbacks: make(chan func(), 2)}
+			s := &App{view: view, session: p, stopPump: make(chan struct{})}
+			started := make(chan struct{})
+			release := make(chan struct{})
+			s.startSending(label, "", func(_ context.Context, p *Session) error {
+				p.emit(Event{Data: []byte("abc"), Sent: true})
+				close(started)
+				<-release
+				return errors.New("serial write failed")
+			})
+			<-started
+			s.TogglePort()
+			close(release)
+			s.jobs.Wait()
+			awaitAppCallback(t, view)
+			awaitAppCallback(t, view)
+			if !s.StatusError || !strings.Contains(s.Status.EN, "serial write failed") || !strings.Contains(s.Status.EN, label.EN) || s.Tx != 3 {
+				t.Fatalf("send failure not reported after disconnect: status=%+v tx=%d", s.Status, s.Tx)
+			}
+		})
+	}
+}
+
 func TestAppFileSendReportsTotalAndSuccessfulBytes(t *testing.T) {
 	data := bytes.Repeat([]byte{0x5A}, 700)
 	path := filepath.Join(t.TempDir(), "firmware.bin")
@@ -834,7 +866,7 @@ func TestSendValidationAndCancellationRemainFrameworkIndependent(t *testing.T) {
 func TestShutdownCollectsBackgroundSaveAndFlushesLatestDraft(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	v := &appTestView{callbacks: make(chan func(), 8)}
-	s := &App{SettingsPath: path, Settings: config.Settings{Language: "en"}}
+	s := &App{SettingsPath: path, settingsStore: &testSettingsStore{}, Settings: config.Settings{Language: "en"}}
 	s.Startup(v)
 	s.Settings.SendText = "used"
 	s.SettingsChanged()
@@ -963,7 +995,7 @@ func TestShutdownReclaimsCaptureWhenCompletionIsDiscarded(t *testing.T) {
 func TestAsyncFileUseSavesAcceptedSnapshotNotLaterDraft(t *testing.T) {
 	dir := t.TempDir()
 	v := &appTestView{callbacks: make(chan func(), 8)}
-	s := &App{SettingsPath: filepath.Join(dir, "config.toml"), Settings: config.Settings{SendText: "accepted", Presets: []config.Preset{{Data: "accepted preset"}}, BaudRates: []string{"115200"}}}
+	s := &App{SettingsPath: filepath.Join(dir, "config.toml"), settingsStore: &testSettingsStore{}, Settings: config.Settings{SendText: "accepted", Presets: []config.Preset{{Data: "accepted preset"}}, BaudRates: []string{"115200"}}}
 	s.Startup(v)
 	s.SettingsChanged()
 	s.SaveLog(filepath.Join(dir, "log.txt"), "display")
@@ -1065,6 +1097,90 @@ func TestShutdownWaitsForLogSaveWithDiscardedCompletion(t *testing.T) {
 	}
 }
 
+type failingLogFile struct {
+	writeErr error
+	closeErr error
+	closed   bool
+}
+
+func (f *failingLogFile) Write(p []byte) (int, error) {
+	if f.writeErr != nil {
+		return 0, f.writeErr
+	}
+	return len(p), nil
+}
+
+func (f *failingLogFile) Close() error {
+	f.closed = true
+	return f.closeErr
+}
+
+func TestWriteAndCloseLogRetainsBothErrors(t *testing.T) {
+	writeErr := errors.New("log write failure")
+	closeErr := errors.New("log close failure")
+	for _, tc := range []struct {
+		name         string
+		write, close error
+	}{
+		{"write", writeErr, nil},
+		{"close", nil, closeErr},
+		{"both", writeErr, closeErr},
+	} {
+		for _, report := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/reported=%t", tc.name, report), func(t *testing.T) {
+				file := &failingLogFile{writeErr: tc.write, closeErr: tc.close}
+				view := &appTestView{callbacks: make(chan func(), 1)}
+				s := &App{view: view, closed: make(chan struct{})}
+				s.jobs.Add(1)
+				go func() {
+					defer s.jobs.Done()
+					s.completeLogSave(writeAndCloseLog(file, "data"), false, false, nil)
+				}()
+				if report {
+					awaitAppCallback(t, view)
+					if !s.StatusError {
+						t.Fatal("save failure was not reported")
+					}
+				}
+				err := s.Shutdown()
+				if !file.closed {
+					t.Fatal("log file was not closed")
+				}
+				if report && err != nil {
+					t.Fatalf("Shutdown repeated reported error: %v", err)
+				}
+				if !report && ((tc.write != nil && !errors.Is(err, tc.write)) || (tc.close != nil && !errors.Is(err, tc.close))) {
+					t.Fatalf("Shutdown lost write or close failure: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestSaveLogFailureSurvivesDiscardedCallback(t *testing.T) {
+	for _, report := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reported=%t", report), func(t *testing.T) {
+			view := &appTestView{callbacks: make(chan func(), 1)}
+			s := &App{view: view, closed: make(chan struct{})}
+			path := filepath.Join(t.TempDir(), "missing", "display.txt")
+			s.SaveLog(path, "data")
+			if report {
+				awaitAppCallback(t, view)
+				if !s.StatusError || !strings.Contains(s.Status.EN, "Failed to save displayed data") {
+					t.Fatalf("save error not reported: %q", s.Status.EN)
+				}
+			}
+			err := s.Shutdown()
+			if report && err != nil {
+				t.Fatalf("Shutdown repeated reported error: %v", err)
+			}
+			if !report && (!errors.Is(err, os.ErrNotExist) || !strings.Contains(i18n.ErrorText(err, true), "Failed to save displayed data")) {
+				t.Fatalf("Shutdown lost save error: %v", err)
+			}
+		})
+	}
+}
+
 func TestDisconnectDeliversFinalReadWriteAndSendingJobRecords(t *testing.T) {
 	port := newBarrierSessionPort()
 	p := newSession(port, 115200, nil)
@@ -1106,7 +1222,7 @@ func TestDisconnectDeliversFinalReadWriteAndSendingJobRecords(t *testing.T) {
 	for len(v.callbacks) > 0 {
 		awaitAppCallback(t, v)
 	}
-	if s.Rx != uint64(len("final RX")) || s.Tx != uint64(len("final TX")+len("terminal TX")) || len(v.records) != 3 {
+	if s.Rx != uint64(len("final RX")) || s.Tx != uint64(len("final TX")+len("terminal TX")) || len(v.records) != 4 || !v.records[3].SessionEnd {
 		t.Fatalf("final records were lost: rx=%d tx=%d records=%d", s.Rx, s.Tx, len(v.records))
 	}
 	if s.PortBusy || s.Sending() || s.Connected() || s.StatusError || p.hasDisplay() {
@@ -1276,8 +1392,13 @@ func TestDisconnectCompletionDoesNotApplyOldErrorsToNewConnection(t *testing.T) 
 	if s.session != current || !s.PortBusy || s.CapturePath != "new capture.bin" || s.Status.EN != "new connection" || s.StatusError {
 		t.Fatal("old disconnect completion mutated the new connection")
 	}
-	if s.Rx != uint64(len("final RX")) || len(v.records) != 1 {
+	if s.Rx != uint64(len("final RX")) || len(v.records) != 2 || !v.records[1].SessionEnd {
 		t.Fatal("isolating old session errors also discarded its final receive record")
+	}
+	current.emit(Event{Data: []byte("new RX")})
+	s.deliverDisplay(current)
+	if len(v.records) != 3 || string(v.records[2].Data) != "new RX" || s.Rx != uint64(len("final RXnew RX")) {
+		t.Fatal("new session data did not follow the old session boundary")
 	}
 	if err := s.Shutdown(); !errors.Is(err, closeErr) {
 		t.Fatalf("unreported stale-session close error was lost: %v", err)
@@ -1392,7 +1513,7 @@ func TestClearReceiveLogDiscardsDetachedSessionDataBeforeFinalDelivery(t *testin
 				t.Fatal("clear retained detached session records or byte counts")
 			}
 			var wantRx, wantTx uint64
-			wantRecords := 0
+			wantRecords := 1 // The terminal boundary does not restore cleared data.
 			if !settled {
 				// Just like an active connection, new data after clear survives.
 				p.emit(Event{Data: []byte("after-clear TX"), Sent: true})
@@ -1400,15 +1521,833 @@ func TestClearReceiveLogDiscardsDetachedSessionDataBeforeFinalDelivery(t *testin
 				s.jobs.Wait()
 				wantRx = uint64(len("final RX"))
 				wantTx = uint64(len("after-clear TX"))
-				wantRecords = 2
+				wantRecords = 3
 			}
 			awaitAppCallback(t, v)
 			if s.Rx != wantRx || s.Tx != wantTx || len(v.records) != wantRecords {
 				t.Fatalf("final delivery resurrected cleared data: rx=%d tx=%d records=%d", s.Rx, s.Tx, len(v.records))
 			}
+			if !v.records[len(v.records)-1].SessionEnd {
+				t.Fatal("session boundary did not follow final delivery")
+			}
 			if s.PortBusy || len(s.closingSessions) != 0 || p.hasDisplay() {
 				t.Fatal("final delivery retained the detached session")
 			}
 		})
+	}
+}
+
+func TestProtectedOutputUsesOpenedFileIdentityAfterRename(t *testing.T) {
+	for _, source := range []bool{false, true} {
+		t.Run(fmt.Sprintf("send=%t", source), func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "original")
+			moved := filepath.Join(dir, "moved")
+			if err := os.WriteFile(path, []byte("preserve"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			opened, err := os.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer opened.Close()
+			info, err := opened.Stat()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(path, moved); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("replacement"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			s := &App{}
+			sendPath := ""
+			if source {
+				sendPath = path
+				s.sendingFileInfo = info
+			} else {
+				s.captureTargets = map[*Session]*captureTarget{&Session{}: {path: path, info: info}}
+			}
+			file, sameSend, sameCapture, err := s.createProtectedOutput(moved, sendPath, "", nil)
+			if err != nil || file != nil || sameSend != source || sameCapture == source {
+				t.Fatalf("identity collision: file=%v send=%t capture=%t err=%v", file, sameSend, sameCapture, err)
+			}
+			data, err := os.ReadFile(moved)
+			if err != nil || string(data) != "preserve" {
+				t.Fatalf("opened file was overwritten: %q %v", data, err)
+			}
+		})
+	}
+}
+
+func TestProtectedOutputUsesCurrentStoreIdentity(t *testing.T) {
+	root := t.TempDir()
+	pinned := filepath.Join(root, "moved")
+	old := filepath.Join(root, "app")
+	for _, dir := range []string{pinned, old} {
+		if err := os.Mkdir(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	current := filepath.Join(pinned, "config.toml")
+	if err := os.WriteFile(current, []byte("replacement"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	store := &testSettingsStore{identity: func() (os.FileInfo, os.FileInfo, string, error) {
+		dir, err := os.Stat(pinned)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		file, err := os.Stat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			err = nil
+		}
+		return dir, file, "config.toml", err
+	}}
+	s := &App{settingsStore: store, protectedSettingsPath: filepath.Join(old, "config.toml")}
+	link := filepath.Join(root, "hardlink")
+	if err := os.Link(current, link); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{current, link} {
+		file, _, _, err := s.createProtectedOutput(path, "", "", nil)
+		if file != nil || err == nil {
+			t.Fatalf("configuration output %q accepted: %v", path, err)
+		}
+	}
+	if data, err := os.ReadFile(current); err != nil || string(data) != "replacement" {
+		t.Fatalf("configuration changed: %q %v", data, err)
+	}
+	if err := os.Remove(current); err != nil {
+		t.Fatal(err)
+	}
+	file, _, _, err := s.createProtectedOutput(current, "", "", nil)
+	if file != nil || err == nil {
+		t.Fatalf("missing configuration name accepted: %v", err)
+	}
+	if _, err := os.Stat(current); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing configuration was created: %v", err)
+	}
+}
+
+func TestCaptureOpenFailureSurvivesDisconnectOrShutdown(t *testing.T) {
+	for _, disconnect := range []bool{false, true} {
+		t.Run(fmt.Sprintf("disconnect=%t", disconnect), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			readDone := make(chan struct{})
+			close(readDone)
+			p := &Session{port: appFileSendPort{}, ctx: ctx, cancel: cancel, readDone: readDone, events: make(chan Event, 1)}
+			view := &appTestView{callbacks: make(chan func(), 4)}
+			failure := errors.New("capture open failure")
+			s := &App{view: view, session: p, stopPump: make(chan struct{}), settingsPathError: failure}
+			s.startCapture(filepath.Join(t.TempDir(), "capture"), p)
+			s.jobs.Wait()
+			if disconnect {
+				s.Status = Text{ZH: "其他错误", EN: "other failure"}
+				s.StatusError = true
+				s.disconnect(nil)
+				(<-view.callbacks)()
+				if !strings.Contains(s.Status.EN, "capture open failure") || !strings.Contains(s.Status.EN, "other failure") {
+					t.Fatalf("errors not reported together: %+v", s.Status)
+				}
+				if err := s.Shutdown(); errors.Is(err, failure) {
+					t.Fatalf("reported error repeated at shutdown: %v", err)
+				}
+			} else if err := s.Shutdown(); !errors.Is(err, failure) {
+				t.Fatalf("shutdown lost capture error: %v", err)
+			}
+		})
+	}
+}
+
+func TestCaptureOpenCancellationRetainsOtherErrors(t *testing.T) {
+	failure := errors.New("close failure")
+	err := captureOpenError(errors.Join(context.Canceled, failure))
+	if !errors.Is(err, failure) || errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation filtering lost error: %v", err)
+	}
+	if err := captureOpenError(errors.Join(context.Canceled)); err != nil {
+		t.Fatalf("normal cancellation reported: %v", err)
+	}
+}
+
+func TestCaptureSetupFailureSurvivesShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	readDone := make(chan struct{})
+	close(readDone)
+	done := make(chan struct{})
+	close(done)
+	failure := errors.New("previous capture close failure")
+	p := &Session{
+		port: appFileSendPort{}, ctx: ctx, cancel: cancel, readDone: readDone,
+		events: make(chan Event, 1),
+		captureWorker: &captureWriter{stopped: true, done: done, result: failure},
+	}
+	view := &appTestView{callbacks: make(chan func(), 4)}
+	s := &App{view: view, session: p, stopPump: make(chan struct{})}
+	s.startCapture(filepath.Join(t.TempDir(), "capture"), p)
+	s.jobs.Wait()
+	if err := s.Shutdown(); !errors.Is(err, failure) {
+		t.Fatalf("shutdown lost capture setup error: %v", err)
+	}
+}
+
+func TestShutdownRetainsUndispatchedSendErrors(t *testing.T) {
+	for _, path := range []string{"", "source.bin"} {
+		t.Run(fmt.Sprintf("file=%t", path != ""), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			readDone := make(chan struct{})
+			close(readDone)
+			p := &Session{port: appFileSendPort{}, ctx: ctx, cancel: cancel, readDone: readDone, events: make(chan Event, 1)}
+			view := &appTestView{callbacks: make(chan func(), 4)}
+			s := &App{view: view, session: p, stopPump: make(chan struct{})}
+			failure := errors.New("undispatched send failure")
+			s.startSending(Text{ZH: "发送", EN: "Send"}, path, func(context.Context, *Session) error { return failure })
+			s.jobs.Wait()
+			if err := s.Shutdown(); !errors.Is(err, failure) {
+				t.Fatalf("Shutdown lost send failure: %v", err)
+			}
+		})
+	}
+}
+
+func TestDrainReportsCaptureAndReadFailuresTogether(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	readDone := make(chan struct{})
+	close(readDone)
+	p := &Session{port: appFileSendPort{}, ctx: ctx, cancel: cancel, readDone: readDone, events: make(chan Event, 2)}
+	s := &App{session: p, stopPump: make(chan struct{})}
+	p.events <- Event{Err: errors.New("record failure")}
+	p.events <- Event{Err: errors.New("read failure"), ReadFailed: true}
+	s.drain(p)
+	s.jobs.Wait()
+	if !s.StatusError || !strings.Contains(s.Status.EN, "record failure") || !strings.Contains(s.Status.EN, "read failure") {
+		t.Fatalf("combined failures missing: %+v", s.Status)
+	}
+}
+
+func TestPortRefreshReportsLoadAndEnumerationFailures(t *testing.T) {
+	s := &App{LoadError: errors.New("load failure")}
+	s.applyPortRefresh(nil, errors.New("enumeration failure"))
+	if !s.StatusError || !strings.Contains(s.Status.EN, "load failure") || !strings.Contains(s.Status.EN, "enumeration failure") {
+		t.Fatalf("startup failures missing: %+v", s.Status)
+	}
+}
+
+func TestDisconnectReportsFlushErrorAfterStatusChanges(t *testing.T) {
+	writeErr := errors.New("flush failure after read error")
+	file := &captureTestFile{writeErr: writeErr, writeStarted: make(chan struct{}, 1), blockWrite: make(chan struct{})}
+	p := NewSession(&serialport.Port{}, 115200)
+	v := &appTestView{callbacks: make(chan func(), 8)}
+	s := &App{view: v, session: p, stopPump: make(chan struct{}), CapturePath: "capture"}
+	defer func() {
+		releaseSessionBarrier(file.blockWrite)
+		_ = s.Shutdown()
+	}()
+	if err := p.setCapture(file); err != nil {
+		t.Fatal(err)
+	}
+	p.enqueueCapture([]byte("buffered"))
+	s.disconnect(errors.New("read failure"))
+	awaitSessionBarrier(t, file.writeStarted)
+	s.Fail("串口已断开", "Serial port disconnected", errors.New("read failure"))
+	releaseSessionBarrier(file.blockWrite)
+	awaitAppCallback(t, v)
+	if !s.StatusError || !strings.Contains(s.Status.EN, "read failure") || !strings.Contains(s.Status.EN, writeErr.Error()) {
+		t.Fatalf("disconnect lost a terminal error: %+v", s.Status)
+	}
+}
+
+type blockingStatCapture struct {
+	*os.File
+	started chan struct{}
+	release chan struct{}
+}
+
+func (f *blockingStatCapture) Stat() (os.FileInfo, error) {
+	close(f.started)
+	<-f.release
+	return f.File.Stat()
+}
+
+func TestCaptureReservationDoesNotWaitForOutputFileIO(t *testing.T) {
+	dir := t.TempDir()
+	file, err := os.Create(filepath.Join(dir, "capture"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	blocked := &blockingStatCapture{File: file, started: make(chan struct{}), release: make(chan struct{})}
+	defer releaseSessionBarrier(blocked.release)
+	p := &Session{}
+	s := &App{captureTargets: map[*Session]*captureTarget{p: {path: file.Name(), file: blocked}}}
+	done := make(chan struct{})
+	go func() {
+		output, _, _, _ := s.createProtectedOutput(filepath.Join(dir, "output"), "", "", nil)
+		if output != nil {
+			_ = output.Close()
+		}
+		close(done)
+	}()
+	awaitSessionBarrier(t, blocked.started)
+	reserved := make(chan struct{})
+	go func() {
+		s.protectCapture(&Session{}, "other", nil)
+		close(reserved)
+	}()
+	awaitSessionBarrier(t, reserved)
+	releaseSessionBarrier(blocked.release)
+	awaitSessionBarrier(t, done)
+}
+
+func TestAppendedOperationErrorSurvivesSettingsSaveSuccess(t *testing.T) {
+	saver := &settingsSaver{saveError: Text{ZH: "保存失败", EN: "save failed"}, results: make(chan settingsSaveResult, 1)}
+	s := &App{saver: saver, settingsSaveError: true, Status: saver.saveError, StatusError: true, closed: make(chan struct{})}
+	s.appendOperationError("关闭失败", "close failed", errors.New("flush failure"))
+	saver.results <- settingsSaveResult{}
+	s.collectSettingsResults(saver)
+	if !s.StatusError || !strings.Contains(s.Status.EN, "flush failure") || s.settingsSaveError {
+		t.Fatalf("save success lost operation failure: %+v", s.Status)
+	}
+}
+
+func TestOutputRejectsConfigurationAndAliases(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	want := []byte("important configuration")
+	if err := os.WriteFile(path, want, 0600); err != nil {
+		t.Fatal(err)
+	}
+	paths := []string{path}
+	hard := filepath.Join(dir, "hard-link")
+	if err := os.Link(path, hard); err == nil {
+		paths = append(paths, hard)
+	}
+	symlink := filepath.Join(dir, "symlink")
+	if err := os.Symlink(path, symlink); err == nil {
+		paths = append(paths, symlink)
+	}
+	for _, destination := range paths {
+		for _, capture := range []bool{false, true} {
+			v := &appTestView{callbacks: make(chan func(), 8)}
+			p := &Session{ctx: context.Background()}
+			s := &App{view: v, session: p, SettingsPath: path}
+			if capture {
+				s.startCapture(destination, p)
+			} else {
+				s.SaveLog(destination, "overwrite")
+			}
+			awaitAppCallback(t, v)
+			if !s.StatusError {
+				t.Fatalf("destination %q capture=%v was accepted", destination, capture)
+			}
+			if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("configuration changed: %q, %v", got, err)
+			}
+			s.jobs.Wait()
+		}
+	}
+	if len(paths) > 1 && paths[len(paths)-1] == symlink {
+		s := &App{SettingsPath: symlink}
+		file, _, _, err := s.createProtectedOutput(path, "", "", nil)
+		if file != nil {
+			file.Close()
+		}
+		if err == nil {
+			t.Fatal("configuration symlink target was accepted")
+		}
+	}
+}
+
+func TestOutputRejectsDanglingConfigurationSymlinkChain(t *testing.T) {
+	for _, capture := range []bool{false, true} {
+		t.Run(fmt.Sprintf("capture=%v", capture), func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.toml")
+			middle := filepath.Join(dir, "middle")
+			output := filepath.Join(dir, "output")
+			if err := os.Symlink("config.toml", middle); err != nil {
+				t.Skipf("symlinks unavailable: %v", err)
+			}
+			if err := os.Symlink("middle", output); err != nil {
+				t.Fatal(err)
+			}
+			v := &appTestView{callbacks: make(chan func(), 8)}
+			p := &Session{ctx: context.Background()}
+			s := &App{view: v, session: p, SettingsPath: configPath}
+			if capture {
+				s.startCapture(output, p)
+			} else {
+				s.SaveLog(output, "data")
+			}
+			awaitAppCallback(t, v)
+			s.jobs.Wait()
+			if !s.StatusError || (capture && s.CapturePath != "") {
+				t.Fatal("dangling configuration link was accepted")
+			}
+			if _, err := os.Lstat(configPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("configuration unexpectedly created: %v", err)
+			}
+		})
+	}
+}
+
+func TestOutputCreatesOrdinaryAndDanglingLinkTargets(t *testing.T) {
+	dir := t.TempDir()
+	s := &App{SettingsPath: filepath.Join(dir, "config.toml")}
+	target := filepath.Join(dir, "target")
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink("target", link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	for _, path := range []string{filepath.Join(dir, "ordinary"), link, link} {
+		file, _, _, err := s.createProtectedOutput(path, "", "", nil)
+		if err != nil {
+			t.Fatalf("open %s: %v", path, err)
+		}
+		if _, err := file.WriteString("data"); err != nil {
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "data" {
+		t.Fatalf("link target = %q, %v", got, err)
+	}
+}
+
+func TestOutputConcurrentDanglingLinkReplacement(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink("config.toml", link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	s := &App{SettingsPath: configPath}
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			_ = os.Remove(link)
+			_ = os.Symlink("safe", link)
+			_ = os.Remove(link)
+			_ = os.Symlink("config.toml", link)
+		}
+	}()
+	for range 100 {
+		file, _, _, _ := s.createProtectedOutput(link, "", "", nil)
+		if file != nil {
+			_ = file.Close()
+		}
+	}
+	close(done)
+	<-stopped
+	if _, err := os.Lstat(configPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("configuration unexpectedly created: %v", err)
+	}
+}
+
+func TestCancelledOutputDoesNotRemoveConcurrentReplacement(t *testing.T) {
+	dir := t.TempDir()
+	output := filepath.Join(dir, "output")
+	other, err := os.Create(filepath.Join(dir, "other"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	blocked := &blockingStatCapture{File: other, started: make(chan struct{}), release: make(chan struct{})}
+	defer releaseSessionBarrier(blocked.release)
+	own := &captureTarget{}
+	s := &App{SettingsPath: filepath.Join(dir, "config.toml"), captureTargets: map[*Session]*captureTarget{
+		{}: {file: blocked},
+	}}
+	done := make(chan error, 1)
+	go func() {
+		file, _, _, err := s.createProtectedOutput(output, "", "", own)
+		if file != nil {
+			_ = file.Close()
+		}
+		done <- err
+	}()
+	awaitSessionBarrier(t, blocked.started)
+	if err := os.Remove(output); err != nil {
+		releaseSessionBarrier(blocked.release)
+		<-done
+		t.Skipf("cannot replace open file: %v", err)
+	}
+	want := []byte("replacement belongs to another operation")
+	if err := os.WriteFile(output, want, 0600); err != nil {
+		releaseSessionBarrier(blocked.release)
+		<-done
+		t.Fatal(err)
+	}
+	own.state.Store(2)
+	releaseSessionBarrier(blocked.release)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected cancellation, got %v", err)
+	}
+	if got, err := os.ReadFile(output); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("replacement changed: %q, %v", got, err)
+	}
+}
+
+func TestConfigurationSaveAndProtectedOutputAreSerialized(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	alias := filepath.Join(dir, "config-link")
+	want := []byte("original configuration")
+	if err := os.WriteFile(path, want, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(path, alias); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+	other, err := os.Create(filepath.Join(dir, "capture"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	blocked := &blockingStatCapture{File: other, started: make(chan struct{}), release: make(chan struct{})}
+	defer releaseSessionBarrier(blocked.release)
+	v := &appTestView{callbacks: make(chan func(), 8)}
+	s := &App{view: v, SettingsPath: path, settingsStore: &testSettingsStore{}, closed: make(chan struct{}), captureTargets: map[*Session]*captureTarget{
+		{}: {path: other.Name(), file: blocked},
+	}}
+	s.SaveLog(alias, "overwrite")
+	awaitSessionBarrier(t, blocked.started)
+	s.startSettingsSaver()
+	s.saver.enqueue(&settingsSnapshot{settings: config.Settings{Language: "en"}})
+	releaseSessionBarrier(blocked.release)
+	awaitAppCallback(t, v)
+	if err := s.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(alias); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("concurrent save allowed configuration truncation: %q, %v", got, err)
+	}
+}
+
+func TestFailedConfigurationLoadStillProtectsExecutableConfig(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "serialgo")
+	path := filepath.Join(dir, "config.toml")
+	want := []byte("invalid = [toml")
+	if err := os.WriteFile(exe, nil, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, want, 0600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(dir, "config-alias")
+	if err := os.Link(path, alias); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+	loadErr := errors.New("configuration decode failed")
+	s := newAppFromLoad(config.Settings{}, "", loadErr, func() (string, error) { return exe, nil })
+	if s.initialSettingsFile != nil {
+		defer s.initialSettingsFile.Close()
+	}
+	if s.SettingsPath != "" || !errors.Is(s.LoadError, loadErr) {
+		t.Fatal("failed load unexpectedly enabled settings persistence")
+	}
+	v := &appTestView{callbacks: make(chan func(), 8)}
+	p := &Session{ctx: context.Background()}
+	s.view, s.session = v, p
+	s.SaveLog(alias, "overwrite")
+	awaitAppCallback(t, v)
+	if !s.StatusError {
+		t.Fatal("export accepted an alias of an unreadable configuration")
+	}
+	s.startCapture(path, p)
+	awaitAppCallback(t, v)
+	if !s.StatusError || s.CapturePath != "" {
+		t.Fatal("recording accepted an unreadable configuration")
+	}
+	s.SettingsDirty = true
+	if err := s.FlushSettings(); err == nil {
+		t.Fatal("failed load allowed settings to be saved")
+	}
+	s.jobs.Wait()
+	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("invalid configuration was modified: %q, %v", got, err)
+	}
+}
+
+func TestOutputFailsClosedWhenExecutablePathCannotBeResolved(t *testing.T) {
+	pathErr := errors.New("executable unavailable")
+	s := newAppFromLoad(config.Settings{}, "", pathErr, func() (string, error) { return "", pathErr })
+	file, _, _, err := s.createProtectedOutput(filepath.Join(t.TempDir(), "output"), "", "", nil)
+	if file != nil {
+		file.Close()
+	}
+	if !errors.Is(err, pathErr) {
+		t.Fatalf("output did not fail closed: %v", err)
+	}
+}
+
+func TestOutputProtectsLoadedIdentityAfterExternalReplacement(t *testing.T) {
+	const helperEnv = "SERIALGO_CONFIG_IDENTITY_HELPER"
+	mode := os.Getenv(helperEnv)
+	if mode == "" {
+		for _, failedLoad := range []bool{false, true} {
+			t.Run(fmt.Sprintf("failed-load-%v", failedLoad), func(t *testing.T) {
+				dir := t.TempDir()
+				executable, err := os.Executable()
+				if err != nil {
+					t.Fatal(err)
+				}
+				data, err := os.ReadFile(executable)
+				if err != nil {
+					t.Fatal(err)
+				}
+				copyPath := filepath.Join(dir, filepath.Base(executable))
+				if err := os.WriteFile(copyPath, data, 0700); err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(dir, "config.toml")
+				childMode := "valid"
+				if failedLoad {
+					childMode = "invalid"
+					if err := os.WriteFile(path, []byte("invalid = [toml"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := config.Save(path, config.Settings{}); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Link(path, filepath.Join(dir, "original-link")); err != nil {
+					t.Skipf("hard links unavailable: %v", err)
+				}
+				cmd := exec.Command(copyPath, "-test.run=^TestOutputProtectsLoadedIdentityAfterExternalReplacement$")
+				cmd.Env = append(os.Environ(), helperEnv+"="+childMode)
+				if output, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("identity helper failed: %v\n%s", err, output)
+				}
+			})
+		}
+		return
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(filepath.Dir(exe), "config.toml")
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(filepath.Dir(exe), "original-link")
+	settings, loadPath, loaded, loadErr := config.LoadWithIdentity()
+	if (loadErr != nil) != (mode == "invalid") || loaded == nil {
+		t.Fatalf("load mode %s: file=%v err=%v", mode, loaded, loadErr)
+	}
+	s := newAppFromIdentity(settings, loadPath, loadErr, os.Executable, loaded, true)
+	defer loaded.Close()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("replacement"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	v := &appTestView{callbacks: make(chan func(), 8)}
+	p := &Session{ctx: context.Background()}
+	s.view, s.session = v, p
+	s.SaveLog(alias, "overwrite")
+	awaitAppCallback(t, v)
+	if !s.StatusError {
+		t.Fatal("export accepted the original configuration identity")
+	}
+	s.startCapture(alias, p)
+	awaitAppCallback(t, v)
+	if !s.StatusError || s.CapturePath != "" {
+		t.Fatal("capture accepted the original configuration identity")
+	}
+	s.jobs.Wait()
+	if got, err := os.ReadFile(alias); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("original configuration changed: %q, %v", got, err)
+	}
+}
+
+func TestOutputProtectsSavedIdentityAfterExternalReplacement(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	s := newAppFromLoad(config.Settings{}, path, nil, os.Executable)
+	s.settingsStore = &testSettingsStore{}
+	s.SettingsDirty = true
+	if err := s.FlushSettings(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.savedSettingsFile.Close()
+	alias := filepath.Join(dir, "saved-link")
+	if err := os.Link(path, alias); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+	want, err := os.ReadFile(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("replacement"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	v := &appTestView{callbacks: make(chan func(), 8)}
+	s.view = v
+	s.SaveLog(alias, "overwrite")
+	awaitAppCallback(t, v)
+	s.jobs.Wait()
+	if !s.StatusError {
+		t.Fatal("export accepted the saved configuration identity")
+	}
+	if got, err := os.ReadFile(alias); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("saved configuration changed: %q, %v", got, err)
+	}
+}
+
+func TestOutputProtectsSavedDescriptorWhenPathChangesBeforeHandoff(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	file, err := config.SaveWithIdentity(path, config.Settings{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	alias := filepath.Join(dir, "saved-link")
+	if err := os.Link(path, alias); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+	want, err := os.ReadFile(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("replacement"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s := &App{SettingsPath: path}
+	s.rememberSavedSettings(file)
+	v := &appTestView{callbacks: make(chan func(), 8)}
+	s.view = v
+	s.SaveLog(alias, "overwrite")
+	awaitAppCallback(t, v)
+	s.jobs.Wait()
+	if !s.StatusError {
+		t.Fatal("export accepted the exchanged saved configuration")
+	}
+	if got, err := os.ReadFile(alias); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("saved configuration changed: %q, %v", got, err)
+	}
+}
+
+func TestOutputProtectsInitialSameDirectorySymlinkTarget(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "original")
+	path := filepath.Join(dir, "config.toml")
+	want := []byte("original configuration")
+	if err := os.WriteFile(target, want, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("original", path); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	loaded, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loaded.Close()
+	s := newAppFromIdentity(config.Settings{}, path, nil, os.Executable, loaded, true)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("replacement"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	v := &appTestView{callbacks: make(chan func(), 8)}
+	s.view = v
+	s.SaveLog(target, "overwrite")
+	awaitAppCallback(t, v)
+	s.jobs.Wait()
+	if !s.StatusError {
+		t.Fatal("export accepted the original symlink target")
+	}
+	if got, err := os.ReadFile(target); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("original symlink target changed: %q, %v", got, err)
+	}
+}
+
+func TestPendingCaptureCancelledBeforeDisconnectOrShutdown(t *testing.T) {
+	for _, shutdown := range []bool{false, true} {
+		t.Run(fmt.Sprint("shutdown=", shutdown), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "capture")
+			if err := os.WriteFile(path, []byte("keep"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			p := NewSession(&serialport.Port{}, 115200)
+			v := &appTestView{callbacks: make(chan func(), 8)}
+			s := &App{view: v, session: p, stopPump: make(chan struct{}), closed: make(chan struct{})}
+			s.fileIOMu.Lock()
+			s.startCapture(path, p)
+			target := s.protectCapture(p, "", nil)
+			done := make(chan error, 1)
+			if shutdown {
+				go func() { done <- s.Shutdown() }()
+			} else {
+				s.disconnect(nil)
+			}
+			deadline := time.After(captureTestTimeout)
+			for target.state.Load() != 2 {
+				select {
+				case <-deadline:
+					s.fileIOMu.Unlock()
+					t.Fatal("pending capture was not canceled")
+				default:
+					time.Sleep(time.Millisecond)
+				}
+			}
+			s.fileIOMu.Unlock()
+			if shutdown {
+				if err := <-done; err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				s.jobs.Wait()
+				if err := s.Shutdown(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got, err := os.ReadFile(path); err != nil || string(got) != "keep" {
+				t.Fatalf("canceled capture damaged destination: %q, %v", got, err)
+			}
+		})
+	}
+}
+
+func TestDisconnectSendFailurePreservesConcurrentCaptureCloseError(t *testing.T) {
+	p := NewSession(&serialport.Port{}, 115200)
+	v := &appTestView{callbacks: make(chan func(), 8)}
+	s := &App{view: v, session: p, stopPump: make(chan struct{}), closed: make(chan struct{})}
+	sendErr := errors.New("send failure")
+	failure := s.retainTerminalError(sendErr)
+	done := make(chan struct{})
+	close(done)
+	s.sendDone = &sendResult{done: done, err: sendErr, failure: failure}
+	s.disconnect(nil)
+	s.appendOperationError("关闭接收文件失败", "Failed to close receive file", errors.New("capture close failure"))
+	awaitAppCallback(t, v)
+	if !s.StatusError || !strings.Contains(s.Status.EN, "capture close failure") || !strings.Contains(s.Status.EN, "send failure") {
+		t.Fatalf("disconnect lost a concurrent failure: %+v", s.Status)
+	}
+	if err := s.Shutdown(); err != nil {
+		t.Fatal(err)
 	}
 }

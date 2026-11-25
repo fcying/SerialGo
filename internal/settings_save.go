@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"os"
 	"slices"
 
 	"github.com/fcying/SerialGo/config"
@@ -23,16 +24,38 @@ type settingsSaver struct {
 	pendingRequest bool
 	stopped        bool
 
+	// An unrelated error remains visible alongside a save error and is
+	// restored if a later save succeeds while we still own the status.
+	previousError    Text
+	hadPreviousError bool
+	saveError        Text
+
 	pending chan *settingsSnapshot
 	results chan settingsSaveResult
 	done    chan struct{}
 }
 
-func writeSettings(path string, settings config.Settings) error {
-	if path == "" {
+// SettingsStore saves settings and returns the opened saved file for identity protection.
+type SettingsStore interface {
+	SaveWithIdentity(string, config.Settings) (*os.File, error)
+	OutputIdentity() (os.FileInfo, os.FileInfo, string, error)
+	Close() error
+}
+
+// The caller holds fileIOMu across both the atomic save and identity pinning.
+func (s *App) writeSettings(path string, settings config.Settings) error {
+	if s.settingsStoreError != nil {
+		return s.settingsStoreError
+	}
+	if path == "" || s.settingsStore == nil {
 		return i18n.NewError("配置不可写, 未保存", "Configuration is not writable; settings were not saved")
 	}
-	return config.Save(path, settings)
+	file, err := s.settingsStore.SaveWithIdentity(path, settings)
+	if err != nil {
+		return err
+	}
+	s.rememberSavedSettings(file)
+	return nil
 }
 
 func newSettingsSaver(path string, save func(string, config.Settings) error, notify func()) *settingsSaver {
@@ -88,7 +111,11 @@ func (s *App) startSettingsSaver() {
 		return
 	}
 	var saver *settingsSaver
-	saver = newSettingsSaver(s.SettingsPath, config.Save, func() {
+	saver = newSettingsSaver(s.SettingsPath, func(path string, settings config.Settings) error {
+		s.fileIOMu.Lock()
+		defer s.fileIOMu.Unlock()
+		return s.writeSettings(path, settings)
+	}, func() {
 		s.dispatch(func() { s.collectSettingsResults(saver) })
 	})
 	s.saver = saver
@@ -195,13 +222,25 @@ func (s *App) collectSettingsResults(a *settingsSaver) {
 			default:
 			}
 			if result.err != nil {
-				if s.StatusError && !s.settingsSaveError {
-					continue
+				if !s.settingsSaveError {
+					a.previousError, a.hadPreviousError = Text{}, s.StatusError
+					if s.StatusError {
+						a.previousError = s.Status
+					}
 				}
-				s.Fail("保存参数失败", "Failed to save settings", result.err)
+				a.saveError = Text{
+					ZH: "保存参数失败: " + i18n.ErrorText(result.err, false),
+					EN: "Failed to save settings: " + i18n.ErrorText(result.err, true),
+				}
+				s.Status, s.StatusError = a.saveError, true
+				if a.hadPreviousError {
+					s.Status.ZH += "; " + a.previousError.ZH
+					s.Status.EN += "; " + a.previousError.EN
+				}
 				s.settingsSaveError = true
 			} else if s.settingsSaveError {
-				s.Status, s.StatusError, s.settingsSaveError = Text{}, false, false
+				s.Status, s.StatusError, s.settingsSaveError = a.previousError, a.hadPreviousError, false
+				a.previousError, a.hadPreviousError, a.saveError = Text{}, false, Text{}
 			}
 		default:
 			return
@@ -221,7 +260,9 @@ func (s *App) FlushSettings() error {
 	settings.BaudRates = slices.Clone(settings.BaudRates)
 	settings.Presets = slices.Clone(settings.Presets)
 	settings.CurveProfiles = config.CloneCurveProfiles(settings.CurveProfiles)
-	err := writeSettings(s.SettingsPath, settings)
+	s.fileIOMu.Lock()
+	err := s.writeSettings(s.SettingsPath, settings)
+	s.fileIOMu.Unlock()
 	if err != nil {
 		return err
 	}

@@ -108,12 +108,14 @@ func (s *controller) confirmCurveProfileEditor() {
 		s.closeCurveProfileEditor()
 		return
 	}
+	original, dirty := v.draft, v.dirty
 	candidate := v.draft
 	candidate.name, candidate.timePattern, candidate.timeScale = e.name, e.timePattern, e.timeScale
 	candidate.pointLimit = profile.PointLimit
 	v.draft, v.dirty = candidate, true
 	applied := s.applyCurveDraft()
 	if !applied {
+		v.draft, v.dirty = original, dirty
 		e.error = v.error
 		return
 	}

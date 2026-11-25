@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,9 +14,36 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
+type testSettingsStore struct {
+	save     func(string, config.Settings) (*os.File, error)
+	close    func() error
+	identity func() (os.FileInfo, os.FileInfo, string, error)
+}
+
+func (s *testSettingsStore) SaveWithIdentity(path string, settings config.Settings) (*os.File, error) {
+	if s.save != nil {
+		return s.save(path, settings)
+	}
+	return config.SaveWithIdentity(path, settings)
+}
+
+func (s *testSettingsStore) OutputIdentity() (os.FileInfo, os.FileInfo, string, error) {
+	if s.identity != nil {
+		return s.identity()
+	}
+	return nil, nil, "", nil
+}
+
+func (s *testSettingsStore) Close() error {
+	if s.close != nil {
+		return s.close()
+	}
+	return nil
+}
+
 func settingsSaveFixture(t *testing.T, path string, save func(string, config.Settings) error) (*App, <-chan struct{}) {
 	t.Helper()
-	s := &App{SettingsPath: path, closed: make(chan struct{}), Settings: config.Settings{Language: "en", Presets: []config.Preset{config.NewPreset()}}}
+	s := &App{SettingsPath: path, settingsStore: &testSettingsStore{}, closed: make(chan struct{}), Settings: config.Settings{Language: "en", Presets: []config.Preset{config.NewPreset()}}}
 	notified := make(chan struct{}, 16)
 	s.saver = newSettingsSaver(path, save, func() { notified <- struct{}{} })
 	t.Cleanup(s.stopSettingsSaver)
@@ -203,8 +231,15 @@ func TestSettingsFailureRetriesSameRevisionAndOwnsOnlyItsError(t *testing.T) {
 	operation := s.Status
 	s.SaveUsedSettings()
 	completeSettingsSave(t, s, notified)
-	if !s.SettingsDirty || s.Status != operation || s.settingsSaveError {
-		t.Fatal("settings failure replaced an unrelated operation error")
+	if !s.SettingsDirty || !s.StatusError || !s.settingsSaveError ||
+		!strings.Contains(s.Status.EN, "Failed to save settings") || !strings.Contains(s.Status.EN, operation.EN) ||
+		!strings.Contains(s.Status.ZH, "保存参数失败") || !strings.Contains(s.Status.ZH, operation.ZH) {
+		t.Fatalf("settings and operation failures should both be visible: %+v", s.Status)
+	}
+	s.SaveUsedSettings()
+	completeSettingsSave(t, s, notified)
+	if strings.Count(s.Status.EN, "Failed to save settings") != 1 || strings.Count(s.Status.EN, operation.EN) != 1 {
+		t.Fatalf("repeated failure duplicated status: %+v", s.Status)
 	}
 	if err := os.Mkdir(dir, 0700); err != nil {
 		t.Fatal(err)
@@ -213,6 +248,37 @@ func TestSettingsFailureRetriesSameRevisionAndOwnsOnlyItsError(t *testing.T) {
 	completeSettingsSave(t, s, notified)
 	if s.SettingsDirty || !s.StatusError || s.Status != operation {
 		t.Fatal("settings recovery erased an unrelated operation error")
+	}
+}
+
+func TestSettingsRecoveryDoesNotEraseNewerOperationFailure(t *testing.T) {
+	fail := true
+	s, notified := settingsSaveFixture(t, "settings.toml", func(string, config.Settings) error {
+		if fail {
+			return errors.New("save failed")
+		}
+		return nil
+	})
+	draftSettings(s, "used")
+	s.SaveUsedSettings()
+	completeSettingsSave(t, s, notified)
+	if !s.SettingsDirty || !strings.Contains(s.Status.EN, "save failed") {
+		t.Fatalf("save failure not visible: %+v", s.Status)
+	}
+	s.Fail("串口错误", "Serial error", errors.New("operation failed"))
+	operation := s.saver.previousError
+	if !s.settingsSaveError || !strings.Contains(s.Status.EN, "save failed") || !strings.Contains(s.Status.EN, "operation failed") {
+		t.Fatalf("later operation error hid save failure: %+v", s.Status)
+	}
+	s.Note("发送完成", "Send completed")
+	if !strings.Contains(s.Status.EN, "save failed") || !strings.Contains(s.Status.EN, "operation failed") {
+		t.Fatalf("later success hid unresolved errors: %+v", s.Status)
+	}
+	fail = false
+	s.SaveUsedSettings()
+	completeSettingsSave(t, s, notified)
+	if s.SettingsDirty || !s.StatusError || s.Status != operation {
+		t.Fatalf("save recovery changed newer operation failure: %+v", s.Status)
 	}
 }
 
@@ -353,5 +419,86 @@ func TestUnchangedClearAndPortSettingsDoNotWrite(t *testing.T) {
 	_, err = os.Stat(path)
 	if !os.IsNotExist(err) {
 		t.Fatalf("unchanged controls created a configuration: %v", err)
+	}
+}
+
+func TestShutdownDrainsSettingsBeforeClosingStore(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	closed := make(chan struct{})
+	count := 0
+	store := &testSettingsStore{
+		save: func(path string, settings config.Settings) (*os.File, error) {
+			count++
+			started <- settings.SendText
+			if count == 1 {
+				<-release
+			}
+			return config.SaveWithIdentity(path, settings)
+		},
+		close: func() error { close(closed); return nil },
+	}
+	view := &appTestView{callbacks: make(chan func(), 8)}
+	s := &App{SettingsPath: path, settingsStore: store, Settings: config.Settings{Language: "en"}}
+	s.Startup(view)
+	draftSettings(s, "used")
+	s.SaveUsedSettings()
+	select {
+	case got := <-started:
+		if got != "used" {
+			t.Fatalf("first snapshot = %q", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("background save did not start")
+	}
+	draftSettings(s, "final")
+	done := make(chan error, 1)
+	go func() { done <- s.Shutdown() }()
+	select {
+	case <-closed:
+		t.Fatal("store closed before in-flight save completed")
+	default:
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown did not drain settings")
+	}
+	select {
+	case got := <-started:
+		if got != "final" {
+			t.Fatalf("final snapshot = %q", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("final save did not start")
+	}
+	select {
+	case <-closed:
+	default:
+		t.Fatal("shutdown did not close store")
+	}
+	if got := readSavedSettings(t, path).SendText; got != "final" {
+		t.Fatalf("saved final draft = %q", got)
+	}
+}
+
+func TestFailedStoreCreationDisablesPersistenceAndOutput(t *testing.T) {
+	failure := errors.New("cannot open executable directory")
+	s := newAppWithStore(nil, failure)
+	if !errors.Is(s.LoadError, failure) || !errors.Is(s.settingsPathError, failure) {
+		t.Fatalf("store failure was not retained: %v", s.LoadError)
+	}
+	s.SettingsDirty = true
+	if err := s.Shutdown(); !errors.Is(err, failure) || !s.SettingsDirty {
+		t.Fatalf("shutdown did not preserve failed save: %v", err)
+	}
+	_, _, _, err := s.createProtectedOutput(filepath.Join(t.TempDir(), "log.txt"), "", "", nil)
+	if !errors.Is(err, failure) {
+		t.Fatalf("output did not fail closed: %v", err)
 	}
 }

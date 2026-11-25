@@ -2,12 +2,18 @@ package config
 
 import (
 	"bytes"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/fcying/SerialGo/internal/i18n"
 
 	"github.com/BurntSushi/toml"
 )
@@ -20,6 +26,243 @@ func savedPresets(t *testing.T, path string) []Preset {
 		t.Fatal(err)
 	}
 	return stored.Presets
+}
+
+func makeConfigSymlink(t *testing.T, target, path string) {
+	t.Helper()
+	if err := os.Symlink(target, path); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+}
+
+func TestConfigSymlinkSaveKeepsLinks(t *testing.T) {
+	for _, absolute := range []bool{false, true} {
+		t.Run(map[bool]string{false: "relative", true: "absolute"}[absolute], func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.toml")
+			middle := filepath.Join(dir, "middle.toml")
+			target := filepath.Join(dir, "actual.toml")
+			if err := Save(target, defaults()); err != nil {
+				t.Fatal(err)
+			}
+			first, second := "middle.toml", "actual.toml"
+			if absolute {
+				first, second = middle, target
+			}
+			makeConfigSymlink(t, second, middle)
+			makeConfigSymlink(t, first, path)
+			settings, loadedPath, err := load(path)
+			if err != nil || loadedPath != path {
+				t.Fatalf("load: path=%q err=%v", loadedPath, err)
+			}
+			settings.SendText = "updated through symlink"
+			if err := Save(loadedPath, settings); err != nil {
+				t.Fatal(err)
+			}
+			for link, want := range map[string]string{path: first, middle: second} {
+				got, err := os.Readlink(link)
+				if err != nil || got != want {
+					t.Fatalf("link %s changed: target=%q err=%v", link, got, err)
+				}
+			}
+			got := defaults()
+			if err := decode(target, &got); err != nil || got.SendText != settings.SendText {
+				t.Fatalf("target not updated: SendText=%q err=%v", got.SendText, err)
+			}
+		})
+	}
+}
+
+func TestConfigSymlinkRejectsUnsafeTargets(t *testing.T) {
+	for _, kind := range []string{"dangling", "outside", "outside chain", "cycle"} {
+		t.Run(kind, func(t *testing.T) {
+			dir, outside := t.TempDir(), t.TempDir()
+			path := filepath.Join(dir, "config.toml")
+			other := filepath.Join(outside, "other.toml")
+			original := []byte("SendText = \"do not overwrite\"\n")
+			if err := os.WriteFile(other, original, 0600); err != nil {
+				t.Fatal(err)
+			}
+			target := "missing.toml"
+			switch kind {
+			case "outside":
+				target = other
+			case "outside chain":
+				target = "middle.toml"
+				makeConfigSymlink(t, other, filepath.Join(dir, target))
+			case "cycle":
+				target = "middle.toml"
+				makeConfigSymlink(t, "config.toml", filepath.Join(dir, target))
+			}
+			makeConfigSymlink(t, target, path)
+			if _, _, err := load(path); err == nil {
+				t.Fatal("load accepted an unsafe symlink")
+			}
+			if err := Save(path, defaults()); err == nil {
+				t.Fatal("save accepted an unsafe symlink")
+			}
+			if got, err := os.Readlink(path); err != nil || got != target {
+				t.Fatalf("configuration link changed: target=%q err=%v", got, err)
+			}
+			if got, err := os.ReadFile(other); err != nil || !bytes.Equal(got, original) {
+				t.Fatalf("outside configuration changed: %q err=%v", got, err)
+			}
+			if kind == "dangling" {
+				if _, err := os.Lstat(filepath.Join(dir, target)); !os.IsNotExist(err) {
+					t.Fatalf("dangling target was created: %v", err)
+				}
+			}
+			if entries, err := filepath.Glob(filepath.Join(dir, ".settings-*")); err != nil || len(entries) != 0 {
+				t.Fatalf("temporary files left behind: %v err=%v", entries, err)
+			}
+		})
+	}
+}
+
+func TestDecodeRejectsTargetReplacedBySymlink(t *testing.T) {
+	dir, outside := t.TempDir(), t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	target := filepath.Join(dir, "actual.toml")
+	other := filepath.Join(outside, "outside.toml")
+	if err := os.WriteFile(target, []byte("SendText = \"inside\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(other, []byte("SendText = \"outside\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	makeConfigSymlink(t, "actual.toml", path)
+	resolved, err := settingsTarget(path)
+	if err != nil || resolved != target {
+		t.Fatalf("resolve: target=%q err=%v", resolved, err)
+	}
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
+	makeConfigSymlink(t, other, target)
+	settings := defaults()
+	before := settings.SendText
+	if err := decode(resolved, &settings); err == nil {
+		t.Fatal("decode followed a substituted symlink")
+	}
+	if settings.SendText != before {
+		t.Fatalf("decode read outside settings: %q", settings.SendText)
+	}
+}
+
+func TestCreateMissingConfigDoesNotReplaceNewFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	original := []byte("SendText = \"created concurrently\"\n")
+	if err := os.WriteFile(path, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := save(path, defaults(), true); err == nil {
+		t.Fatal("exclusive creation replaced an existing file")
+	}
+	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("existing configuration changed: %q err=%v", got, err)
+	}
+}
+
+func TestLoadCreationFailureDoesNotReturnWritablePath(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "missing")
+	path := filepath.Join(dir, "config.toml")
+	settings, loadedPath, err := load(path)
+	if err == nil || loadedPath != "" {
+		t.Fatalf("load after creation failure: path=%q err=%v", loadedPath, err)
+	}
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	original := []byte("SendText = \"created after failed load\"\n")
+	if err := os.WriteFile(path, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Save(loadedPath, settings); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("unread configuration changed: %q err=%v", got, err)
+	}
+}
+
+func TestCreateMissingConfigPublishesCompleteFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	want := defaults()
+	want.SendText = "new configuration"
+	if err := save(path, want, true); err != nil {
+		t.Fatal(err)
+	}
+	got := defaults()
+	if err := decode(path, &got); err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("created configuration: got=%+v err=%v", got, err)
+	}
+	if entries, err := filepath.Glob(filepath.Join(dir, ".settings-*")); err != nil || len(entries) != 0 {
+		t.Fatalf("temporary files left behind: %v err=%v", entries, err)
+	}
+}
+
+func TestLoadFileReturnsOpenedIdentity(t *testing.T) {
+	for _, kind := range []string{"created", "existing", "invalid"} {
+		t.Run(kind, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.toml")
+			if kind != "created" {
+				data := []byte("SendText = \"existing\"\n")
+				if kind == "invalid" {
+					data = []byte("invalid = [\n")
+				}
+				if err := os.WriteFile(path, data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var opened *os.File
+			_, loadedPath, err := loadFile(path, &opened)
+			if (err != nil) != (kind == "invalid") || opened == nil {
+				t.Fatalf("load: path=%q file=%v err=%v", loadedPath, opened, err)
+			}
+			defer opened.Close()
+			info, err := opened.Stat()
+			if err != nil {
+				t.Fatal(err)
+			}
+			actual, err := os.Stat(path)
+			if err != nil || !os.SameFile(info, actual) {
+				t.Fatalf("identity differs from loaded file: %v", err)
+			}
+			if err := os.Rename(path, filepath.Join(dir, "old.toml")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("replacement"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			replacement, err := os.Stat(path)
+			if err != nil || os.SameFile(info, replacement) {
+				t.Fatalf("identity followed a replacement: %v", err)
+			}
+		})
+	}
+}
+
+func TestSaveWithIdentityTracksWrittenFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	file, err := SaveWithIdentity(path, defaults())
+	if err != nil || file == nil {
+		t.Fatalf("save: file=%v err=%v", file, err)
+	}
+	defer file.Close()
+	identity, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err := os.Stat(path)
+	if err != nil || !os.SameFile(identity, actual) {
+		t.Fatalf("identity differs from saved file: %v", err)
+	}
+	if identity, err := SaveWithIdentity("", defaults()); err != nil || identity != nil {
+		t.Fatalf("empty path: identity=%v err=%v", identity, err)
+	}
 }
 
 func TestDefaultConfigHasFiveDistinctPresets(t *testing.T) {
@@ -644,5 +887,351 @@ func TestLegacyWindowSettingsInferSavedPixelPosition(t *testing.T) {
 	}
 	if got.Window.PixelWidth != 1200 || got.Window.PixelHeight != 900 {
 		t.Fatalf("legacy pixel bounds = %dx%d, want 1200x900", got.Window.PixelWidth, got.Window.PixelHeight)
+	}
+}
+
+func TestStoreDetectsExternalChanges(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "windows" {
+		t.Skip("store unsupported")
+	}
+	for _, change := range []string{"in-place", "replace", "remove"} {
+		t.Run(change, func(t *testing.T) {
+			dir := t.TempDir()
+			store, err := openStore(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			settings, path, file, err := store.LoadWithIdentity()
+			if err != nil {
+				t.Fatal(err)
+			}
+			file.Close()
+			external := []byte("SendText = \"external\"\n")
+			switch change {
+			case "in-place":
+				err = os.WriteFile(path, external, 0600)
+			case "replace":
+				tmp := filepath.Join(dir, "replacement")
+				if err = os.WriteFile(tmp, external, 0600); err == nil {
+					var root *os.Root
+					root, err = os.OpenRoot(dir)
+					if err == nil {
+						err = root.Rename("replacement", "config.toml")
+						root.Close()
+					}
+				}
+			case "remove":
+				err = os.Remove(path)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			settings.SendText = "stale"
+			file, err = store.SaveWithIdentity(path, settings)
+			if file != nil {
+				file.Close()
+			}
+			if err == nil {
+				t.Fatal("stale save succeeded")
+			}
+			if zh, en := i18n.ErrorText(err, false), i18n.ErrorText(err, true); !strings.Contains(zh, "重启") || !strings.Contains(en, "restart") {
+				t.Fatalf("conflict recovery is not localized: zh=%q en=%q", zh, en)
+			}
+			got, err := os.ReadFile(path)
+			if change == "remove" {
+				if !os.IsNotExist(err) {
+					t.Fatalf("removed config recreated: %v", err)
+				}
+			} else if err != nil || !bytes.Equal(got, external) {
+				t.Fatalf("external content overwritten: %q, %v", got, err)
+			}
+		})
+	}
+}
+
+func TestStoreConcurrentProcesses(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "windows" {
+		t.Skip("store unsupported")
+	}
+	if dir := os.Getenv("SERIALGO_STORE_TEST_DIR"); dir != "" {
+		id := os.Getenv("SERIALGO_STORE_TEST_ID")
+		store, err := openStore(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		settings, path, file, err := store.LoadWithIdentity()
+		if err != nil {
+			t.Fatal(err)
+		}
+		file.Close()
+		if err = os.WriteFile(filepath.Join(dir, "ready-"+id), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(15 * time.Second)
+		for {
+			if _, err = os.Stat(filepath.Join(dir, "go")); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for start")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		settings.SendText = id
+		file, err = store.SaveWithIdentity(path, settings)
+		if file != nil {
+			file.Close()
+		}
+		if err != nil && !strings.Contains(i18n.ErrorText(err, true), "Configuration changed") {
+			t.Fatal(err)
+		}
+		result := "conflict"
+		if err == nil {
+			result = "saved"
+		}
+		if err = os.WriteFile(filepath.Join(dir, "result-"+id), []byte(result), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	dir := t.TempDir()
+	store, err := openStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, file, err := store.LoadWithIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file.Close()
+	store.Close()
+	commands := make([]*exec.Cmd, 2)
+	for i, id := range []string{"one", "two"} {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestStoreConcurrentProcesses$")
+		cmd.Env = append(os.Environ(), "SERIALGO_STORE_TEST_DIR="+dir, "SERIALGO_STORE_TEST_ID="+id)
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		commands[i] = cmd
+		defer func() {
+			if cmd.ProcessState == nil {
+				cmd.Process.Kill()
+				cmd.Wait()
+			}
+		}()
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		_, one := os.Stat(filepath.Join(dir, "ready-one"))
+		_, two := os.Stat(filepath.Join(dir, "ready-two"))
+		if one == nil && two == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for children")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "go"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, cmd := range commands {
+		if err := cmd.Wait(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	one, err := os.ReadFile(filepath.Join(dir, "result-one"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := os.ReadFile(filepath.Join(dir, "result-two"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !((string(one) == "saved" && string(two) == "conflict") || (string(two) == "saved" && string(one) == "conflict")) {
+		t.Fatalf("results: %s, %s", one, two)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	winner := "one"
+	if string(two) == "saved" {
+		winner = "two"
+	}
+	if !bytes.Contains(data, []byte("SendText = \""+winner+"\"")) {
+		t.Fatalf("winner not persisted: %s", data)
+	}
+}
+
+func TestStoreTracksLinkTargetAndOwnSaves(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "windows" {
+		t.Skip("store unsupported")
+	}
+	dir := t.TempDir()
+	first, second := filepath.Join(dir, "first.toml"), filepath.Join(dir, "second.toml")
+	if err := os.WriteFile(first, []byte("SendText = \"first\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte("SendText = \"second\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "config.toml")
+	makeConfigSymlink(t, "first.toml", link)
+	store, err := openStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	settings, path, file, err := store.LoadWithIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file.Close()
+	for _, value := range []string{"one", "two"} {
+		settings.SendText = value
+		file, err = store.SaveWithIdentity(path, settings)
+		if err != nil {
+			t.Fatal(err)
+		}
+		file.Close()
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	makeConfigSymlink(t, "second.toml", link)
+	file, err = store.SaveWithIdentity(path, settings)
+	if file != nil {
+		file.Close()
+	}
+	if err == nil {
+		t.Fatal("save accepted a changed link target")
+	}
+	data, err := os.ReadFile(second)
+	if err != nil || string(data) != "SendText = \"second\"\n" {
+		t.Fatalf("new target changed: %q, %v", data, err)
+	}
+}
+
+func TestStoreLockFailurePreservesConfig(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "windows" {
+		t.Skip("store unsupported")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	original := []byte("SendText = \"untouched\"\n")
+	if err := os.WriteFile(path, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, ".config.toml.lock"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := openStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	settings, _, file, err := store.LoadWithIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file.Close()
+	if settings.SendText != "untouched" {
+		t.Fatalf("loaded %q", settings.SendText)
+	}
+	file, err = store.SaveWithIdentity(path, defaults())
+	if file != nil {
+		file.Close()
+	}
+	if err == nil {
+		t.Fatal("save succeeded without the lock")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(data, original) {
+		t.Fatalf("configuration changed: %q, %v", data, err)
+	}
+}
+
+func TestStoreLockContentionIsBounded(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "windows" {
+		t.Skip("store unsupported")
+	}
+	dir := t.TempDir()
+	first, err := openStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := openStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	_, path, file, err := second.LoadWithIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file.Close()
+	unlock, err := lockStore(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	start := time.Now()
+	file, err = second.SaveWithIdentity(path, defaults())
+	if file != nil {
+		file.Close()
+	}
+	if err == nil || time.Since(start) > 5*time.Second {
+		t.Fatalf("contended save: err=%v elapsed=%v", err, time.Since(start))
+	}
+	if zh, en := i18n.ErrorText(err, false), i18n.ErrorText(err, true); !strings.Contains(zh, "超时") || !strings.Contains(en, "Timed out") {
+		t.Fatalf("lock timeout is not localized: zh=%q en=%q", zh, en)
+	}
+}
+
+func TestStoreConcurrentFirstLoad(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "windows" {
+		t.Skip("store unsupported")
+	}
+	for round := 0; round < 8; round++ {
+		dir := t.TempDir()
+		start := make(chan struct{})
+		errs := make(chan error, 8)
+		for i := 0; i < cap(errs); i++ {
+			go func() {
+				store, err := openStore(dir)
+				if err != nil {
+					errs <- err
+					return
+				}
+				<-start
+				_, path, file, err := store.LoadWithIdentity()
+				if file != nil {
+					file.Close()
+				}
+				if err == nil && path != filepath.Join(dir, "config.toml") {
+					err = errors.New("load returned an incorrect configuration path")
+				}
+				closeErr := store.Close()
+				if err == nil {
+					err = closeErr
+				}
+				errs <- err
+			}()
+		}
+		close(start)
+		var firstErr error
+		for i := 0; i < cap(errs); i++ {
+			err := <-errs
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+		if firstErr != nil {
+			t.Fatalf("round %d: simultaneous first load: %v", round, firstErr)
+		}
 	}
 }

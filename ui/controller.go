@@ -128,12 +128,36 @@ func (s *controller) bindWindowGeometry() {
 	s.window.OnMaximize(s.captureWindowGeometry)
 	s.window.OnUnmaximize(s.captureWindowGeometry)
 	s.window.OnRestore(s.captureWindowGeometry)
-	s.window.OnClose(func(*mygo.CloseEvent) {
-		// Capture the plot's final bounds before the native owner destroys it.
-		if s.curveWindow != nil {
-			s.curveWindow.Destroy()
+	s.window.OnClose(func(e *mygo.CloseEvent) {
+		s.confirmMainWindowClose(e, func() {
+			// Capture the plot's final bounds before the native owner destroys it.
+			if s.curveWindow != nil {
+				s.curveWindow.Destroy()
+			}
+		}, func() { s.window.Destroy() })
+		if e.DefaultPrevented() && s.curveWindow != nil {
+			if s.curveWindow.IsMinimized() {
+				s.curveWindow.Restore()
+			}
+			s.curveWindow.Focus()
+			s.curveWindow.Invalidate()
 		}
 	})
+}
+
+// The original close proceeds normally when no confirmation is necessary.
+// A confirmed discard destroys both windows without re-entering OnClose.
+func (s *controller) confirmMainWindowClose(e *mygo.CloseEvent, closeCurve, closeMain func()) {
+	if s.curveWindow != nil {
+		s.confirmSerialCurveClose(e, func() {
+			closeCurve()
+			closeMain()
+		})
+		if e.DefaultPrevented() {
+			return
+		}
+		closeCurve()
+	}
 }
 
 func (s *controller) captureWindowGeometry() {

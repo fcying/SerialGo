@@ -16,15 +16,28 @@ type settingsTestView struct{ callbacks chan func() }
 func (v *settingsTestView) Dispatch(fn func())            { v.callbacks <- fn }
 func (v *settingsTestView) AppendEvents([]internal.Event) {}
 
+// UI tests exercise real writes to their own temporary configuration paths.
+type settingsTestStore struct{}
+
+func (settingsTestStore) SaveWithIdentity(path string, settings config.Settings) (*os.File, error) {
+	return config.SaveWithIdentity(path, settings)
+}
+
+func (settingsTestStore) OutputIdentity() (os.FileInfo, os.FileInfo, string, error) {
+	return nil, nil, "", nil
+}
+
+func (settingsTestStore) Close() error { return nil }
+
 func settingsSaveFixture(t *testing.T, path string) (*controller, <-chan func()) {
 	t.Helper()
-	app := &internal.App{SettingsPath: path, Settings: config.Settings{
+	app := internal.NewAppWithSettingsStore(config.Settings{
 		Language: "en", DisplayBufferLimit: config.NormalizeDisplayBufferLimit(0),
 		ReceiveHexBytesPerLine: config.DefaultReceiveHexBytesPerLine,
 		ReceiveFont: config.DefaultReceiveFont, ReceiveFontSize: config.DefaultReceiveFontSize, ReceiveFontColor: config.DefaultReceiveFontColor,
 		CurveSidebarWidth: config.DefaultCurveSidebarWidth,
 		Presets:           []config.Preset{config.NewPreset()},
-	}}
+	}, path, settingsTestStore{})
 	s := newController(app)
 	view := &settingsTestView{callbacks: make(chan func(), 32)}
 	app.Startup(view)

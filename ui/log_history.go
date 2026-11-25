@@ -55,7 +55,7 @@ func (h *receiveHistory) append(event internal.Event) {
 	}
 	block := &h.blocks[len(h.blocks)-1]
 	header := uint64(len(event.Data)) << 1
-	if event.Sent {
+	if event.Sent || event.SessionEnd {
 		header |= 1
 	}
 	block.data = binary.AppendUvarint(block.data, header)
@@ -76,7 +76,7 @@ func (b *receiveHistoryBlock) pop() internal.Event {
 	start := n + m
 	end := start + int(header>>1)
 	b.at = b.at.Add(time.Duration(delta))
-	event := internal.Event{At: b.at, Data: b.data[start:end], Sent: header&1 != 0}
+	event := internal.Event{At: b.at, Data: b.data[start:end], Sent: header&1 != 0 && header>>1 != 0, SessionEnd: header == 1}
 	b.data = b.data[end:]
 	return event
 }
