@@ -101,9 +101,7 @@ func (s *curveColumnStroke) summary(first, a, b, last curvePixel) {
 	s.count = len(s.vertices) + 1
 }
 
-// Statistics-only frames reuse bounds, clipped paths and isolated sample dots.
-// Revision zero is an explicitly uncached snapshot, used before acquisition.
-func (v *curveViewState) prepareCurveGeometry(plot ui.Rect) {
+func (v *curveViewState) curveGeometryKey(plot ui.Rect) curveGeometryKey {
 	key := curveGeometryKey{
 		revision: v.snapshot.Revision, count: len(v.snapshot.Series), preview: v.previewing,
 		span: v.span, position: v.position, plot: plot,
@@ -111,12 +109,35 @@ func (v *curveViewState) prepareCurveGeometry(plot ui.Rect) {
 	if len(v.snapshot.Series) != 0 {
 		key.series = &v.snapshot.Series[0]
 	}
+	return key
+}
+
+// Layout depends on the data bounds, but not on the plot rectangle.
+func (v *curveViewState) curveLayoutBounds() (curveBounds, bool) {
+	key := v.curveGeometryKey(ui.Rect{})
+	cached := v.geometry.key
+	cached.plot = ui.Rect{}
+	if v.geometry.valid && key.revision != 0 && cached == key {
+		return v.geometry.bounds, v.geometry.hasData
+	}
+	return v.bounds()
+}
+
+// Statistics-only frames reuse bounds, clipped paths and isolated sample dots.
+// Revision zero is an explicitly uncached snapshot, used before acquisition.
+func (v *curveViewState) prepareCurveGeometry(plot ui.Rect) {
+	bounds, hasData := v.curveLayoutBounds()
+	v.prepareCurveGeometryWithBounds(plot, bounds, hasData)
+}
+
+func (v *curveViewState) prepareCurveGeometryWithBounds(plot ui.Rect, bounds curveBounds, hasData bool) {
+	key := v.curveGeometryKey(plot)
 	g := &v.geometry
 	if g.valid && key.revision != 0 && g.key == key {
 		return
 	}
 	g.key, g.valid, g.hoverValid = key, true, false
-	g.bounds, g.hasData = v.bounds()
+	g.bounds, g.hasData = bounds, hasData
 	if len(v.paths) < len(v.snapshot.Series) {
 		v.paths = slices.Grow(v.paths, len(v.snapshot.Series)-len(v.paths))
 		v.paths = v.paths[:len(v.snapshot.Series)]
@@ -125,15 +146,15 @@ func (v *curveViewState) prepareCurveGeometry(plot ui.Rect) {
 		g.dots = slices.Grow(g.dots, len(v.snapshot.Series)-len(g.dots))
 		g.dots = g.dots[:len(v.snapshot.Series)]
 	}
-	bounds := g.bounds
+	bounds = g.bounds
 	projectX := func(x float64) float32 {
-		return plot.X + float32((x-bounds.x0)/(bounds.x1-bounds.x0))*plot.W
+		return plot.X + float32(curveFraction(x, bounds.x0, bounds.x1))*plot.W
 	}
 	column := func(x float64) int { return int(projectX(x)) }
 	project := func(point internal.CurvePoint) curvePixel {
 		return curvePixel{
 			x: projectX(point.X),
-			y: plot.Y + plot.H - float32((point.Y-bounds.y0)/(bounds.y1-bounds.y0))*plot.H,
+			y: plot.Y + plot.H - float32(curveFraction(point.Y, bounds.y0, bounds.y1))*plot.H,
 		}
 	}
 	for i, series := range v.snapshot.Series {
@@ -158,7 +179,11 @@ func (v *curveViewState) prepareCurveGeometry(plot ui.Rect) {
 			a := project(start)
 			if start.X == end.X && start.Y == end.Y {
 				stroke.flush()
-				dot := ui.Rect{X: a.x - 2, Y: a.y - 2, W: 4, H: 4}
+				// Keep the full marker visible at the plot edges instead of
+				// clipping half of the newest or oldest isolated sample.
+				centerX := max(plot.X+2, min(a.x, plot.X+plot.W-2))
+				centerY := max(plot.Y+2, min(a.y, plot.Y+plot.H-2))
+				dot := ui.Rect{X: centerX - 2, Y: centerY - 2, W: 4, H: 4}
 				dots := g.dots[i]
 				if len(dots) == 0 || dots[len(dots)-1] != dot {
 					g.dots[i] = append(dots, dot)
@@ -201,11 +226,12 @@ func (v *curveViewState) prepareCurveHover(mouseX float32, x float64) {
 
 func closestCurvePoint(series internal.CurveSeries, x0, x1, x float64) int {
 	points := series.Points
-	closest, distance := -1, math.Inf(1)
+	closest, distance, halfDistance := -1, math.Inf(1), math.Inf(1)
 	consider := func(i int) {
 		d := math.Abs(points[i].X - x)
-		if d < distance {
-			closest, distance = i, d
+		half := math.Abs(points[i].X/2 - x/2)
+		if d < distance || (math.IsInf(d, 1) && math.IsInf(distance, 1) && (closest < 0 || half < halfDistance)) {
+			closest, distance, halfDistance = i, d, half
 		}
 	}
 	if len(series.TimeRuns) == 0 {

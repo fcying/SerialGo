@@ -75,8 +75,8 @@ func TestCurveReceiveWallClockTimestamps(t *testing.T) {
 	}
 	session := &Session{curve: newCurveWorker(app.curveReceiver())}
 	at := time.Unix(1700000000, 123987654)
-	session.receiveChunk([]byte("t=900000 VBAT=1000\nt=1 VBAT=2000\nVBAT="), at)
-	session.receiveChunk([]byte("3000\nVBAT=4000\n"), at.Add(1250*time.Millisecond))
+	session.receiveChunk([]byte("t=900000 VBAT=1000\nt=1 VBAT=2000\nVBAT="), at, session.curveReadState())
+	session.receiveChunk([]byte("3000\nVBAT=4000\n"), at.Add(1250*time.Millisecond), session.curveReadState())
 	close(session.curve.queue)
 	<-session.curve.done
 	var snapshot CurveSnapshot
@@ -155,11 +155,11 @@ func TestCurveSessionBoundariesAndLogIndependence(t *testing.T) {
 	oldReceive := testCurveReceiver(oldReceiver)
 	at := time.Unix(1700000000, 123987654)
 	app.session = &Session{curve: newCurveWorker(oldReceiver)}
-	app.session.receiveChunk([]byte("VBAT=1000\nVBAT="), at)
+	app.session.receiveChunk([]byte("VBAT=1000\nVBAT="), at, app.session.curveReadState())
 	app.session.enqueueDisplay(Event{Data: []byte(strings.Repeat("x", displayBufferSize))})
 	app.session.enqueueDisplay(Event{Data: []byte("evicts queued display")})
 	app.ClearReceiveLog()
-	app.session.receiveChunk([]byte("2000\n"), at.Add(time.Second))
+	app.session.receiveChunk([]byte("2000\n"), at.Add(time.Second), app.session.curveReadState())
 	app.session.emit(Event{Sent: true, Data: []byte("VBAT=9000\n")})
 	close(app.session.curve.queue)
 	<-app.session.curve.done

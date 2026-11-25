@@ -337,6 +337,9 @@ func TestCurveWorkerQueuedEpochCannotPolluteResetAcquisition(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			// Finish the read that began before the transition; its contents
+			// must not be attributed to the new curve.
+			h.send(t, "V=101\n")
 			h.release()
 			h.awaitProcessed(t, curveQueueLimit+1)
 			h.send(t, "V=4\n")
@@ -347,6 +350,123 @@ func TestCurveWorkerQueuedEpochCannotPolluteResetAcquisition(t *testing.T) {
 			points := snapshot.Series[0].Points
 			if !h.app.CurveRunning() || snapshot.Lines != 1 || snapshot.Matched != 1 || snapshot.DroppedBytes != 0 || snapshot.DroppedChunks != 0 || len(points) != 1 || points[0].Y != want || points[0].Break {
 				t.Fatalf("旧 epoch 的排队数据或丢弃统计污染新采集: %+v", snapshot)
+			}
+		})
+	}
+}
+
+func TestCurveWorkerBindsEpochBeforeOtherDelivery(t *testing.T) {
+	for _, transition := range []string{"clear", "schema", "restart", "start"} {
+		t.Run(transition, func(t *testing.T) {
+			profile := config.NewCurveProfile("worker")
+			profile.Channels = []config.CurveChannel{{Name: "value", Mode: "regex", Pattern: `^V=([0-9]+)$`, Scale: 1, Enabled: true}}
+			app := &App{Settings: config.Settings{CurveProfiles: []config.CurveProfile{profile}}}
+			if transition != "start" {
+				if err := app.StartCurve(0); err != nil {
+					t.Fatal(err)
+				}
+			}
+			capture := &captureWriter{queue: make([]byte, 128), wake: make(chan struct{}, 1)}
+			session := &Session{curve: newCurveWorker(app.curveReceiver()), capture: capture}
+			session.displayMu.Lock()
+			delivered := make(chan struct{})
+			go func() {
+				session.receiveChunk([]byte("V=99\n"), time.Unix(1, 0), session.curveReadState())
+				close(delivered)
+			}()
+			// Capture is dispatched before display; its wake proves that the
+			// batch has bound its curve state and is blocked on display delivery.
+			select {
+			case <-capture.wake:
+			case <-time.After(captureTestTimeout):
+				session.displayMu.Unlock()
+				<-delivered
+				close(session.curve.queue)
+				<-session.curve.done
+				t.Fatal("timed out waiting for capture delivery")
+			}
+			var err error
+			switch transition {
+			case "clear":
+				app.ClearCurve()
+			case "schema":
+				profiles := config.CloneCurveProfiles(app.Settings.CurveProfiles)
+				profiles[0].Channels[0].Scale = 2
+				err = app.ApplyCurveProfiles(profiles, 0)
+			case "restart":
+				app.StopCurve()
+				err = app.StartCurve(0)
+			case "start":
+				err = app.StartCurve(0)
+			}
+			session.displayMu.Unlock()
+			curveWorkerTestAwait(t, delivered)
+			if err != nil {
+				close(session.curve.queue)
+				<-session.curve.done
+				t.Fatal(err)
+			}
+			session.receiveChunk([]byte("V=4\n"), time.Unix(2, 0), session.curveReadState())
+			close(session.curve.queue)
+			<-session.curve.done
+			var snapshot CurveSnapshot
+			app.CurveSnapshot(&snapshot)
+			want := float64(4)
+			if transition == "schema" {
+				want = 8
+			}
+			points := snapshot.Series[0].Points
+			if snapshot.Lines != 1 || snapshot.Matched != 1 || len(points) != 1 || points[0].Y != want {
+				t.Fatalf("pre-transition batch entered the new acquisition: %+v", snapshot)
+			}
+		})
+	}
+}
+
+func TestCurveWorkerReadSpanningTransitionKeepsOldState(t *testing.T) {
+	for _, transition := range []string{"clear", "schema", "restart", "start"} {
+		t.Run(transition, func(t *testing.T) {
+			h := newCurveWorkerTestHarness(t)
+			if transition == "start" {
+				h.app.StopCurve()
+				// Complete the read started while enabled, then wait until a
+				// read has started with acquisition disabled.
+				h.send(t, "V=98\n")
+			}
+			want := float64(4)
+			switch transition {
+			case "clear":
+				h.app.ClearCurve()
+			case "schema":
+				profiles := config.CloneCurveProfiles(h.app.Settings.CurveProfiles)
+				profiles[0].Channels[0].Scale = 2
+				if err := h.app.ApplyCurveProfiles(profiles, 0); err != nil {
+					t.Fatal(err)
+				}
+				want = 8
+			case "restart":
+				h.app.StopCurve()
+				if err := h.app.StartCurve(0); err != nil {
+					t.Fatal(err)
+				}
+			case "start":
+				if err := h.app.StartCurve(0); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The excluded read ends mid-record; its suffix must also be
+			// discarded, including when it spans multiple subsequent reads.
+			h.send(t, "V=9")
+			h.send(t, "9")
+			h.send(t, "9\nV=4\n")
+			h.release()
+			curveWorkerTestFinishClose(t, h.startClose(t))
+			h.assertIO(t)
+			var snapshot CurveSnapshot
+			h.app.CurveSnapshot(&snapshot)
+			points := snapshot.Series[0].Points
+			if snapshot.Lines != 1 || snapshot.Matched != 1 || snapshot.DroppedBytes != 0 || snapshot.DroppedChunks != 0 || len(points) != 1 || points[0].Y != want {
+				t.Fatalf("read spanning transition entered the new acquisition: %+v", snapshot)
 			}
 		})
 	}

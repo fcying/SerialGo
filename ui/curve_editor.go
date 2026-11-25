@@ -254,8 +254,11 @@ func (s *controller) curveToolbar(c *ui.Context) {
 		pauseLabel := s.tr("暂停查看", "Pause view")
 		if v.paused {
 			pauseLabel = s.tr("实时跟随", "Follow live")
+			if !v.running {
+				pauseLabel = s.tr("查看最终快照", "View final snapshot")
+			}
 		}
-		ui.Button(c.Key("pause"), pauseLabel).Height(controlHeight).Padding(controlPadY, 6).Disabled(!v.running).OnClick(func() {
+		ui.Button(c.Key("pause"), pauseLabel).Height(controlHeight).Padding(controlPadY, 6).Disabled(!v.running && !v.paused).OnClick(func() {
 			v.paused = !v.paused
 			if !v.paused {
 				v.previewing = false

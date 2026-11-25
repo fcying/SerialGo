@@ -1,12 +1,15 @@
 package serialport
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 
+	"github.com/fcying/SerialGo/internal/i18n"
 	"golang.org/x/sys/unix"
 )
 
@@ -115,5 +118,41 @@ func TestLinuxEnumerationFiltersDeviceNodes(t *testing.T) {
 	_, err = listLinuxPorts(filepath.Join(directory, "absent"))
 	if !os.IsNotExist(err) {
 		t.Fatalf("missing device directory error was lost: %v", err)
+	}
+}
+
+func TestLinuxStopBitCombinations(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing-port")
+	for _, test := range []struct {
+		dataBits, stopBits string
+		rejected           bool
+	}{
+		{"5", "2", true},
+		{" 5 ", " 2 ", true},
+		{"5", "1.5", false},
+		{"5", "1", false},
+		{"6", "2", false},
+		{"7", "2", false},
+		{"8", "2", false},
+	} {
+		t.Run(test.dataBits+"/"+test.stopBits, func(t *testing.T) {
+			port, err := Open(Settings{Name: missing, Baud: "9600", DataBits: test.dataBits, Parity: "none", StopBits: test.stopBits})
+			if port != nil || err == nil {
+				t.Fatalf("Open() = %v, %v; want an error", port, err)
+			}
+			if !test.rejected {
+				if !strings.HasPrefix(err.Error(), "open serial port ") {
+					t.Fatalf("valid combination did not reach device open: %v", err)
+				}
+				return
+			}
+			wrapped := fmt.Errorf("context: %w", err)
+			if got, want := i18n.ErrorText(wrapped, false), "context: Linux 不支持 5 数据位和 2 停止位的组合；该设置可能产生 1.5 停止位"; got != want {
+				t.Errorf("Chinese error = %q, want %q", got, want)
+			}
+			if got, want := i18n.ErrorText(wrapped, true), "context: Linux does not support 5 data bits with 2 stop bits; this setting can produce 1.5 stop bits"; got != want {
+				t.Errorf("English error = %q, want %q", got, want)
+			}
+		})
 	}
 }

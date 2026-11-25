@@ -62,14 +62,11 @@ func TestCurvePerformance(t *testing.T) {
 			Name: name, Mode: "prefix", Pattern: name + "=", Scale: 1, Enabled: true,
 		})
 	}
-	app := &internal.App{
-		SettingsPath: filepath.Join(t.TempDir(), "config.toml"),
-		Settings: config.Settings{
-			Language:      "en",
-			CurveProfiles: []config.CurveProfile{profile},
-			Port:          serialport.Settings{Name: port, Baud: "921600", DataBits: "8", Parity: "None", StopBits: "1"},
-		},
-	}
+	app := internal.NewAppWithSettingsStore(config.Settings{
+		Language:      "en",
+		CurveProfiles: []config.CurveProfile{profile},
+		Port:          serialport.Settings{Name: port, Baud: "921600", DataBits: "8", Parity: "None", StopBits: "1"},
+	}, filepath.Join(t.TempDir(), "config.toml"), settingsTestStore{})
 	view := &curvePerfView{callbacks: make(chan func(), 32), closed: make(chan struct{})}
 	app.Startup(view)
 	t.Cleanup(func() {

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	serial "github.com/albenik/go-serial/v2"
+	"github.com/fcying/SerialGo/internal/i18n"
 )
 
 // Info describes an available UART. Description is optional display metadata;
@@ -92,6 +93,12 @@ func Open(s Settings) (*Port, error) {
 			stopBits = serial.TwoStopBits
 		}
 	case "2":
+		if runtime.GOOS == "linux" && dataBits == 5 {
+			return nil, i18n.NewError(
+				"Linux 不支持 5 数据位和 2 停止位的组合；该设置可能产生 1.5 停止位",
+				"Linux does not support 5 data bits with 2 stop bits; this setting can produce 1.5 stop bits",
+			)
+		}
 		stopBits = serial.TwoStopBits
 	default:
 		return nil, fmt.Errorf("invalid stop bits %q", s.StopBits)

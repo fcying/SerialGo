@@ -51,6 +51,12 @@ func (s *controller) openSerialCurve() {
 	})
 	s.curveWindow = w
 	done := make(chan struct{})
+	w.OnClose(func(e *mygo.CloseEvent) {
+		s.confirmSerialCurveClose(e, func() { w.Destroy() })
+		if e.DefaultPrevented() {
+			w.Invalidate()
+		}
+	})
 	w.OnClosed(func() {
 		close(done)
 		s.closeSerialCurve(w)
@@ -72,6 +78,16 @@ func (s *controller) openSerialCurve() {
 			}
 		}
 	}()
+}
+
+// confirmSerialCurveClose uses the same discard confirmation as profile switches.
+// Destroy bypasses OnClose after the user explicitly confirms discarding the draft.
+func (s *controller) confirmSerialCurveClose(e *mygo.CloseEvent, closeWindow func()) {
+	if s.curve == nil || !s.curve.dirty {
+		return
+	}
+	e.PreventDefault()
+	s.curveDiscardThen(closeWindow)
 }
 
 func (s *controller) closeSerialCurve(w *mygo.Window) {

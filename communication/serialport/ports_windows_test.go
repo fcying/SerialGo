@@ -1,6 +1,9 @@
 package serialport
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestPortDescription(t *testing.T) {
 	for _, test := range []struct {
@@ -19,5 +22,12 @@ func TestPortDescription(t *testing.T) {
 				t.Errorf("portDescription(%q, %q) = %q, want %q", test.name, test.description, got, test.want)
 			}
 		})
+	}
+}
+
+func TestWindowsFiveDataBitsTwoStopBitsReachesDeviceOpen(t *testing.T) {
+	port, err := Open(Settings{Name: `\\.\SerialGoMissingPort`, Baud: "9600", DataBits: "5", Parity: "none", StopBits: "2"})
+	if port != nil || err == nil || !strings.HasPrefix(err.Error(), "open serial port ") {
+		t.Fatalf("Open() = %v, %v; want a device-open error", port, err)
 	}
 }

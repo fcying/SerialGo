@@ -35,3 +35,30 @@ func TestSendFileRejectsFIFOWithoutBlocking(t *testing.T) {
 		t.Fatalf("sent %d bytes from FIFO, want none", len(sender.data))
 	}
 }
+
+func TestOutputOperationsRejectFIFOWithoutBlocking(t *testing.T) {
+	for _, capture := range []bool{false, true} {
+		path := filepath.Join(t.TempDir(), "stream")
+		if err := syscall.Mkfifo(path, 0600); err != nil {
+			t.Fatal(err)
+		}
+		view := &appTestView{callbacks: make(chan func(), 1)}
+		p := &Session{ctx: context.Background()}
+		s := &App{view: view, session: p}
+		if capture {
+			s.CaptureTarget()(path)
+		} else {
+			s.SaveLog(path, "data")
+		}
+		select {
+		case fn := <-view.callbacks:
+			fn()
+		case <-time.After(time.Second):
+			t.Fatalf("capture=%t: opening FIFO blocked", capture)
+		}
+		if !s.StatusError || s.FileBusy || s.CapturePath != "" {
+			t.Fatalf("capture=%t: FIFO was not rejected: status=%+v busy=%t path=%q", capture, s.Status, s.FileBusy, s.CapturePath)
+		}
+		s.jobs.Wait()
+	}
+}

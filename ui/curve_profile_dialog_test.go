@@ -405,25 +405,51 @@ func TestCurveProfileDialogChangesPreviewPointLimitAndPersists(t *testing.T) {
 	}
 }
 
-func TestCurveProfileDialogApplyFailureRetainsCorrectedCommonFields(t *testing.T) {
-	app := &internal.App{Settings: config.Settings{Language: "en", CurveProfiles: []config.CurveProfile{config.NewCurveProfile("firmware")}}}
-	s := newController(app)
-	s.curve = newCurveViewState(s.settings)
-	s.startCurve()
-	s.curve.draft.channels[0].offset = "incomplete"
-	s.curve.dirty = true
-	s.curve.error = localizedText{zh: "未完成的曲线输入", en: "Incomplete curve input"}
-	profiles := config.CloneCurveProfiles(s.settings.CurveProfiles)
-	revision := app.SettingsRevision
-	s.curve.profileEditor = newCurveProfileEdit(s.curve.draft)
-	e := s.curve.profileEditor
-	e.name = "renamed firmware"
-	s.confirmCurveProfileEditor()
-	if s.curve.profileEditor != e || e.error.en == "" || !s.curve.dirty || s.curve.error.en == "" || s.curve.draft.name != "renamed firmware" || s.curve.draft.channels[0].offset != "incomplete" {
-		t.Fatal("failed application discarded corrected common fields or unfinished channel input")
-	}
-	if app.SettingsDirty || app.SettingsRevision != revision || !reflect.DeepEqual(profiles, s.settings.CurveProfiles) || !s.curve.running {
-		t.Fatal("failed application changed the saved or active configuration")
+func TestCurveProfileDialogApplyFailureDoesNotChangeDraft(t *testing.T) {
+	for _, action := range []string{"cancel", "retry"} {
+		for _, dirty := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s_dirty_%t", action, dirty), func(t *testing.T) {
+				app := &internal.App{Settings: config.Settings{Language: "en", CurveProfiles: []config.CurveProfile{config.NewCurveProfile("firmware")}}}
+				s := newController(app)
+				s.curve = newCurveViewState(s.settings)
+				s.startCurve()
+				s.curve.draft.channels[0].offset = "incomplete"
+				s.curve.dirty = dirty
+				before := s.curve.draft
+				before.channels = append([]curveChannelDraft(nil), before.channels...)
+				profiles := config.CloneCurveProfiles(s.settings.CurveProfiles)
+				revision := app.SettingsRevision
+				s.curve.profileEditor = newCurveProfileEdit(s.curve.draft)
+				e := s.curve.profileEditor
+				e.name = "renamed firmware"
+				e.timePattern = `t=(\d+)`
+				e.timeScale = "0.01"
+				e.pointLimit = "100"
+				s.confirmCurveProfileEditor()
+				if s.curve.profileEditor != e || e.error.en == "" || s.curve.dirty != dirty || !reflect.DeepEqual(s.curve.draft, before) {
+					t.Fatal("failed application changed the draft or discarded the editor error")
+				}
+				if app.SettingsDirty || app.SettingsRevision != revision || !reflect.DeepEqual(profiles, s.settings.CurveProfiles) || !s.curve.running {
+					t.Fatal("failed application changed the saved or active configuration")
+				}
+				if action == "cancel" {
+					s.closeCurveProfileEditor()
+					if s.curve.profileEditor != nil || s.curve.dirty != dirty || !reflect.DeepEqual(s.curve.draft, before) {
+						t.Fatal("cancel after failure changed the underlying draft")
+					}
+					return
+				}
+				s.confirmCurveProfileEditor()
+				if s.curve.profileEditor != e || e.error.en == "" || s.curve.dirty != dirty || !reflect.DeepEqual(s.curve.draft, before) || app.SettingsRevision != revision {
+					t.Fatal("retry closed the editor or changed the draft without applying it")
+				}
+				s.curve.draft.channels[0].offset = "0"
+				s.confirmCurveProfileEditor()
+				if s.curve.profileEditor != nil || s.curve.dirty || s.settings.CurveProfiles[0].Name != e.name || s.settings.CurveProfiles[0].TimePattern != e.timePattern || s.settings.CurveProfiles[0].TimeScale != 0.01 || s.settings.CurveProfiles[0].PointLimit != 100 {
+					t.Fatal("retry after correcting the channel did not apply the editor fields")
+				}
+			})
+		}
 	}
 }
 

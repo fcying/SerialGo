@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -46,6 +47,9 @@ type FileSendProgress struct {
 type captureTarget struct {
 	path   string
 	opened <-chan struct{}
+	info   os.FileInfo
+	file   interface{ Stat() (os.FileInfo, error) }
+	state  atomic.Uint32 // 0: pending, 1: truncation committed, 2: canceled
 }
 
 type terminalError struct {
@@ -53,8 +57,11 @@ type terminalError struct {
 }
 
 type sendResult struct {
-	done chan struct{}
-	err  error
+	done    chan struct{}
+	err     error
+	label   Text
+	file    bool
+	failure *terminalError
 }
 
 // App owns serial operations, operation state and persisted preferences.
@@ -88,14 +95,23 @@ type App struct {
 	pendingPortMu          sync.Mutex
 	pendingPort            *serialport.Port
 	captureMu              sync.Mutex
+	fileIOMu               sync.Mutex
 	captureTargets         map[*Session]*captureTarget
 	terminalMu             sync.Mutex
 	terminalErrors         map[*terminalError]struct{}
+	protectedSettingsPath  string
+	initialSettingsFile    *os.File
+	savedSettingsFile      *os.File
+	settingsStore          SettingsStore
+	settingsStoreError     error
+	settingsPathError      error
 	saver                  *settingsSaver
 	settingsSaveError      bool
 	cancelSend             context.CancelFunc
 	sendDone               *sendResult
 	sendingFilePath        string
+	sendingFileInfo        os.FileInfo
+	sendOpenDone           <-chan struct{}
 	fileProgressUpdatedAt  time.Time
 	fileProgressGeneration uint64
 	loadErrorReported      bool
@@ -104,9 +120,55 @@ type App struct {
 }
 
 func NewApp() *App {
-	settings, path, err := config.Load()
+	return newAppWithStore(config.OpenExecutableStore())
+}
+
+// NewAppWithSettingsStore constructs an app from already-loaded settings and an
+// explicitly supplied store. The caller is responsible for its path policy.
+// Shutdown closes the store after all pending settings writes have completed.
+func NewAppWithSettingsStore(settings config.Settings, path string, store SettingsStore) *App {
+	return &App{Settings: settings, SettingsPath: path, protectedSettingsPath: path, settingsStore: store}
+}
+
+func newAppWithStore(store *config.Store, err error) *App {
+	if err != nil {
+		s := newAppFromIdentity(config.DefaultSettings(), "", err, os.Executable, nil, true)
+		s.settingsStoreError = err
+		s.settingsPathError = err
+		return s
+	}
+	settings, path, file, err := store.LoadWithIdentity()
+	s := newAppFromIdentity(settings, path, err, os.Executable, file, true)
+	s.settingsStore = store
+	return s
+}
+
+func newAppFromLoad(settings config.Settings, path string, loadErr error, executable func() (string, error)) *App {
+	return newAppFromIdentity(settings, path, loadErr, executable, nil, false)
+}
+
+func newAppFromIdentity(settings config.Settings, path string, loadErr error, executable func() (string, error), file *os.File, trusted bool) *App {
+	protectedPath := path
+	var pathErr error
+	if protectedPath == "" {
+		var exe string
+		exe, pathErr = executable()
+		if pathErr == nil {
+			exe, pathErr = filepath.EvalSymlinks(exe)
+		}
+		if pathErr == nil {
+			protectedPath = filepath.Join(filepath.Dir(exe), "config.toml")
+		}
+	}
 	warning := normalizeStartupSettings(&settings)
-	s := &App{Settings: settings, SettingsPath: path, LoadError: err, settingsWarning: warning}
+	s := &App{Settings: settings, SettingsPath: path, LoadError: loadErr, settingsWarning: warning, protectedSettingsPath: protectedPath, settingsPathError: pathErr}
+	s.initialSettingsFile = file
+	if !trusted && pathErr == nil && protectedPath != "" {
+		s.initialSettingsFile, pathErr = os.Open(protectedPath)
+		if pathErr != nil && !errors.Is(pathErr, os.ErrNotExist) {
+			s.settingsPathError = pathErr
+		}
+	}
 	initialPort, initialRates := settings.Port, settings.BaudRates
 	s.InitializeBaudRates()
 	if s.Settings.Port != initialPort || !slices.Equal(s.Settings.BaudRates, initialRates) {
@@ -154,6 +216,11 @@ func (s *App) Shutdown() error {
 	var shutdownErr error
 	if s.session != nil {
 		p := s.session
+		target := s.protectCapture(p, s.CapturePath, nil)
+		target.cancel()
+		if target != nil && target.opened != nil {
+			<-target.opened
+		}
 		s.session = nil
 		close(s.stopPump)
 		shutdownErr = errors.Join(shutdownErr, p.Close())
@@ -179,7 +246,20 @@ func (s *App) Shutdown() error {
 	if pendingPort != nil {
 		_ = pendingPort.Close()
 	}
-	return errors.Join(shutdownErr, s.FlushSettings())
+	shutdownErr = errors.Join(shutdownErr, s.FlushSettings())
+	if s.initialSettingsFile != nil {
+		shutdownErr = errors.Join(shutdownErr, s.initialSettingsFile.Close())
+		s.initialSettingsFile = nil
+	}
+	if s.savedSettingsFile != nil {
+		shutdownErr = errors.Join(shutdownErr, s.savedSettingsFile.Close())
+		s.savedSettingsFile = nil
+	}
+	if s.settingsStore != nil {
+		shutdownErr = errors.Join(shutdownErr, s.settingsStore.Close())
+		s.settingsStore = nil
+	}
+	return shutdownErr
 }
 
 func (s *App) retainTerminalError(err error) *terminalError {
@@ -202,6 +282,21 @@ func (s *App) acknowledgeTerminalError(result *terminalError) {
 	s.terminalMu.Unlock()
 }
 
+// Remove cancellation without discarding independent errors joined with it.
+func captureOpenError(err error) error {
+	if err == context.Canceled {
+		return nil
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		var result error
+		for _, part := range joined.Unwrap() {
+			result = errors.Join(result, captureOpenError(part))
+		}
+		return result
+	}
+	return err
+}
+
 // Capture reservations outlive CapturePath and are released only after the file
 // worker has closed. A new open gets its own token so stale completions cannot
 // release a later capture's destination.
@@ -211,12 +306,24 @@ func (s *App) protectCapture(p *Session, path string, opened <-chan struct{}) *c
 	target := s.captureTargets[p]
 	if opened != nil || target == nil && path != "" {
 		target = &captureTarget{path: path, opened: opened}
+		p.captureMu.Lock()
+		if p.captureWorker != nil {
+			target.file, _ = p.captureWorker.file.(interface{ Stat() (os.FileInfo, error) })
+		}
+		p.captureMu.Unlock()
 		if s.captureTargets == nil {
 			s.captureTargets = make(map[*Session]*captureTarget)
 		}
 		s.captureTargets[p] = target
 	}
 	return target
+}
+
+func (t *captureTarget) cancel() {
+	if t == nil {
+		return
+	}
+	t.state.CompareAndSwap(0, 2)
 }
 
 // Failure events can outlive a stopped capture and must not clear a replacement.
@@ -274,10 +381,16 @@ func (s *App) dispatch(fn func()) {
 }
 
 func (s *App) Fail(zh, en string, err error) {
-	s.settingsSaveError = false
-	s.Status = Text{
+	operation := Text{
 		ZH: zh + ": " + i18n.ErrorText(err, false),
 		EN: en + ": " + i18n.ErrorText(err, true),
+	}
+	if s.settingsSaveError && s.saver != nil {
+		s.saver.previousError = operation
+		s.saver.hadPreviousError = true
+		s.Status = Text{ZH: s.saver.saveError.ZH + "; " + operation.ZH, EN: s.saver.saveError.EN + "; " + operation.EN}
+	} else {
+		s.Status = operation
 	}
 	s.StatusError = true
 }
@@ -287,6 +400,30 @@ func (s *App) Note(zh, en string) {
 		return
 	}
 	s.Status, s.StatusError = Text{ZH: zh, EN: en}, false
+}
+
+// Preserve both the visible status and the operation error underneath a pending
+// settings-save failure, so a later successful save cannot erase this failure.
+func (s *App) appendOperationError(zh, en string, err error) {
+	previous := s.Status
+	if s.settingsSaveError && s.saver != nil {
+		previous = Text{}
+		if s.saver.hadPreviousError {
+			previous = s.saver.previousError
+		}
+	}
+	operation := Text{ZH: zh + ": " + i18n.ErrorText(err, false), EN: en + ": " + i18n.ErrorText(err, true)}
+	if previous.ZH != "" || previous.EN != "" {
+		operation = Text{ZH: previous.ZH + "; " + operation.ZH, EN: previous.EN + "; " + operation.EN}
+	}
+	if s.settingsSaveError && s.saver != nil {
+		s.saver.previousError = operation
+		s.saver.hadPreviousError = true
+		s.Status = Text{ZH: s.saver.saveError.ZH + "; " + operation.ZH, EN: s.saver.saveError.EN + "; " + operation.EN}
+	} else {
+		s.Status = operation
+	}
+	s.StatusError = true
 }
 
 func (s *App) showSettingsWarning() {
@@ -412,7 +549,7 @@ func (s *App) drain(p *Session) {
 			current := s.failedCaptureIsCurrent(p, event.capture)
 			captureStopped = captureStopped || current
 		} else {
-			readErr = event.Err
+			readErr = errors.Join(readErr, event.Err)
 		}
 	}
 	if captureErr != nil {
@@ -420,14 +557,16 @@ func (s *App) drain(p *Session) {
 			s.releaseCapture(p, s.protectCapture(p, "", nil))
 			s.CapturePath = ""
 		}
-		s.Fail("已停止接收存文件", "Receive-to-file stopped", captureErr)
+		if readErr == nil {
+			s.Fail("已停止接收存文件", "Receive-to-file stopped", captureErr)
+		}
 		for _, worker := range captureWorkers {
 			p.acknowledgeCaptureError(worker)
 		}
 	}
 	if readErr != nil {
-		s.disconnect(readErr)
-		s.Fail("串口已断开", "Serial port disconnected", readErr)
+		s.disconnect(errors.Join(readErr, captureErr))
+		s.Fail("串口已断开", "Serial port disconnected", errors.Join(readErr, captureErr))
 	}
 }
 
@@ -457,11 +596,14 @@ func (s *App) startSending(label Text, filePath string, send func(context.Contex
 	}
 	p := s.session
 	ctx, cancel := context.WithCancel(context.Background())
-	done := &sendResult{done: make(chan struct{})}
+	done := &sendResult{done: make(chan struct{}), label: label, file: filePath != ""}
 	s.sendDone = done
 	s.cancelSend = cancel
 	if filePath != "" {
 		s.sendingFilePath = filePath
+		s.captureMu.Lock()
+		s.sendingFileInfo = nil
+		s.captureMu.Unlock()
 		s.FileProgress = FileSendProgress{
 			Name:    filepath.Base(filePath),
 			Status:  Text{ZH: "发送中", EN: "Sending"},
@@ -477,6 +619,9 @@ func (s *App) startSending(label Text, filePath string, send func(context.Contex
 	go func() {
 		defer s.jobs.Done()
 		done.err = send(ctx, p)
+		if done.err != nil && !errors.Is(done.err, context.Canceled) {
+			done.failure = s.retainTerminalError(i18n.WrapError(label.ZH+"失败", label.EN+" failed", done.err))
+		}
 		cancel()
 		close(done.done)
 		s.dispatch(func() {
@@ -501,6 +646,7 @@ func (s *App) startSending(label Text, filePath string, send func(context.Contex
 				}
 			case err != nil:
 				s.Fail(label.ZH+"失败", label.EN+" failed", err)
+				s.acknowledgeTerminalError(done.failure)
 				if filePath != "" {
 					s.finishFileSendProgress(p, true, s.Status, true)
 				}
@@ -650,9 +796,29 @@ func (s *App) SendFile() {
 		return
 	}
 	s.fileProgressGeneration++
+	opened := make(chan struct{})
+	s.sendOpenDone = opened
 	progressGeneration := s.fileProgressGeneration
 	s.startSending(Text{ZH: "发送文件", EN: "File send"}, path, func(ctx context.Context, p *Session) error {
-		return sendFileWithProgress(ctx, path, delay, p, func(total int64) {
+		s.fileIOMu.Lock()
+		file, err := os.OpenFile(path, os.O_RDONLY|outputNonblock, 0)
+		if err == nil {
+			var info os.FileInfo
+			info, err = file.Stat()
+			s.captureMu.Lock()
+			s.sendingFileInfo = info
+			s.captureMu.Unlock()
+		}
+		s.fileIOMu.Unlock()
+		close(opened)
+		if err != nil {
+			if file != nil {
+				_ = file.Close()
+			}
+			return err
+		}
+		defer file.Close()
+		return sendOpenedFileWithProgress(ctx, file, delay, p, func(total int64) {
 			s.dispatch(func() {
 				if s.fileProgressGeneration != progressGeneration || !s.FileProgress.Active {
 					return
@@ -684,7 +850,7 @@ func (s *App) applyPortRefresh(ports []serialport.Info, err error) {
 	s.loadErrorReported = true
 	if err != nil {
 		if reportLoadError {
-			s.Fail("读取参数失败", "Failed to load settings", s.LoadError)
+			s.Fail("读取参数及刷新串口失败", "Failed to load settings and refresh serial ports", errors.Join(s.LoadError, err))
 		} else {
 			s.Fail("刷新串口失败", "Failed to refresh serial ports", err)
 		}
@@ -755,6 +921,7 @@ func (s *App) disconnect(readErr error) {
 		return
 	}
 	target := s.protectCapture(p, s.CapturePath, nil)
+	target.cancel()
 	sendDone := s.sendDone
 	if s.closingSessions == nil {
 		s.closingSessions = make(map[*Session]struct{})
@@ -771,18 +938,25 @@ func (s *App) disconnect(readErr error) {
 	s.jobs.Add(1)
 	go func() {
 		defer s.jobs.Done()
-		err := p.Close()
-		s.curveDisconnected()
 		if target != nil && target.opened != nil {
 			<-target.opened
 		}
+		err := p.Close()
+		s.curveDisconnected()
 		if sendDone != nil {
 			<-sendDone.done
+		}
+		var sendFailure *terminalError
+		if sendDone != nil {
+			sendFailure = sendDone.failure
 		}
 		s.releaseCapture(p, target)
 		result := s.retainTerminalError(err)
 		s.dispatch(func() {
 			s.deliverDisplay(p)
+			if s.view != nil {
+				s.view.AppendEvents([]Event{{SessionEnd: true}})
+			}
 			delete(s.closingSessions, p)
 			if s.session != nil {
 				return
@@ -809,7 +983,28 @@ func (s *App) disconnect(readErr error) {
 			}
 			s.sendingFilePath = ""
 			s.PortBusy = false
+			if sendFailure != nil {
+				failure := sendFailure.err
+				if readErr != nil {
+					failure = errors.Join(failure, i18n.WrapError("串口已断开", "Serial port disconnected", readErr))
+				}
+				if err != nil {
+					failure = errors.Join(failure, i18n.WrapError("关闭串口失败", "Failed to close serial port", err))
+					s.acknowledgeTerminalError(result)
+				}
+				if s.Status != status || s.StatusError != statusError {
+					s.appendOperationError("发送失败", "Send failed", failure)
+				} else {
+					s.Fail("发送失败", "Send failed", failure)
+				}
+				s.acknowledgeTerminalError(sendFailure)
+				return
+			}
 			if s.Status != status || s.StatusError != statusError {
+				if err != nil {
+					s.appendOperationError("关闭串口失败", "Failed to close serial port", err)
+					s.acknowledgeTerminalError(result)
+				}
 				return
 			}
 			if err != nil {
@@ -834,57 +1029,267 @@ func (s *App) SaveLog(path, text string) {
 	if s.FileBusy || s.closing {
 		return
 	}
-	capturePaths := s.capturePaths()
 	sendPath := s.sendingFilePath
+	capturePath := s.CapturePath
+	sendOpened := s.sendOpenDone
 	snapshot := s.usedSettingsSnapshot()
 	s.FileBusy = true
 	s.jobs.Add(1)
 	go func() {
 		defer s.jobs.Done()
-		sameCapture := slices.ContainsFunc(capturePaths, func(other string) bool { return sameFilePath(path, other) })
-		sameSendSource := sendPath != "" && sameFilePath(path, sendPath)
-		var err error
-		if !sameCapture && !sameSendSource {
-			var file *os.File
-			file, err = os.Create(path)
-			if err == nil {
-				_, err = io.WriteString(file, text)
-				err = errors.Join(err, file.Close())
-			}
+		if sendPath != "" && sendOpened != nil {
+			<-sendOpened
 		}
-		s.dispatch(func() {
-			s.FileBusy = false
-			if sameSendSource {
-				s.Note("请勿覆盖正在发送的文件", "Do not overwrite the file currently being sent")
-				return
-			}
-			if sameCapture {
-				s.Note("请勿覆盖正在接收的文件", "Do not overwrite the active receive file")
-				return
-			}
-			if err != nil {
-				s.Fail("保存显示数据失败", "Failed to save displayed data", err)
-			} else {
-				s.Note("显示数据已保存", "Displayed data saved")
-				s.saveUsedSnapshot(snapshot)
-			}
-		})
+		file, sameSendSource, sameCapture, err := s.createProtectedOutput(path, sendPath, capturePath, nil)
+		if err == nil && file != nil {
+			err = writeAndCloseLog(file, text)
+		}
+		s.completeLogSave(err, sameSendSource, sameCapture, snapshot)
 	}()
 }
 
-func sameFilePath(path, other string) bool {
-	if path == other && path != "" {
-		return true
-	}
-	pathInfo, err := os.Stat(path)
+func (s *App) completeLogSave(err error, sameSendSource, sameCapture bool, snapshot *settingsSnapshot) {
+	var result *terminalError
 	if err != nil {
-		return false
+		result = s.retainTerminalError(i18n.WrapError("保存显示数据失败", "Failed to save displayed data", err))
 	}
-	otherInfo, err := os.Stat(other)
+	s.dispatch(func() {
+		s.FileBusy = false
+		if err != nil {
+			s.Fail("保存显示数据失败", "Failed to save displayed data", err)
+			s.acknowledgeTerminalError(result)
+			return
+		}
+		if sameSendSource {
+			s.Note("请勿覆盖正在发送的文件", "Do not overwrite the file currently being sent")
+			return
+		}
+		if sameCapture {
+			s.Note("请勿覆盖正在接收的文件", "Do not overwrite the active receive file")
+			return
+		}
+		s.Note("显示数据已保存", "Displayed data saved")
+		s.saveUsedSnapshot(snapshot)
+	})
+}
+
+func writeAndCloseLog(file io.WriteCloser, text string) error {
+	_, err := io.WriteString(file, text)
+	return errors.Join(err, file.Close())
+}
+
+// fileIOMu must be held. Retain the actual save descriptor, so an external
+// replacement cannot hide its identity or allow its inode to be reused.
+func (s *App) rememberSavedSettings(file *os.File) {
+	if s.savedSettingsFile != nil {
+		_ = s.savedSettingsFile.Close()
+	}
+	s.savedSettingsFile = file
+}
+
+// The mutex serializes source opening and destination validation/truncation.
+// Comparisons use the opened descriptors, not paths that can be replaced.
+func (s *App) createProtectedOutput(path, sendPath, capturePath string, own *captureTarget) (*os.File, bool, bool, error) {
+	s.fileIOMu.Lock()
+	defer s.fileIOMu.Unlock()
+	if own != nil && own.state.Load() == 2 {
+		return nil, false, false, context.Canceled
+	}
+	if s.settingsPathError != nil {
+		return nil, false, false, s.settingsPathError
+	}
+	settingsPath := s.protectedSettingsPath
+	if settingsPath == "" {
+		settingsPath = s.SettingsPath
+	}
+	var settingsDir, currentSettings os.FileInfo
+	var settingsName string
+	if s.settingsStore != nil {
+		var identityErr error
+		settingsDir, currentSettings, settingsName, identityErr = s.settingsStore.OutputIdentity()
+		if identityErr != nil {
+			return nil, false, false, identityErr
+		}
+		if settingsDir != nil {
+			settingsPath = ""
+		}
+	}
+	outputPath, err := resolvedOutputPath(path)
 	if err != nil {
-		return false
+		return nil, false, false, err
 	}
-	return os.SameFile(pathInfo, otherInfo)
+	configPath := ""
+	if settingsPath != "" {
+		configPath, err = resolvedOutputPath(settingsPath)
+		if err != nil {
+			return nil, false, false, err
+		}
+		if sameOutputName(outputPath, configPath) {
+			return nil, false, false, i18n.NewError("不能覆盖配置文件", "Cannot overwrite the configuration file")
+		}
+	}
+	// Never create through the supplied path: a dangling link could be changed
+	// after validation to point at a missing configuration file.
+	file, err := os.OpenFile(path, os.O_WRONLY|outputNonblock, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		parent, openErr := os.OpenRoot(filepath.Dir(outputPath))
+		if openErr != nil {
+			return nil, false, false, openErr
+		}
+		defer parent.Close()
+		if settingsDir != nil && (sameOutputName(filepath.Base(outputPath), "config.toml") || sameOutputName(filepath.Base(outputPath), settingsName)) {
+			outputDir, statErr := parent.Stat(".")
+			if statErr != nil {
+				return nil, false, false, statErr
+			}
+			if os.SameFile(outputDir, settingsDir) {
+				return nil, false, false, i18n.NewError("不能覆盖配置文件", "Cannot overwrite the configuration file")
+			}
+		}
+		if configPath != "" && sameOutputName(filepath.Base(outputPath), filepath.Base(configPath)) {
+			outputDir, outputErr := parent.Stat(".")
+			configDir, configErr := os.Stat(filepath.Dir(configPath))
+			if outputErr != nil || configErr != nil {
+				return nil, false, false, errors.Join(outputErr, configErr)
+			}
+			if os.SameFile(outputDir, configDir) {
+				return nil, false, false, i18n.NewError("不能覆盖配置文件", "Cannot overwrite the configuration file")
+			}
+		}
+		file, err = parent.OpenFile(filepath.Base(outputPath), os.O_WRONLY|os.O_CREATE|os.O_EXCL|outputNonblock, 0666)
+	}
+	if err != nil {
+		return nil, false, false, err
+	}
+	info, err := file.Stat()
+	if err == nil && !info.Mode().IsRegular() {
+		err = i18n.NewError("输出文件必须是普通文件", "Output file must be a regular file")
+	}
+	sameSend, sameCapture := false, false
+	s.captureMu.Lock()
+	source := s.sendingFileInfo
+	type captureSnapshot struct {
+		path string
+		info os.FileInfo
+		file interface{ Stat() (os.FileInfo, error) }
+	}
+	targets := make([]captureSnapshot, 0, len(s.captureTargets))
+	for _, target := range s.captureTargets {
+		if target != own {
+			targets = append(targets, captureSnapshot{target.path, target.info, target.file})
+		}
+	}
+	s.captureMu.Unlock()
+	if err == nil {
+		if settingsDir != nil {
+			_, currentSettings, _, err = s.settingsStore.OutputIdentity()
+		}
+		if currentSettings != nil && os.SameFile(info, currentSettings) {
+			err = i18n.NewError("不能覆盖配置文件", "Cannot overwrite the configuration file")
+		}
+		if settingsPath != "" {
+			settings, statErr := os.Stat(settingsPath)
+			if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+				err = statErr
+			} else if settings != nil && os.SameFile(info, settings) {
+				err = i18n.NewError("不能覆盖配置文件", "Cannot overwrite the configuration file")
+			}
+		}
+		for _, protected := range []*os.File{s.initialSettingsFile, s.savedSettingsFile} {
+			if err != nil || protected == nil {
+				continue
+			}
+			settings, statErr := protected.Stat()
+			if statErr != nil {
+				err = statErr
+			} else if os.SameFile(info, settings) {
+				err = i18n.NewError("不能覆盖配置文件", "Cannot overwrite the configuration file")
+			}
+		}
+		if sendPath != "" {
+			// A custom startSending callback may not register an open descriptor.
+			if source == nil {
+				source, _ = os.Stat(sendPath)
+			}
+			sameSend = source != nil && os.SameFile(info, source)
+		}
+		if capturePath != "" && len(targets) == 0 && own == nil {
+			capture, _ := os.Stat(capturePath)
+			sameCapture = capture != nil && os.SameFile(info, capture)
+		}
+		for _, target := range targets {
+			capture := target.info
+			if capture == nil && target.file != nil {
+				capture, _ = target.file.Stat()
+			}
+			if capture == nil {
+				capture, _ = os.Stat(target.path)
+			}
+			if capture != nil && os.SameFile(info, capture) {
+				sameCapture = true
+				break
+			}
+		}
+		if err == nil && !sameSend && !sameCapture {
+			if own != nil && !own.state.CompareAndSwap(0, 1) {
+				err = context.Canceled
+			}
+			if err == nil {
+				err = file.Truncate(0)
+			}
+			if err == nil && own != nil {
+				s.captureMu.Lock()
+				own.info = info
+				s.captureMu.Unlock()
+			}
+		}
+	}
+	if err != nil || sameSend || sameCapture {
+		return nil, sameSend, sameCapture, errors.Join(err, file.Close())
+	}
+	return file, false, false, nil
+}
+
+// Resolve symlinked parents and dangling final symlinks without creating them.
+func resolvedOutputPath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	for range 255 {
+		parent, err := filepath.EvalSymlinks(filepath.Dir(abs))
+		if err != nil {
+			return "", err
+		}
+		abs = filepath.Join(parent, filepath.Base(abs))
+		info, err := os.Lstat(abs)
+		if errors.Is(err, os.ErrNotExist) {
+			return abs, nil
+		}
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			return abs, nil
+		}
+		target, err := os.Readlink(abs)
+		if err != nil {
+			return "", err
+		}
+		if filepath.IsAbs(target) {
+			abs = target
+		} else {
+			abs = filepath.Join(parent, target)
+		}
+	}
+	return "", errors.New("too many output symlinks")
+}
+
+func sameOutputName(a, b string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
 }
 
 // startCapture ignores stale native-dialog results from an earlier connection.
@@ -894,6 +1299,7 @@ func (s *App) startCapture(path string, connection *Session) {
 	}
 	snapshot := s.usedSettingsSnapshot()
 	sendPath := s.sendingFilePath
+	sendOpened := s.sendOpenDone
 	s.FileBusy = true
 	// Reserve the path while its file is being opened, so display saving
 	// cannot truncate the capture before the completion callback runs.
@@ -903,25 +1309,35 @@ func (s *App) startCapture(path string, connection *Session) {
 	s.jobs.Add(1)
 	go func() {
 		defer s.jobs.Done()
-		sameSendSource := sendPath != "" && sameFilePath(path, sendPath)
-		var file *os.File
-		var err error
-		if !sameSendSource {
-			file, err = os.Create(path)
-			if err == nil {
-				err = connection.SetCapture(file)
-				if err != nil {
-					err = errors.Join(err, file.Close())
-				}
+		if sendPath != "" && sendOpened != nil {
+			<-sendOpened
+		}
+		file, sameSendSource, sameCapture, err := s.createProtectedOutput(path, sendPath, "", target)
+		if err == nil && file != nil {
+			err = connection.SetCapture(file)
+			if err != nil {
+				err = errors.Join(err, file.Close())
 			}
 		}
-		if sameSendSource || err != nil {
+		if sameSendSource || sameCapture || err != nil {
 			s.releaseCapture(connection, target)
 		}
+		err = captureOpenError(err)
+		result := s.retainTerminalError(err)
 		close(opened)
 		s.dispatch(func() {
 			s.FileBusy = false
 			if s.session != connection {
+				if result != nil {
+					s.appendOperationError("打开接收文件失败", "Failed to open receive file", err)
+					s.acknowledgeTerminalError(result)
+				}
+				return
+			}
+			if err != nil {
+				s.CapturePath = ""
+				s.appendOperationError("打开接收文件失败", "Failed to open receive file", err)
+				s.acknowledgeTerminalError(result)
 				return
 			}
 			if sameSendSource {
@@ -929,9 +1345,13 @@ func (s *App) startCapture(path string, connection *Session) {
 				s.Note("请勿覆盖正在发送的文件", "Do not overwrite the file currently being sent")
 				return
 			}
-			if err != nil {
+			if sameCapture {
 				s.CapturePath = ""
-				s.Fail("打开接收文件失败", "Failed to open receive file", err)
+				s.Note("请勿覆盖正在接收的文件", "Do not overwrite the active receive file")
+				return
+			}
+			if target.state.Load() == 2 {
+				s.CapturePath = ""
 			} else {
 				connection.captureMu.Lock()
 				active := connection.capture != nil
@@ -968,6 +1388,10 @@ func (s *App) StopCapture() {
 		s.dispatch(func() {
 			s.FileBusy = false
 			if s.session != p {
+				if err != nil {
+					s.appendOperationError("关闭接收文件失败", "Failed to close receive file", err)
+					s.acknowledgeTerminalError(result)
+				}
 				return
 			}
 			s.CapturePath = ""

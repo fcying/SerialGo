@@ -21,6 +21,68 @@ func finiteCurvePoint(point internal.CurvePoint) bool {
 	return !math.IsNaN(point.X) && !math.IsInf(point.X, 0) && !math.IsNaN(point.Y) && !math.IsInf(point.Y, 0)
 }
 
+// curveFraction and curveLerp avoid overflowing the difference of finite endpoints.
+func curveFraction(value, low, high float64) float64 {
+	width := high - low
+	if math.IsInf(width, 0) {
+		return (value/2 - low/2) / (high/2 - low/2)
+	}
+	return (value - low) / width
+}
+
+func curveLerp(low, high, fraction float64) float64 {
+	if fraction == 0 {
+		return low
+	}
+	if fraction == 1 {
+		return high
+	}
+	width := high - low
+	if math.IsInf(width, 0) {
+		return (1-fraction)*low + fraction*high
+	}
+	if fraction > .5 {
+		return high - (1-fraction)*width
+	}
+	return low + fraction*width
+}
+
+// Interpolate from the closer X endpoint so a tiny distance is not lost by
+// rounding a fraction near one.
+func curveIntersectionY(a, b internal.CurvePoint, x float64) float64 {
+	from, to, distance := a.Y, b.Y, x-a.X
+	if distance > b.X-x {
+		from, to, distance = b.Y, a.Y, b.X-x
+	}
+	width := b.X - a.X
+	widthExp := 0
+	if math.IsInf(width, 0) {
+		width = b.X/2 - a.X/2
+		widthExp = 1
+	}
+	fraction := (distance / width) * math.Ldexp(1, -widthExp)
+	if fraction >= 0x1p-1022 || distance == 0 {
+		return curveLerp(from, to, fraction)
+	}
+	// A subnormal fraction can lose significant bits (or underflow to zero)
+	// before multiplication by a large Y range. Scale the product instead.
+	dy := to - from
+	dyExp := 0
+	if math.IsInf(dy, 0) {
+		dy = to/2 - from/2
+		dyExp = 1
+	}
+	dm, de := math.Frexp(distance)
+	wm, we := math.Frexp(width)
+	ym, ye := math.Frexp(dy)
+	delta := math.Ldexp((dm*ym)/wm, de+ye+dyExp-we-widthExp)
+	return from + delta
+}
+
+func curveFinite(value float64) float64 {
+	return max(-math.MaxFloat64, min(math.MaxFloat64, value))
+}
+
 // clipCurveSegment clips a forward segment to the time window, including verticals.
 func clipCurveSegment(a, b internal.CurvePoint, x0, x1 float64) (internal.CurvePoint, internal.CurvePoint, bool) {
 	if b.X < x0 || a.X > x1 {
@@ -31,12 +93,10 @@ func clipCurveSegment(a, b internal.CurvePoint, x0, x1 float64) (internal.CurveP
 	}
 	start, end := a, b
 	if a.X < x0 {
-		fraction := (x0 - a.X) / (b.X - a.X)
-		start.X, start.Y = x0, (1-fraction)*a.Y+fraction*b.Y
+		start.X, start.Y = x0, curveIntersectionY(a, b, x0)
 	}
 	if b.X > x1 {
-		fraction := (x1 - a.X) / (b.X - a.X)
-		end.X, end.Y = x1, (1-fraction)*a.Y+fraction*b.Y
+		end.X, end.Y = x1, curveIntersectionY(a, b, x1)
 	}
 	return start, end, true
 }
@@ -163,12 +223,19 @@ func curvePointTime(seconds float64) time.Time {
 // large or small labels without rounding adjacent representable ticks together.
 func curveDeviceTimeFormat(x0, x1 float64) (byte, int) {
 	step := (x1 - x0) / 4
+	if math.IsInf(step, 0) {
+		step = x1/4 - x0/4
+	}
 	if step == 0 {
 		return 'g', 17
 	}
 	stepExponent := int(math.Floor(math.Log10(step)))
 	decimals := max(0, -stepExponent)
 	magnitude := max(math.Abs(x0), math.Abs(x1))
+	// Avoid rounding finite endpoints near MaxFloat64 to an infinite value.
+	if magnitude >= 1e308 {
+		return 'g', 17
+	}
 	if decimals <= 6 && magnitude < 1e12 {
 		return 'f', decimals
 	}
@@ -180,14 +247,17 @@ func curveHoverTime(seconds float64, deviceTime bool) string {
 	if !deviceTime {
 		return curvePointTime(seconds).Format("15:04:05.000")
 	}
-	// A sample can be much closer to its neighbors than two axis ticks.
-	// Use the shortest round-trip precision rather than rounding to tick precision.
+	return curveHoverValue(seconds) + " s"
+}
+
+func curveHoverValue(value float64) string {
+	// Show ordinary values in decimal while preserving the shortest round-trip representation.
 	format := byte('g')
-	magnitude := math.Abs(seconds)
+	magnitude := math.Abs(value)
 	if magnitude >= 1e-6 && magnitude < 1e12 {
 		format = 'f'
 	}
-	return strconv.FormatFloat(seconds, format, -1, 64) + " s"
+	return strconv.FormatFloat(value, format, -1, 64)
 }
 
 func (v *curveViewState) bounds() (curveBounds, bool) {
@@ -212,17 +282,37 @@ func (v *curveViewState) bounds() (curveBounds, bool) {
 		return curveBounds{0, 1, 0, 1}, false
 	}
 	span := curveSpanSeconds(v.span)
-	if span > 0 && v.position == 100 && bounds.x1 > bounds.x0 {
+	followingRange := span > 0 && v.position == 100 && bounds.x1 > bounds.x0
+	if followingRange {
 		// Follow the latest sample even when the device clock moves backwards.
 		width := min(span, bounds.x1-bounds.x0)
 		bounds.x1 = v.snapshot.LatestX
-		bounds.x0 = bounds.x1 - width
+		bounds.x0 = curveFinite(bounds.x1 - width)
 	} else if span > 0 && bounds.x1-bounds.x0 > span {
-		bounds.x1 = bounds.x0 + span + (bounds.x1-bounds.x0-span)*v.position/100
-		bounds.x0 = bounds.x1 - span
+		width := bounds.x1 - bounds.x0
+		shift := (width - span) * v.position / 100
+		if math.IsInf(shift, 0) || math.IsNaN(shift) {
+			bounds.x1 = curveLerp(bounds.x0+span, bounds.x1, v.position/100)
+		} else {
+			bounds.x1 = bounds.x0 + span + shift
+		}
+		bounds.x0 = curveFinite(bounds.x1 - span)
 	}
 	if bounds.x1 == bounds.x0 {
-		bounds.x1 = bounds.x0 + 1
+		if followingRange {
+			bounds.x0 = math.Nextafter(bounds.x1, math.Inf(-1))
+		}
+		if math.IsInf(bounds.x0, -1) || bounds.x0 == bounds.x1 {
+			bounds.x0 = bounds.x1
+			bounds.x1 = bounds.x0 + 1
+			if bounds.x1 == bounds.x0 {
+				bounds.x1 = math.Nextafter(bounds.x0, math.Inf(1))
+				if math.IsInf(bounds.x1, 1) {
+					bounds.x1 = bounds.x0
+					bounds.x0 = math.Nextafter(bounds.x1, math.Inf(-1))
+				}
+			}
+		}
 	}
 	for _, series := range v.snapshot.Series {
 		segments := newCurveVisibleSegments(series, bounds.x0, bounds.x1)
@@ -243,12 +333,42 @@ func (v *curveViewState) bounds() (curveBounds, bool) {
 		bounds.y0, bounds.y1 = 0, 1
 	}
 	padding := (bounds.y1 - bounds.y0) * .08
+	if math.IsInf(padding, 0) {
+		padding = bounds.y1*.08 - bounds.y0*.08
+	}
 	if padding == 0 {
 		padding = max(math.Abs(bounds.y0)*.05, .01)
 	}
-	bounds.y0 -= padding
-	bounds.y1 += padding
+	bounds.y0 = curveFinite(bounds.y0 - padding)
+	bounds.y1 = curveFinite(bounds.y1 + padding)
 	return bounds, true
+}
+
+// curveYLabels uses one precision for the axis, increasing it only when
+// distinct representable ticks would otherwise receive the same label.
+func curveYLabels(bounds curveBounds, ticks int) [5]string {
+	var values [5]float64
+	var labels [5]string
+	for i := 0; i <= ticks; i++ {
+		values[i] = curveLerp(bounds.y1, bounds.y0, float64(i)/float64(ticks))
+	}
+	precision := 5
+	if max(math.Abs(bounds.y0), math.Abs(bounds.y1)) >= 1e308 {
+		precision = 17
+	}
+	for {
+		distinct := true
+		for i := 0; i <= ticks; i++ {
+			labels[i] = strconv.FormatFloat(values[i], 'g', precision, 64)
+			if i > 0 && values[i] != values[i-1] && labels[i] == labels[i-1] {
+				distinct = false
+			}
+		}
+		if distinct || precision == 17 {
+			return labels
+		}
+		precision++
+	}
 }
 
 func (s *controller) curveChart(c *ui.Context) {
@@ -258,9 +378,20 @@ func (s *controller) curveChart(c *ui.Context) {
 	pointerX, pointerY, hovered := chart.PointerPosition()
 	chart.Draw(func(p *ui.Painter, r ui.Rect) {
 		mouseX, mouseY := r.X+pointerX, r.Y+pointerY
-		plot := ui.Rect{X: r.X + 66, Y: r.Y + 14, W: max(1, r.W-82), H: max(1, r.H-48)}
-		v.prepareCurveGeometry(plot)
-		bounds, hasData := v.geometry.bounds, v.geometry.hasData
+		bounds, hasData := v.curveLayoutBounds()
+		height := max(1, r.H-48)
+		yTicks := max(1, min(4, int(height/16)))
+		yLabels := curveYLabels(bounds, yTicks)
+		labelWidth := float32(0)
+		for i := 0; i <= yTicks; i++ {
+			width, _ := p.MeasureText(0, ui.Span{Text: yLabels[i], Size: 10})
+			labelWidth = max(labelWidth, width)
+		}
+		right := min(float32(16), max(0, r.W-1))
+		minPlotWidth := min(float32(40), max(1, r.W-right))
+		left := min(max(float32(66), labelWidth+8), max(0, r.W-right-minPlotWidth))
+		plot := ui.Rect{X: r.X + left, Y: r.Y + 14, W: max(1, r.W-left-right), H: height}
+		v.prepareCurveGeometryWithBounds(plot, bounds, hasData)
 		if !hasData && !v.snapshot.DeviceTime {
 			span := curveSpanSeconds(v.span)
 			if span == 0 {
@@ -269,14 +400,17 @@ func (s *controller) curveChart(c *ui.Context) {
 			bounds.x1 = float64(time.Now().UnixMilli()) / 1000
 			bounds.x0 = bounds.x1 - span
 		}
-		xPixel := func(x float64) float32 { return plot.X + float32((x-bounds.x0)/(bounds.x1-bounds.x0))*plot.W }
-		yPixel := func(y float64) float32 { return plot.Y + plot.H - float32((y-bounds.y0)/(bounds.y1-bounds.y0))*plot.H }
-		yTicks := max(1, min(4, int(plot.H/16)))
+		xPixel := func(x float64) float32 { return plot.X + float32(curveFraction(x, bounds.x0, bounds.x1))*plot.W }
+		yPixel := func(y float64) float32 { return plot.Y + plot.H - float32(curveFraction(y, bounds.y0, bounds.y1))*plot.H }
 		for i := 0; i <= yTicks; i++ {
 			fraction := float64(i) / float64(yTicks)
 			y := plot.Y + plot.H*float32(fraction)
 			p.Line(plot.X, y, plot.X+plot.W, y, 1, c.Theme().Border)
-			p.Text(r.X+4, y-6, fmt.Sprintf("%.5g", bounds.y1-fraction*(bounds.y1-bounds.y0)), 10, c.Theme().TextMuted)
+			if left > 8 {
+				p.Clip(ui.Rect{X: r.X + 4, Y: r.Y, W: left - 8, H: r.H}, 0, func() {
+					p.Text(r.X+4, y-6, yLabels[i], 10, c.Theme().TextMuted)
+				})
+			}
 		}
 		clockLayout, sample := "15:04:05", "00:00:00"
 		if bounds.x1-bounds.x0 < 10 {
@@ -305,7 +439,7 @@ func (s *controller) curveChart(c *ui.Context) {
 				continue
 			}
 			nextLabelX = labelX
-			stamp := bounds.x0 + fraction*(bounds.x1-bounds.x0)
+			stamp := curveLerp(bounds.x0, bounds.x1, fraction)
 			var label string
 			if v.snapshot.DeviceTime {
 				switch i {
@@ -345,7 +479,7 @@ func (s *controller) curveChart(c *ui.Context) {
 			}
 		})
 		if hovered && mouseX >= plot.X && mouseX <= plot.X+plot.W && mouseY >= plot.Y && mouseY <= plot.Y+plot.H {
-			x := bounds.x0 + float64((mouseX-plot.X)/plot.W)*(bounds.x1-bounds.x0)
+			x := curveLerp(bounds.x0, bounds.x1, float64((mouseX-plot.X)/plot.W))
 			v.prepareCurveHover(mouseX, x)
 			p.Line(mouseX, plot.Y, mouseX, plot.Y+plot.H, 1, c.Theme().TextMuted)
 			top := plot.Y + 4
@@ -357,7 +491,7 @@ func (s *controller) curveChart(c *ui.Context) {
 				point := series.Points[closest]
 				color := curveColor(series.Color)
 				stamp := curveHoverTime(point.X, v.snapshot.DeviceTime)
-				label := fmt.Sprintf("%s: %.6g %s @ %s", series.Name, point.Y, series.Unit, stamp)
+				label := fmt.Sprintf("%s: %s %s @ %s", series.Name, curveHoverValue(point.Y), series.Unit, stamp)
 				p.Fill(ui.Rect{X: plot.X + 4, Y: top, W: max(0, plot.W-8), H: 17}, c.Theme().Surface, 2)
 				p.Text(plot.X+8, top+1, label, 11, color)
 				p.Fill(ui.Rect{X: xPixel(point.X) - 3, Y: yPixel(point.Y) - 3, W: 6, H: 6}, color, 3)

@@ -36,6 +36,96 @@ func TestReceiveLogSplitText(t *testing.T) {
 	}
 }
 
+func TestReceiveLogSessionBoundaryFlushesAndReplays(t *testing.T) {
+	for _, tc := range []struct {
+		encoding      string
+		first, second []byte
+		want, hex     string
+	}{
+		{"UTF-8", []byte{0xe4}, []byte{0xb8, 0xad}, "���", "E4 B8 AD "},
+		{"GB18030", []byte{0xd6}, []byte{0xd0}, "��", "D6 D0 "},
+	} {
+		t.Run(tc.encoding, func(t *testing.T) {
+			var l receiveLog
+			options := logOptions{encoding: tc.encoding}
+			l.configure(options)
+			l.append([]internal.Event{{Data: tc.first}})
+			if got := l.text.String(); got != "" {
+				t.Fatalf("incomplete character displayed before disconnect: %q", got)
+			}
+			l.append([]internal.Event{{SessionEnd: true}})
+			if got := l.text.String(); got != "�" {
+				t.Fatalf("disconnect did not flush incomplete character: %q", got)
+			}
+			l.append([]internal.Event{{Data: tc.second}, {SessionEnd: true}})
+			if got := l.text.String(); got != tc.want {
+				t.Fatalf("sessions were joined: got %q, want %q", got, tc.want)
+			}
+			options.showSent = true
+			l.configure(options)
+			if got := l.text.String(); got != "RX < "+tc.want {
+				t.Fatalf("reformat lost session boundaries: %q", got)
+			}
+			options.showSent = false
+			l.configure(options)
+			if got := l.text.String(); got != tc.want {
+				t.Fatalf("rebuild lost session boundaries: %q", got)
+			}
+			options.hex = true
+			l.configure(options)
+			hex := l.text.String()
+			options.hex = false
+			l.configure(options)
+			if hex != tc.hex || l.text.String() != tc.want {
+				t.Fatalf("HEX toggle changed session history: hex=%q text=%q", hex, l.text.String())
+			}
+		})
+	}
+}
+
+func TestReceiveLogSessionBoundaryResetsCR(t *testing.T) {
+	for _, encoding := range []string{"UTF-8", "GB18030"} {
+		t.Run(encoding, func(t *testing.T) {
+			var l receiveLog
+			options := logOptions{encoding: encoding}
+			l.configure(options)
+			l.append([]internal.Event{{Data: []byte("\r")}, {SessionEnd: true}, {Data: []byte("\n")}})
+			if got := l.text.String(); got != "\n\n" {
+				t.Fatalf("cross-session CR/LF = %q, want two newlines", got)
+			}
+			options.hex = true
+			l.configure(options)
+			options.hex = false
+			l.configure(options)
+			if got := l.text.String(); got != "\n\n" {
+				t.Fatalf("replayed cross-session CR/LF = %q, want two newlines", got)
+			}
+		})
+	}
+}
+
+func TestReceiveLogSessionBoundarySurvivesEviction(t *testing.T) {
+	const limit = 200_000
+	options := logOptions{encoding: "UTF-8", limit: limit}
+	var l receiveLog
+	l.configure(options)
+	l.append([]internal.Event{
+		{Data: []byte(strings.Repeat("x", 17_000))},
+		{Data: []byte{0xe4}}, {SessionEnd: true},
+		{Data: []byte{0xb8, 0xad}},
+		{Data: []byte(strings.Repeat("y", limit-16_384-3))},
+	})
+	l.append([]internal.Event{{Data: []byte("z")}})
+	got := l.text.String()
+	if !strings.HasPrefix(got, "���") {
+		t.Fatalf("eviction lost retained session boundary: %q", got[:min(len(got), 20)])
+	}
+	l.rebuild()
+	if l.text.String() != got {
+		t.Fatal("rebuild after eviction differs from live display")
+	}
+}
+
 func TestReceiveLogRendersSavedBytesInHex(t *testing.T) {
 	var l receiveLog
 	l.configure(logOptions{encoding: "UTF-8", gap: 20 * time.Millisecond})

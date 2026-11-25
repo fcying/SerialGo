@@ -31,6 +31,7 @@ type receiveLog struct {
 	view                            editor.State
 	theme                           editor.Theme
 	scrollToEnd, autoScrollDisabled bool
+	sessionHasData                  bool
 }
 
 type logRenderer struct {
@@ -84,6 +85,7 @@ func (out *logOutput) writeRune(r rune) {
 func (l *receiveLog) clear() {
 	l.history = receiveHistory{}
 	l.bytes = 0
+	l.sessionHasData = false
 	l.rebuild()
 }
 
@@ -132,8 +134,15 @@ func (l *receiveLog) append(events []internal.Event) {
 	var text strings.Builder
 	out := logOutput{text: &text}
 	for _, event := range events {
-		if len(event.Data) == 0 {
+		if event.SessionEnd {
+			if !l.sessionHasData {
+				continue
+			}
+			l.sessionHasData = false
+		} else if len(event.Data) == 0 {
 			continue
+		} else {
+			l.sessionHasData = true
 		}
 		l.history.append(event)
 		l.bytes += len(event.Data)
@@ -224,6 +233,14 @@ func (l *logRenderer) sameState(other *logRenderer) bool {
 }
 
 func (l *logRenderer) render(out *logOutput, event internal.Event) {
+	if event.SessionEnd {
+		if !l.options.hex && len(l.pending) != 0 {
+			l.decode(out, nil, true)
+		}
+		l.decoder.Reset()
+		l.cr = false
+		return
+	}
 	var offset uint64
 	if l.options.hex {
 		offset = l.hexOffsets.advance(event)

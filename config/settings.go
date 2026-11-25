@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -221,6 +222,18 @@ func NewPreset() Preset {
 }
 
 func Load() (Settings, string, error) {
+	return loadDefault(nil)
+}
+
+// LoadWithIdentity returns the actual opened file, even if decoding fails.
+// The caller owns and must close any non-nil file returned.
+func LoadWithIdentity() (Settings, string, *os.File, error) {
+	var file *os.File
+	s, path, err := loadDefault(&file)
+	return s, path, file, err
+}
+
+func loadDefault(opened **os.File) (Settings, string, error) {
 	if defaultSettingsErr != nil {
 		return defaults(), "", defaultSettingsErr
 	}
@@ -232,18 +245,32 @@ func Load() (Settings, string, error) {
 	if err != nil {
 		return defaults(), "", err
 	}
-	return load(filepath.Join(filepath.Dir(exe), "config.toml"))
+	return loadFile(filepath.Join(filepath.Dir(exe), "config.toml"), opened)
 }
 
 func load(path string) (Settings, string, error) {
+	return loadFile(path, nil)
+}
+
+func loadFile(path string, opened **os.File) (Settings, string, error) {
+	return loadFileInDir(path, filepath.Dir(path), opened)
+}
+
+func loadFileInDir(path, logicalDir string, opened **os.File) (Settings, string, error) {
 	s := defaults()
 	if defaultSettingsErr != nil {
 		return s, "", defaultSettingsErr
 	}
-	err := decode(path, &s)
-	if errors.Is(err, os.ErrNotExist) {
-		err = Save(path, s)
-		return s, path, err
+	target, err := settingsTargetInDir(path, logicalDir)
+	if err != nil {
+		return s, "", err
+	}
+	err = decodeFile(target, &s, opened)
+	if errors.Is(err, os.ErrNotExist) && (opened == nil || *opened == nil) {
+		if err = saveFileInDir(path, logicalDir, s, true, opened); err != nil {
+			return defaults(), "", err
+		}
+		return s, path, nil
 	}
 	if err != nil {
 		// Do not overwrite a configuration we could not read.
@@ -253,6 +280,23 @@ func load(path string) (Settings, string, error) {
 }
 
 func decode(path string, s *Settings) error {
+	return decodeFile(path, s, nil)
+}
+
+func decodeFile(path string, s *Settings, opened **os.File) error {
+	file, err := openSettingsFile(path)
+	if err != nil {
+		return err
+	}
+	if opened == nil {
+		defer file.Close()
+	} else {
+		*opened = file
+	}
+	return decodeSettings(file, s)
+}
+
+func decodeSettings(file io.Reader, s *Settings) error {
 	stored := struct {
 		*Settings
 		Presets           []toml.Primitive
@@ -262,7 +306,7 @@ func decode(path string, s *Settings) error {
 		// Decode wider than the UI type so invalid numeric widths can be normalized.
 		CurveSidebarWidth float64
 	}{Settings: s, CurveSidebarWidth: float64(s.CurveSidebarWidth)}
-	metadata, err := toml.DecodeFile(path, &stored)
+	metadata, err := toml.NewDecoder(file).Decode(&stored)
 	if err != nil {
 		return err
 	}
@@ -343,12 +387,106 @@ func appendLegacyBaud(s *Settings, text string) {
 	}
 }
 
+// settingsTarget follows only links whose next hop is in the configuration
+// directory. Never inspect an out-of-directory target, even in a link chain.
+func settingsTarget(path string) (string, error) {
+	return settingsTargetInDir(path, filepath.Dir(path))
+}
+
+func settingsTargetInDir(path, logicalDir string) (string, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Dir(path)
+	logicalDir, err = filepath.Abs(logicalDir)
+	if err != nil {
+		return "", err
+	}
+	seen := make(map[string]bool)
+	for {
+		if seen[path] {
+			return "", fmt.Errorf("configuration symlink cycle: %s", path)
+		}
+		seen[path] = true
+		info, err := os.Lstat(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) && len(seen) == 1 {
+				return path, nil
+			}
+			return "", fmt.Errorf("inspect configuration target %s: %w", path, err)
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			return path, nil
+		}
+		link, err := os.Readlink(path)
+		if err != nil {
+			return "", fmt.Errorf("read configuration symlink %s: %w", path, err)
+		}
+		if filepath.IsAbs(link) {
+			if !sameSettingsDirectory(filepath.Dir(link), logicalDir) {
+				return "", fmt.Errorf("configuration symlink points outside its directory: %s", path)
+			}
+			path = filepath.Join(dir, filepath.Base(link))
+		} else {
+			if filepath.Dir(link) != "." || filepath.Clean(link) == "." || filepath.Clean(link) == ".." {
+				return "", fmt.Errorf("configuration symlink points outside its directory: %s", path)
+			}
+			path = filepath.Join(dir, link)
+		}
+	}
+}
+
 func Save(path string, s Settings) error {
-	if defaultSettingsErr != nil {
+	return save(path, s, false)
+}
+
+// SaveWithIdentity returns an open handle to the file written. The caller owns
+// and must close any non-nil file returned. A blank path writes nothing.
+func SaveWithIdentity(path string, s Settings) (*os.File, error) {
+	var file *os.File
+	if err := saveFile(path, s, false, &file); err != nil {
+		return nil, err
+	}
+	return file, nil
+}
+
+// save creates a new configuration without replacing a file that appeared
+// after the load attempt when createOnly is true.
+func save(path string, s Settings, createOnly bool) error {
+	return saveFile(path, s, createOnly, nil)
+}
+
+func saveFile(path string, s Settings, createOnly bool, opened **os.File) error {
+	return saveFileInDir(path, filepath.Dir(path), s, createOnly, opened)
+}
+
+func saveFileInDir(path, logicalDir string, s Settings, createOnly bool, opened **os.File) error {
+	if path == "" {
 		return defaultSettingsErr
 	}
-	if path == "" {
-		return nil
+	if err := prepareSettings(&s); err != nil {
+		return err
+	}
+	if !createOnly {
+		var err error
+		path, err = settingsTargetInDir(path, logicalDir)
+		if err != nil {
+			return err
+		}
+	}
+	dir := filepath.Dir(path)
+	file, err := createSettingsTemp(dir)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	return publishSettingsFile(file, path, s, createOnly, opened)
+}
+
+func prepareSettings(s *Settings) error {
+	if defaultSettingsErr != nil {
+		return defaultSettingsErr
 	}
 	if len(s.Presets) > PresetCount {
 		return i18n.NewError(
@@ -367,21 +505,42 @@ func Save(path string, s Settings) error {
 	if s.BaudRates == nil {
 		s.BaudRates = []string{}
 	}
-	dir := filepath.Dir(path)
-	file, err := os.CreateTemp(dir, ".settings-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(file.Name())
+	return nil
+}
+
+func publishSettingsFile(file *os.File, path string, s Settings, createOnly bool, opened **os.File) error {
 	presets := s.Presets
 	if presets == nil {
 		presets = []Preset{}
 	}
 	stored := fileSettings{Settings: &s, Presets: presets}
 	writeErr := toml.NewEncoder(file).Encode(stored)
+	var duplicate *os.File
+	var dupErr error
+	if writeErr == nil && opened != nil {
+		duplicate, dupErr = duplicateSettingsFile(file)
+	}
 	closeErr := file.Close()
-	if err := errors.Join(writeErr, closeErr); err != nil {
+	if err := errors.Join(writeErr, dupErr, closeErr); err != nil {
+		if duplicate != nil {
+			duplicate.Close()
+		}
 		return err
 	}
-	return os.Rename(file.Name(), path)
+	var err error
+	if createOnly {
+		err = installSettingsFile(file.Name(), path)
+	} else {
+		err = os.Rename(file.Name(), path)
+	}
+	if err != nil {
+		if duplicate != nil {
+			duplicate.Close()
+		}
+		return err
+	}
+	if opened != nil {
+		*opened = duplicate
+	}
+	return nil
 }
